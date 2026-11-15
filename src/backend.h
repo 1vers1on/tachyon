@@ -21,6 +21,7 @@ struct BackendOptions {
     size_t reserve_bytes = 0;      // GPU memory to leave free (e.g. draft model weights)
     size_t extra_kv_per_tok = 0;   // additional KV bytes per token per slot to budget (draft model KV)
     int vocab_limit = 0;   // >0: only compute logits for token ids < vocab_limit (draft models)
+    int cpu_moe = -1;      // CUDA: MoE layers whose experts run on the CPU from system RAM (-1 = auto: what does not fit)
 };
 
 class Backend {

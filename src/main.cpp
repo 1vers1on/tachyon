@@ -29,6 +29,8 @@ static void usage() {
         "  --spec N                 n-gram speculative draft tokens (default 4 on GPU, 0 on CPU; 0 = off)\n"
         "  --draft model.tach       small draft model for speculative decoding (same tokenizer), --draft-k N\n"
         "  --kv8                    8-bit KV cache (CUDA, experimental)\n"
+        "  --cpu-moe N              keep the experts of the last N MoE layers in system RAM (CPU compute); default: auto\n"
+        "  --prefill-chunk N        prompt tokens per forward (default 512; 2048 for MoE models larger than VRAM)\n"
         "  --no-graphs              disable CUDA graphs\n"
         "  --temp T --top-k K --top-p P --min-p P --seed S   sampling (run/bench)\n"
         "  -v / -q                  verbose / quiet logging\n", TACH_VERSION);
@@ -39,7 +41,7 @@ struct Args {
     int port = 8080, n = 256, ctx = 8192, slots = -1, threads = 0, spec = -1, prompt_len = 512;
     bool chat = false, kv8 = false, graphs = true, no_think = false, think = false;
     std::string draft;
-    int draft_k = 4, draft_vocab = 0;
+    int draft_k = 4, draft_vocab = 0, cpu_moe = -1, prefill_chunk = 0;
     SamplingParams sp;
     bool temp_set = false;
 };
@@ -64,6 +66,8 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--draft") a.draft = next();
         else if (s == "--draft-k") a.draft_k = atoi(next().c_str());
         else if (s == "--draft-vocab") a.draft_vocab = atoi(next().c_str());
+        else if (s == "--cpu-moe") a.cpu_moe = atoi(next().c_str());
+        else if (s == "--prefill-chunk") a.prefill_chunk = atoi(next().c_str());
         else if (s == "--prompt-len") a.prompt_len = atoi(next().c_str());
         else if (s == "--device") a.device = next();
         else if (s == "--chat") a.chat = true;
@@ -93,6 +97,8 @@ static void load_engine(Engine& e, const Args& a) {
     o.backend.threads = a.threads;
     o.backend.kv_int8 = a.kv8;
     o.backend.use_graphs = a.graphs;
+    o.backend.cpu_moe = a.cpu_moe;
+    o.prefill_chunk = a.prefill_chunk;
     o.spec_draft = a.spec;
     o.draft_model = a.draft;
     o.draft_k = a.draft_k;

@@ -246,7 +246,7 @@ public:
                 }
                 // rope frequencies: pairs (i, i + rope_half); only the first rope_rot rotate
                 L.inv_freq.assign(lc.rope_half, 0.f);
-                const int rd = c_.arch == "qwen3_5" ? 2 * lc.rope_half : lc.head_dim;  // exponent denominator
+                const int rd = lc.rope_den > 0 ? lc.rope_den : c_.arch == "qwen3_5" ? 2 * lc.rope_half : lc.head_dim;  // exponent denominator
                 for (int i = 0; i < lc.rope_rot; i++) {
                     float f = powf(lc.rope_theta, -2.f * i / rd);
                     if (c_.rope_scaling == "llama3") {
@@ -258,6 +258,10 @@ public:
                             f = (1 - sm) * f / c_.rope_factor + sm * f;
                         }
                     } else if (c_.rope_scaling == "linear") f /= c_.rope_factor;
+                    else if (c_.rope_scaling == "longrope") {
+                        const auto& fac = opt.ctx > c_.rope_orig_ctx ? c_.rope_long : c_.rope_short;
+                        if (i < (int)fac.size()) f /= fac[i];
+                    }
                     L.inv_freq[i] = f;
                 }
             } else if (lc.type == "conv") {
@@ -437,7 +441,11 @@ private:
                 float* row = qkv + (size_t)m * nrows;
                 if (L.bqkv) for (int i = 0; i < nrows; i++) row[i] += L.bqkv[i];
                 const int pos = batch[m].pos;
-                for (int i = 0; i < lc.rope_half; i++) { float th = pos * L.inv_freq[i]; cs[i] = cosf(th); sn[i] = sinf(th); }
+                for (int i = 0; i < lc.rope_half; i++) {
+                    float th = pos * L.inv_freq[i];
+                    const float ms = L.inv_freq[i] != 0.f ? c_.rope_mscale : 1.f;   // longrope attention factor
+                    cs[i] = cosf(th) * ms; sn[i] = sinf(th) * ms;
+                }
                 auto rope = [&](float* v) {
                     for (int i = 0; i < lc.rope_half; i++) {
                         float x0 = v[i], x1 = v[i + lc.rope_half];
@@ -915,4 +923,179 @@ void cpu_selftest() {
                 printf("%s m=%d r=%d kernel=%.5f ref=%.5f\n", qtype_name(qt), m, r, y[m * N + r], ref);
             }
     }
+}
+
+// ================================================================================================
+// CpuMoe: experts in system RAM for the CUDA backend (see cpu_moe.h)
+// ================================================================================================
+#include "cpu_moe.h"
+#include <fcntl.h>
+#include <unistd.h>
+
+struct CpuMoe::Impl {
+    struct L { QMat gu, dn; int E = 0, F = 0, H = 0; bool gelu = false; std::string pre; };
+    std::unique_ptr<ThreadPool> pool;
+    std::vector<L> layers;
+    std::vector<std::pair<void*, size_t>> maps;
+    size_t total = 0;
+    // scratch
+    QAct xa, ha;
+    std::vector<float> xf, gu, h, dn;
+    std::vector<int> order, start, cnt;
+
+    // copy (and widen Q3 -> Q4) one tensor into hugepage-backed anonymous memory
+    QMat load(const TensorInfo& t) {
+        QMat q; q.name = t.name; q.rows = (int)t.rows; q.cols = (int)t.cols;
+        const bool q3 = t.type == QType::Q3;
+        q.t = q3 ? QType::Q4 : t.type;
+        const size_t db = q3 ? (size_t)q.rows * q.cols / 2 : t.data_bytes, sb = t.scale_bytes;
+        const size_t n = align_up(db, 64) + align_up(sb, 64);
+        void* m = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) die("out of memory for CPU experts (%s, %.1f GB so far)", t.name.c_str(), total / 1e9);
+        madvise(m, n, MADV_HUGEPAGE);
+        maps.push_back({m, n});
+        total += n;
+        uint8_t* d = (uint8_t*)m;
+        uint8_t* s = d + align_up(db, 64);
+        pool->parallel_for(q.rows, [&](int64_t r0, int64_t r1) {
+            for (int64_t r = r0; r < r1; r++) {
+                if (!q3) { memcpy(d + (size_t)r * (db / q.rows), t.data + (size_t)r * (db / q.rows), db / q.rows); continue; }
+                const uint8_t* src = t.data + (size_t)r * q.cols * 3 / 8;
+                uint8_t* dst = d + (size_t)r * q.cols / 2;
+                for (int b = 0; b < q.cols / 32; b++) {
+                    const uint32_t* blk = (const uint32_t*)(src + b * 12);
+                    uint8_t v[32];
+                    for (int e = 0; e < 32; e++) {
+                        int w = e / 16, k = (e % 16) / 4, bb = e % 4;
+                        v[e] = ((blk[w] >> (8 * bb + 2 * k)) & 3) | (((blk[2] >> (8 * bb + e / 4)) & 1) << 2);
+                    }
+                    for (int j = 0; j < 16; j++) dst[b * 16 + j] = v[j] | (v[j + 16] << 4);
+                }
+            }
+        }, 256);
+        memcpy(s, t.scales, sb);
+        q.d = d; q.s = s;
+        return q;
+    }
+};
+
+CpuMoe::CpuMoe(int threads) : p_(new Impl) {
+    p_->pool = std::make_unique<ThreadPool>(threads > 0 ? threads : std::max(1u, std::thread::hardware_concurrency() / 2));
+}
+CpuMoe::~CpuMoe() { for (auto& m : p_->maps) munmap(m.first, m.second); }
+size_t CpuMoe::bytes() const { return p_->total; }
+std::vector<std::pair<void*, size_t>> CpuMoe::regions() const { return p_->maps; }
+CpuMoe::HostMat CpuMoe::mat(int li, int which) const {
+    const QMat& q = which == 0 ? p_->layers[li].gu : p_->layers[li].dn;
+    return {q.t, q.rows, q.cols, q.d, q.s, qtype_data_bytes(q.t, q.rows, q.cols), qtype_scale_bytes(q.t, q.rows, q.cols)};
+}
+
+int CpuMoe::add_layer(const TensorInfo& gu, const TensorInfo& dn, int E, bool gelu, const std::string& pre) {
+    Impl::L l;
+    l.gu = p_->load(gu); l.dn = p_->load(dn);
+    l.E = E; l.H = (int)gu.cols; l.F = (int)dn.cols; l.gelu = gelu; l.pre = pre;
+    if (l.gu.rows != E * 2 * l.F || l.dn.rows != E * l.H) die("CpuMoe: unexpected expert shapes for %s", pre.c_str());
+    p_->layers.push_back(l);
+    return (int)p_->layers.size() - 1;
+}
+
+void CpuMoe::forward(int li, int M, int K, const uint16_t* xn, const int* ids, const float* w, float* out) {
+    static const bool prof = getenv("TACH_CMOE_PROF") != nullptr;
+    static double tsum[6]; static int ncall = 0;
+    double tp = prof ? now_sec() : 0;
+    auto mark = [&](int i) { if (!prof) return; double t = now_sec(); tsum[i] += t - tp; tp = t; };
+    struct Rep { ~Rep() { if (prof && ncall) fprintf(stderr, "[cmoe] %d calls, avg ms: group+quant %.3f gu %.3f act %.3f down %.3f combine %.3f gap %.3f\n", ncall,
+        1e3 * tsum[0] / ncall, 1e3 * tsum[1] / ncall, 1e3 * tsum[2] / ncall, 1e3 * tsum[3] / ncall, 1e3 * tsum[4] / ncall, 1e3 * tsum[5] / ncall); } };
+    static Rep rep;
+    static double tlast = 0;
+    if (prof) { if (tlast > 0) tsum[5] += tp - tlast; ncall++; }
+    Impl& I = *p_;
+    const Impl::L& L = I.layers[li];
+    const int H = L.H, F = L.F, E = L.E, P = M * K;
+    // 1. group (token, expert) pairs by expert
+    I.cnt.assign(E, 0);
+    for (int p = 0; p < P; p++) I.cnt[ids[p]]++;
+    I.start.assign(E + 1, 0);
+    for (int e = 0; e < E; e++) I.start[e + 1] = I.start[e] + I.cnt[e];
+    I.order.assign(P, 0);
+    {
+        std::vector<int> fill(I.start.begin(), I.start.end() - 1);
+        for (int p = 0; p < P; p++) I.order[fill[ids[p]]++] = p;
+    }
+    // 2. gathered, quantized activations (row i = pair order[i])
+    I.xf.resize((size_t)P * H);
+    I.xa.resize(P, H);
+    I.pool->parallel_for(P, [&](int64_t a, int64_t b) {
+        for (int64_t i = a; i < b; i++) {
+            const int m = I.order[i] / K;
+            float* x = I.xf.data() + (size_t)i * H;
+            for (int j = 0; j < H; j++) x[j] = h2f(xn[(size_t)m * H + j]);
+            quantize_act_row(x, H, I.xa.q + (size_t)i * H, I.xa.d + (size_t)i * (H / CPU_ABLK), I.xa.s + (size_t)i * (H / CPU_ABLK));
+        }
+    }, 4);
+    mark(0);
+    if (g_imatrix) g_imatrix->add(L.pre + "wgu_e", I.xf.data(), P, H);
+    auto view = [&](const QAct& a, int K2, int off, int n) {
+        QAct v; v.M = n; v.K = K2;
+        v.q = a.q + (size_t)off * K2; v.d = a.d + (size_t)off * (K2 / CPU_ABLK); v.s = a.s + (size_t)off * (K2 / CPU_ABLK);
+        return v;
+    };
+    // tasks: (expert, row chunk) over all used experts in one dispatch
+    std::vector<int> used;
+    for (int e = 0; e < E; e++) if (I.cnt[e]) used.push_back(e);
+    constexpr int CH = 32;
+    // 3. gate/up for every pair, act(g) * u
+    I.gu.resize((size_t)P * 2 * F);
+    {
+        const int nch = (2 * F + CH - 1) / CH;
+        I.pool->parallel_for((int64_t)used.size() * nch, [&](int64_t a, int64_t b) {
+            for (int64_t t = a; t < b; t++) {
+                const int e = used[t / nch], c = (int)(t % nch);
+                const QAct av = view(I.xa, H, I.start[e], I.cnt[e]);
+                gemm_rows(sub_rows(L.gu, e * 2 * F, 2 * F), av, I.gu.data() + (size_t)I.start[e] * 2 * F, 2 * F, c * CH, std::min(2 * F, (c + 1) * CH));
+            }
+        });
+    }
+    mark(1);
+    I.h.resize((size_t)P * F);
+    I.ha.resize(P, F);
+    I.pool->parallel_for(P, [&](int64_t a, int64_t b) {
+        for (int64_t i = a; i < b; i++) {
+            const float* g = I.gu.data() + (size_t)i * 2 * F;
+            float* hh = I.h.data() + (size_t)i * F;
+            for (int j = 0; j < F; j++) hh[j] = (L.gelu ? gelu_tanh(g[2 * j]) : silu(g[2 * j])) * g[2 * j + 1];
+            quantize_act_row(hh, F, I.ha.q + (size_t)i * F, I.ha.d + (size_t)i * (F / CPU_ABLK), I.ha.s + (size_t)i * (F / CPU_ABLK));
+        }
+    }, 4);
+    if (g_imatrix) g_imatrix->add(L.pre + "wdown_e", I.h.data(), P, F);
+    mark(2);
+    // 4. down projections
+    I.dn.resize((size_t)P * H);
+    {
+        const int nch = (H + CH - 1) / CH;
+        I.pool->parallel_for((int64_t)used.size() * nch, [&](int64_t a, int64_t b) {
+            for (int64_t t = a; t < b; t++) {
+                const int e = used[t / nch], c = (int)(t % nch);
+                const QAct av = view(I.ha, F, I.start[e], I.cnt[e]);
+                gemm_rows(sub_rows(L.dn, e * H, H), av, I.dn.data() + (size_t)I.start[e] * H, H, c * CH, std::min(H, (c + 1) * CH));
+            }
+        });
+    }
+    mark(3);
+    // 5. weighted combine per token
+    std::vector<int> pos(P);
+    for (int i = 0; i < P; i++) pos[I.order[i]] = i;
+    I.pool->parallel_for(M, [&](int64_t a, int64_t b) {
+        for (int64_t m = a; m < b; m++) {
+            float* o = out + (size_t)m * H;
+            for (int j = 0; j < H; j++) o[j] = 0.f;
+            for (int k = 0; k < K; k++) {
+                const float wk = w[m * K + k];
+                const float* d = I.dn.data() + (size_t)pos[m * K + k] * H;
+                for (int j = 0; j < H; j++) o[j] += wk * d[j];
+            }
+        }
+    }, 4);
+    mark(4);
+    if (prof) tlast = now_sec();
 }

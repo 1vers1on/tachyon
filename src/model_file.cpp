@@ -10,6 +10,7 @@ Json LayerCfg::to_json() const {
     if (type == "attn") {
         j.set("n_heads", n_heads); j.set("n_kv_heads", n_kv_heads); j.set("head_dim", head_dim);
         j.set("rope_theta", (double)rope_theta); j.set("rope_half", rope_half); j.set("rope_rot", rope_rot);
+        if (rope_den) j.set("rope_den", rope_den);
         j.set("window", window); j.set("qk_norm", qk_norm); j.set("v_norm", v_norm); j.set("attn_gate", attn_gate);
         j.set("k_eq_v", k_eq_v); j.set("attn_scale", (double)attn_scale); j.set("kv_src", kv_src);
     } else if (type == "conv") {
@@ -33,6 +34,7 @@ LayerCfg LayerCfg::from_json(const Json& j) {
     l.n_heads = (int)j.get_int("n_heads", 0); l.n_kv_heads = (int)j.get_int("n_kv_heads", 0); l.head_dim = (int)j.get_int("head_dim", 0);
     l.rope_theta = (float)j.get_num("rope_theta", 10000); l.rope_half = (int)j.get_int("rope_half", l.head_dim / 2);
     l.rope_rot = (int)j.get_int("rope_rot", l.rope_half);
+    l.rope_den = (int)j.get_int("rope_den", 0);
     l.window = (int)j.get_int("window", 0); l.qk_norm = (int)j.get_int("qk_norm", 0); l.v_norm = j.get_bool("v_norm", false);
     l.attn_gate = j.get_bool("attn_gate", false); l.k_eq_v = j.get_bool("k_eq_v", false);
     l.attn_scale = (float)j.get_num("attn_scale", 0); l.kv_src = (int)j.get_int("kv_src", -1);
@@ -69,6 +71,12 @@ Json ModelConfig::to_json() const {
     j.set("rope_low_freq", (double)rope_low_freq);
     j.set("rope_high_freq", (double)rope_high_freq);
     j.set("rope_orig_ctx", rope_orig_ctx);
+    if (!rope_short.empty()) {
+        Json a = Json::array(), b = Json::array();
+        for (float v : rope_short) a.push((double)v);
+        for (float v : rope_long) b.push((double)v);
+        j.set("rope_short", a); j.set("rope_long", b); j.set("rope_mscale", (double)rope_mscale);
+    }
     j.set("max_ctx", max_ctx);
     j.set("wtype", qtype_name(wtype));
     j.set("act", act);
@@ -103,6 +111,9 @@ ModelConfig ModelConfig::from_json(const Json& j) {
     c.rope_low_freq = (float)j.get_num("rope_low_freq", 1);
     c.rope_high_freq = (float)j.get_num("rope_high_freq", 4);
     c.rope_orig_ctx = (int)j.get_int("rope_orig_ctx", 8192);
+    for (auto& v : j["rope_short"].arr) c.rope_short.push_back((float)v.as_num());
+    for (auto& v : j["rope_long"].arr) c.rope_long.push_back((float)v.as_num());
+    c.rope_mscale = (float)j.get_num("rope_mscale", 1.0);
     c.max_ctx = (int)j.get_int("max_ctx", 4096);
     c.wtype = qtype_from_name(j.get_str("wtype", "q4"));
     c.act = j.get_str("act", "silu");

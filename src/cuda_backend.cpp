@@ -5,7 +5,11 @@
 // Shapes that drive register / shared-memory layout are template arguments; everything else is runtime.
 #include "backend.h"
 #include "quant.h"
+#include "cpu_moe.h"
 #include <cuda.h>
+#include <deque>
+#include <thread>
+#include <atomic>
 #include <nvrtc.h>
 #include <map>
 #include <set>
@@ -39,6 +43,7 @@ struct DLayer {
     CUdeviceptr conv_w = 0, dn_conv = 0, dn_A = 0, dn_dt = 0, dn_norm = 0, router = 0, expert_bias = 0;
     CUdeviceptr kc = 0, vc = 0, ksc = 0, vsc = 0;   // KV cache (shared with kv_src for Gemma 4)
     int kv_cap = 0;                                 // positions stored (ring of window + batch for sliding layers)
+    int cpu_moe = -1;                               // CpuMoe layer handle when the experts live in system RAM
     CUdeviceptr st0 = 0, st1 = 0;                   // recurrent state (conv / delta net)
     DMat ple_gate, ple_out; CUdeviceptr ple_post_norm = 0;
     int in_rows() const { return c.is_attn() ? c.qkv_rows() : c.type == "conv" ? 3 * conv_in.cols : c.dn_in_rows(); }
@@ -48,7 +53,7 @@ struct DLayer {
 struct RopeArgs {
     CUdeviceptr qkv, qn, kn, inv_freq, pos, slot, qout, kc, vc, ksc, vsc;
     int nrows, nh, nkv, qstride, qrows, kvd, half, qk_norm, v_norm, k_eq_v, own_kv, ctx;
-    float qscale;
+    float qscale, mscale;
 };
 struct AttnArgs {
     CUdeviceptr q, kc, vc, pos, slot, part_o, part_ml, counters, oq, ods, oh, gate, ksc, vsc;
@@ -78,6 +83,10 @@ public:
             if (h_batch_) cuMemFreeHost(h_batch_);
             if (h_out_) cuMemFreeHost(h_out_);
             if (h_moe_) cuMemFreeHost(h_moe_);
+            if (cm_thread_.joinable()) { cm_stop_ = true; cm_thread_.join(); }
+            if (stage_bytes_) for (auto& r : cmoe_->regions()) cuMemHostUnregister(r.first);
+            if (cm_hdr_) cuMemFreeHost((void*)cm_hdr_);
+            if (cm_buf_) cuMemFreeHost(cm_buf_);
             cuDevicePrimaryCtxRelease(dev_);
         }
     }
@@ -115,6 +124,7 @@ public:
         alloc_caches();
         alloc_activations();
         compile_kernels();
+        if (cmoe_) { cpu_moe_start(); stream_setup(); }
         CU(cuStreamSynchronize(stream_));
         if (getenv("TACH_KBENCH")) {
             int M = atoi(getenv("TACH_KBENCH")); if (M < 1) M = 1;
@@ -340,9 +350,63 @@ private:
     // ---------------------------------------------------------------------------------------------
     // weights / caches / buffers
     // ---------------------------------------------------------------------------------------------
+    // Which MoE layers keep their experts in system RAM (computed on the CPU): explicit count, or as many as needed
+    // so that the rest of the model + experts of the remaining layers + a KV budget fit in free VRAM.
+    std::set<int> plan_cpu_moe(const ModelFile& mf) {
+        std::set<int> cpu;
+        std::vector<int> moe;
+        std::vector<size_t> eb(c_.n_layers, 0);
+        size_t other = 0;
+        for (auto& kv : mf.tensors) {
+            const size_t b = align_up(kv.second.data_bytes, 256) + align_up(kv.second.scale_bytes, 256);
+            const std::string& n = kv.first;
+            const bool ex = n.size() > 6 && (n.compare(n.size() - 6, 6, ".wgu_e") == 0 || (n.size() > 8 && n.compare(n.size() - 8, 8, ".wdown_e") == 0));
+            if (ex) eb[atoi(n.c_str() + 4)] += b; else other += b;
+        }
+        for (int l = 0; l < c_.n_layers; l++) if (c_.layers[l].n_experts) moe.push_back(l);
+        if (moe.empty()) return cpu;
+        int ncpu = opt.cpu_moe;
+        if (ncpu < 0) {
+            size_t free_b, total_b;
+            cuMemGetInfo(&free_b, &total_b);
+            size_t per_tok = 0, fixed = 0;
+            for (auto& lc : c_.layers) {
+                if (!lc.is_attn() || lc.kv_src >= 0) continue;
+                const size_t tokb = (size_t)lc.n_kv_heads * lc.head_dim * (opt.kv_int8 ? 1 : 2) * 2;
+                if (lc.window > 0) fixed += tokb * (lc.window + opt.max_batch) * opt.n_slots; else per_tok += tokb;
+            }
+            // KV budget: the requested context for one slot at least, capped at 16k tokens (alloc_caches shrinks the rest)
+            const size_t kv = per_tok * (size_t)std::min(opt.ctx * opt.n_slots, std::max(opt.ctx, 16384)) + fixed;
+            const size_t need = other + kv + (256ull << 20) + (768ull << 20) + opt.reserve_bytes;
+            size_t room = free_b > need ? free_b - need : 0;
+            size_t emax = 0;
+            for (int l : moe) emax = std::max(emax, eb[l]);
+            ncpu = 0;
+            size_t total_e = 0;
+            for (int l : moe) total_e += eb[l];
+            if (total_e > room) {
+                // offloading: keep two layers' worth of VRAM for streaming experts during prefill
+                const size_t stage = stream_experts_ ? 2 * emax : 0;
+                room = room > stage ? room - stage : 0;
+                for (int l : moe) { if (eb[l] <= room) room -= eb[l]; else ncpu++; }
+            }
+            if (ncpu) logi("cuda: experts of %d / %zu MoE layers do not fit in VRAM -> system RAM (CPU), %.1f GB on the GPU",
+                           ncpu, moe.size(), (double)(free_b > need ? free_b - need - room : 0) / 1e9);
+        }
+        ncpu = std::min<int>(ncpu, (int)moe.size());
+        for (int i = (int)moe.size() - ncpu; i < (int)moe.size(); i++) cpu.insert(moe[i]);   // last layers on the CPU
+        return cpu;
+    }
+
     void upload_weights(const ModelFile& mf) {
+        const std::set<int> cpu_layers = plan_cpu_moe(mf);
+        auto on_cpu = [&](const std::string& n) {
+            if (cpu_layers.empty() || n.rfind("blk.", 0) != 0) return false;
+            const bool ex = (n.size() > 6 && n.compare(n.size() - 6, 6, ".wgu_e") == 0) || (n.size() > 8 && n.compare(n.size() - 8, 8, ".wdown_e") == 0);
+            return ex && cpu_layers.count(atoi(n.c_str() + 4));
+        };
         size_t total = 0;
-        for (auto& kv : mf.tensors) total += align_up(kv.second.data_bytes, 256) + align_up(kv.second.scale_bytes, 256);
+        for (auto& kv : mf.tensors) if (!on_cpu(kv.first)) total += align_up(kv.second.data_bytes, 256) + align_up(kv.second.scale_bytes, 256);
         CUdeviceptr base = alloc(total);
         size_t chunk = 64 << 20;
         void* pinned;
@@ -362,6 +426,7 @@ private:
         std::map<std::string, std::pair<CUdeviceptr, CUdeviceptr>> ptr;
         for (auto& kv : mf.tensors) {
             const TensorInfo& t = kv.second;
+            if (on_cpu(kv.first)) continue;
             CUdeviceptr d = up(t.data, t.data_bytes);
             CUdeviceptr s = t.scale_bytes ? up(t.scales, t.scale_bytes) : 0;
             ptr[t.name] = {d, s};
@@ -419,6 +484,13 @@ private:
             if (L.c.n_experts) {
                 L.router = vec(p + "router");
                 L.expert_bias = vec(p + "expert_bias", false);
+                if (cpu_layers.count(l)) {
+                    if (!cmoe_) cmoe_ = std::make_unique<CpuMoe>(opt.threads);
+                    L.cpu_moe = cmoe_->add_layer(*mf.tensor(p + "wgu_e"), *mf.tensor(p + "wdown_e"), L.c.n_experts, c_.act == "gelu", p);
+                    L.wgu_e = DMat{}; L.wgu_e.t = mf.tensor(p + "wgu_e")->type; L.wgu_e.cols = c_.hidden;
+                    L.wdown_e = DMat{}; L.wdown_e.t = mf.tensor(p + "wdown_e")->type; L.wdown_e.cols = L.c.expert_ffn;
+                    continue;
+                }
                 L.wgu_e = mat(p + "wgu_e");
                 L.wdown_e = mat(p + "wdown_e");
             } else if (L.c.ffn) {
@@ -427,6 +499,7 @@ private:
             }
         }
         logi("cuda: uploaded %.2f GB of weights", total / 1e9);
+        if (cmoe_) logi("cuda: %zu MoE layers with experts in system RAM (%.2f GB, CPU compute)", cpu_layers.size(), cmoe_->bytes() / 1e9);
     }
 
     void alloc_caches() {
@@ -484,7 +557,7 @@ private:
                 }
                 // rope table: pairs (i, i + rope_half); first rope_rot frequencies rotate
                 std::vector<float> inv(std::max(1, lc.rope_half), 0.f);
-                const int rd = c_.arch == "qwen3_5" ? 2 * lc.rope_half : lc.head_dim;
+                const int rd = lc.rope_den > 0 ? lc.rope_den : c_.arch == "qwen3_5" ? 2 * lc.rope_half : lc.head_dim;
                 for (int i = 0; i < lc.rope_rot; i++) {
                     float f = powf(lc.rope_theta, -2.f * i / rd);
                     if (c_.rope_scaling == "llama3") {
@@ -496,6 +569,10 @@ private:
                             f = (1 - sm) * f / c_.rope_factor + sm * f;
                         }
                     } else if (c_.rope_scaling == "linear") f /= c_.rope_factor;
+                    else if (c_.rope_scaling == "longrope") {
+                        const auto& fac = opt.ctx > c_.rope_orig_ctx ? c_.rope_long : c_.rope_short;
+                        if (i < (int)fac.size()) f /= fac[i];
+                    }
                     inv[i] = f;
                 }
                 L.inv_freq = alloc(inv.size() * 4);
@@ -672,6 +749,7 @@ private:
                 }
             }
             if (conv_par_ok(lc)) { names.insert("conv_par<0>"); names.insert("conv_state<0>"); }
+            if (lc.n_experts && L.cpu_moe >= 0) { names.insert(gemm_name(QType::Q4, 2)); names.insert(gemm_name(QType::Q4, 0)); names.insert(gemm_name(QType::Q8, 2)); names.insert(gemm_name(QType::Q8, 0)); }
             if (lc.n_experts) {
                 names.insert(ind_name(L.wgu_e.t, L.wgu_e.cols));
                 names.insert(ind_name(L.wdown_e.t, L.wdown_e.cols));
@@ -690,6 +768,7 @@ private:
         }
         names.insert("causal_conv<0>");
         names.insert("causal_conv<1>");
+        names.insert("causal_conv<2>");
         for (int M = 1; M <= 8; M++) names.insert(gemv2_name(out_.t, out_.cols, M, 1, 0));
         if (tc_ok(out_.t) && out_.cols % 256 == 0) names.insert(tc_name(out_.t, out_.cols, 0));
         std::string key = std::string(kKernelSource);
@@ -787,6 +866,8 @@ private:
         f_plecomb_ = fn("ple_combine");
         f_plemul_ = fn("ple_mul");
         f_dnpost_ = fn("dn_post");
+        f_mpost_ = fn("moe_post");
+        f_mwait_ = fn("moe_wait");
     }
     static constexpr int TC_SMEM = 3 * (64 * 144 + 64 * 16 + 8 * 272 + 512);
     int gemm_smem() const { return 2 * 64 * 72 * 2 + 2 * 128 * 72 * 2; }
@@ -920,6 +1001,7 @@ private:
         a.qk_norm = lc.qk_norm == 1 ? 1 : 0; a.v_norm = lc.v_norm; a.k_eq_v = lc.k_eq_v; a.own_kv = lc.kv_src < 0; a.ctx = L.kv_cap;
         const float scale = lc.attn_scale > 0 ? lc.attn_scale : 1.f / sqrtf((float)lc.head_dim);
         a.qscale = scale * sqrtf((float)lc.head_dim);  // attention kernels apply 1/sqrt(head_dim)
+        a.mscale = c_.rope_mscale;
         (void)M;
         return a;
     }
@@ -1000,18 +1082,16 @@ private:
                 gemv(L.wo, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
             } else if (lc.type == "conv") {
                 gemv(L.conv_in, 1, 0, M, x_, L.attn_norm, 0, 0, 0, proj_);
-                launch(F("causal_conv<0>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
-                       pos_ptr(), slot_ptr(), M, tmp_);
-                launch(f_quant_, D3(M), D3(256), 0, tmp_, H, xq_, xds_);
+                launch(F("causal_conv<2>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
+                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, xq_, xds_);
                 gemv(L.conv_out, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
             } else {
                 const int R = lc.dn_in_rows(), CD = lc.dn_conv_dim(), VD = lc.dn_val_dim();
                 gemv(L.dn_in, 1, 0, M, x_, L.attn_norm, 0, 0, 0, proj_);
                 launch(F("causal_conv<1>"), D3((CD + 127) / 128), D3(128), 0, proj_, R, CD, lc.dn_conv, L.dn_conv, L.st0,
-                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0);
+                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0);
                 launch(F(dn_name(lc.dn_dk, lc.dn_dv)), D3(lc.dn_nv), D3(2 * lc.dn_dv), 0, proj_, R, lc.dn_nk, lc.dn_nv, L.dn_A, L.dn_dt,
-                       L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_);
-                launch(f_quant_, D3(M), D3(256), 0, tmp_, VD, xq_, xds_);
+                       L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, xq_, xds_);
                 gemv(L.dn_out, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
             }
             if (!dadd) residual(M, tmp_, L.post_attn_norm, 1.f);
@@ -1019,7 +1099,7 @@ private:
             const bool fadd = direct_add(L, true) && !c_.ple_dim;
             const float fscalar = c_.ple_dim ? 1.f : lc.layer_scalar;
             if (lc.n_experts) {
-                moe_decode(L, M);
+                if (L.cpu_moe >= 0) moe_cpu(L, M); else moe_decode(L, M);
             } else if (lc.ffn) {
                 gemv_gu(L.wgu, M, x_, L.ffn_norm, fq_, fds_);
                 gemv(L.wdown, 0, fadd ? 1 : 0, M, 0, 0, 0, fq_, fds_, fadd ? x_ : tmp_);
@@ -1028,6 +1108,151 @@ private:
             if (c_.ple_dim) ple_layer(L, l, M, false);
         }
         logits_pass();
+    }
+
+    // Experts in system RAM: route + normalize on the GPU, then a request through host-mapped memory to a CPU server
+    // thread (polled on both sides: host callbacks cost ~1 ms per round trip under WSL2), output copied back.
+    // All of it is ordinary kernels, so decode stays one CUDA graph.
+    volatile int* cm_hdr_ = nullptr;   // host view of the header
+    CUdeviceptr cm_hdr_d_ = 0, cm_buf_d_ = 0, cm_counter_ = 0;
+    uint8_t* cm_buf_ = nullptr;
+    size_t cm_out_off_ = 0;
+    std::thread cm_thread_;
+    std::atomic<bool> cm_stop_{false};
+    void cpu_moe_start() {
+        const int H = c_.hidden;
+        size_t P = 0;
+        for (auto& L : layers_) if (L.cpu_moe >= 0) P = std::max<size_t>(P, (size_t)cap_ * L.c.top_k);
+        cm_out_off_ = align_up(P * 8 + (size_t)cap_ * H * 2, 256);
+        const size_t bytes = cm_out_off_ + (size_t)cap_ * H * 4;
+        void* hp;
+        CU(cuMemHostAlloc(&hp, 4096, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
+        memset(hp, 0, 4096);
+        cm_hdr_ = (volatile int*)hp;
+        CU(cuMemHostGetDevicePointer(&cm_hdr_d_, hp, 0));
+        CU(cuMemHostAlloc(&hp, bytes, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
+        cm_buf_ = (uint8_t*)hp;
+        CU(cuMemHostGetDevicePointer(&cm_buf_d_, hp, 0));
+        cm_counter_ = alloc(4);
+        CU(cuMemsetD32(cm_counter_, 0, 1));
+        cm_thread_ = std::thread([this] {
+            int last = 0;
+            double idle_since = now_sec();
+            while (!cm_stop_.load(std::memory_order_relaxed)) {
+                const int s = cm_hdr_[0];
+                if (s == last) {
+                    if (now_sec() - idle_since < 0.05) _mm_pause();   // hot: spin
+                    else std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    continue;
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                last = s;
+                const int lid = cm_hdr_[1], M = cm_hdr_[2], K = cm_hdr_[3], P = M * K;
+                cmoe_->forward(lid, M, K, (const uint16_t*)(cm_buf_ + (size_t)P * 8), (const int*)cm_buf_, (const float*)(cm_buf_ + (size_t)P * 4),
+                               (float*)(cm_buf_ + cm_out_off_));
+                std::atomic_thread_fence(std::memory_order_release);
+                cm_hdr_[16] = s;
+                idle_since = now_sec();
+            }
+        });
+    }
+    // ---- prefill: stream RAM-resident experts to the GPU (double-buffered on a copy stream) ----
+    bool stream_experts_ = getenv("TACH_NO_EXPERT_STREAM") == nullptr;
+    int stream_min_tokens_ = getenv("TACH_EXPERT_STREAM_MIN") ? atoi(getenv("TACH_EXPERT_STREAM_MIN")) : 128;
+    CUstream cstream_ = nullptr;
+    CUdeviceptr xstage_[2] = {0, 0};
+    CUevent stage_ready_[2] = {}, stage_free_[2] = {};
+    int stage_layer_[2] = {-1, -1};
+    size_t stage_bytes_ = 0;
+    void stream_setup() {
+        if (!stream_experts_) return;
+        size_t need = 0;
+        for (auto& L : layers_) {
+            if (L.cpu_moe < 0) continue;
+            size_t b = 0;
+            for (int w = 0; w < 2; w++) { auto h = cmoe_->mat(L.cpu_moe, w); b += align_up(h.db, 256) + align_up(h.sb, 256); }
+            need = std::max(need, b);
+        }
+        size_t pinned = 0;
+        for (auto& r : cmoe_->regions()) {
+            if (cuMemHostRegister(r.first, r.second, CU_MEMHOSTREGISTER_PORTABLE) != CUDA_SUCCESS) {
+                logi("cuda: could not page-lock expert memory; prefill computes RAM-resident experts on the CPU");
+                for (auto& r2 : cmoe_->regions()) { if (r2.first == r.first) break; cuMemHostUnregister(r2.first); }
+                stream_experts_ = false;
+                return;
+            }
+            pinned += r.second;
+        }
+        size_t free_b, total_b;
+        cuMemGetInfo(&free_b, &total_b);
+        if (free_b < 2 * need + (256ull << 20)) {
+            logi("cuda: no VRAM left for expert streaming buffers; prefill computes RAM-resident experts on the CPU");
+            for (auto& r : cmoe_->regions()) cuMemHostUnregister(r.first);
+            stream_experts_ = false;
+            return;
+        }
+        stage_bytes_ = need;
+        for (int i = 0; i < 2; i++) {
+            xstage_[i] = alloc(need);
+            CU(cuEventCreate(&stage_ready_[i], CU_EVENT_DISABLE_TIMING));
+            CU(cuEventCreate(&stage_free_[i], CU_EVENT_DISABLE_TIMING));
+            CU(cuEventRecord(stage_free_[i], stream_));
+        }
+        CU(cuStreamCreate(&cstream_, CU_STREAM_NON_BLOCKING));
+        logi("cuda: prefill streams RAM-resident experts (2 x %.0f MB staging, %.1f GB page-locked)", need / 1e6, pinned / 1e9);
+    }
+    // enqueue the copy of layer l's experts into staging buffer b (after its previous user finished)
+    void stage_issue(int b, int l) {
+        const DLayer& L = layers_[l];
+        CU(cuStreamWaitEvent(cstream_, stage_free_[b], 0));
+        size_t off = 0;
+        for (int w = 0; w < 2; w++) {
+            auto h = cmoe_->mat(L.cpu_moe, w);
+            CU(cuMemcpyHtoDAsync(xstage_[b] + off, h.d, h.db, cstream_)); off += align_up(h.db, 256);
+            CU(cuMemcpyHtoDAsync(xstage_[b] + off, h.s, h.sb, cstream_)); off += align_up(h.sb, 256);
+        }
+        CU(cuEventRecord(stage_ready_[b], cstream_));
+        stage_layer_[b] = l;
+    }
+    int next_cpu_moe_layer(int after) const {
+        for (int l = after + 1; l < c_.n_layers; l++) if (layers_[l].cpu_moe >= 0) return l;
+        return -1;
+    }
+    // prefill pass start: queue the first two RAM-resident layers
+    void stage_begin(int M) {
+        stage_layer_[0] = stage_layer_[1] = -1;
+        if (!stream_experts_ || M < stream_min_tokens_) return;
+        int l0 = next_cpu_moe_layer(-1);
+        if (l0 >= 0) stage_issue(0, l0);
+        int l1 = l0 >= 0 ? next_cpu_moe_layer(l0) : -1;
+        if (l1 >= 0) stage_issue(1, l1);
+    }
+    void moe_streamed(const DLayer& L, int l, int M, const std::string& bp) {
+        const int b = stage_layer_[0] == l ? 0 : 1;
+        CU(cuStreamWaitEvent(stream_, stage_ready_[b], 0));
+        DLayer S = L;
+        size_t off = 0;
+        auto h0 = cmoe_->mat(L.cpu_moe, 0), h1 = cmoe_->mat(L.cpu_moe, 1);
+        S.wgu_e.t = h0.t; S.wgu_e.rows = h0.rows; S.wgu_e.cols = h0.cols; S.wgu_e.d = xstage_[b]; off += align_up(h0.db, 256);
+        S.wgu_e.s = xstage_[b] + off; off += align_up(h0.sb, 256);
+        S.wdown_e.t = h1.t; S.wdown_e.rows = h1.rows; S.wdown_e.cols = h1.cols; S.wdown_e.d = xstage_[b] + off; off += align_up(h1.db, 256);
+        S.wdown_e.s = xstage_[b] + off;
+        moe_prefill(S, M, bp);
+        CU(cuEventRecord(stage_free_[b], stream_));
+        // refill this buffer with the layer after the one in the other buffer
+        const int nxt = next_cpu_moe_layer(std::max(stage_layer_[0], stage_layer_[1]));
+        if (nxt >= 0) stage_issue(b, nxt); else stage_layer_[b] = -1;
+    }
+
+    void moe_cpu(const DLayer& L, int M) {
+        const LayerCfg& lc = L.c;
+        const int H = c_.hidden, K = lc.top_k;
+        launch(f_route_, D3(M), D3(256), 0, x_, L.ffn_norm, L.router, lc.n_experts, K, lc.router == "sigmoid" ? 1 : 0,
+               L.expert_bias, lc.norm_topk ? 1 : 0, lc.routed_scale, moe_ids_, moe_w_);
+        launch(f_rms_f16_, D3(M), D3(256), 0, x_, L.ffn_norm, ha_);
+        launch(f_mpost_, D3(1), D3(1024), 0, cm_hdr_d_, cm_counter_, L.cpu_moe, M, K, H, moe_ids_, moe_w_, ha_, cm_buf_d_);
+        launch(f_mwait_, D3(std::min(28, std::max(1, M * H / 4096))), D3(256), 0, cm_hdr_d_, cm_counter_, (CUdeviceptr)(cm_buf_d_ + cm_out_off_), tmp_, M * H);
+        residual(M, tmp_, L.post_ffn_norm, lc.layer_scalar);
     }
 
     void moe_decode(const DLayer& L, int M) {
@@ -1072,6 +1297,7 @@ private:
 
     void prefill_pass(int M, int slot, int p0) {
         const int H = c_.hidden;
+        if (cmoe_) stage_begin(M);
         launch(f_embed_, D3(M), D3(256), 0, embd_.d, embd_.s, tok_ptr(), x_, c_.embed_scale);
         if (c_.ple_dim) ple_inputs(M, true);
         if (g_imatrix) imat_rows_ += M;
@@ -1112,7 +1338,7 @@ private:
                     launch(F("conv_state<0>"), D3((H + 255) / 256), D3(256), 0, proj_, 3 * H, H, lc.conv_k, st, M);
                 } else {
                     launch(F("causal_conv<0>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
-                           pos_ptr(), slot_ptr(), M, tmp_);
+                           pos_ptr(), slot_ptr(), M, tmp_, (CUdeviceptr)0, (CUdeviceptr)0);
                 }
                 launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * H);
                 if (g_imatrix) imat_acc(bp + "conv_out", hb_, M, H);
@@ -1132,9 +1358,9 @@ private:
                     launch(f_dnpost_, D3(M, (NV + 7) / 8), D3(256), 0, tmp_, proj_, R, CD, NV, DV, L.dn_norm, hb_);
                 } else {
                     launch(F("causal_conv<1>"), D3((CD + 127) / 128), D3(128), 0, proj_, R, CD, lc.dn_conv, L.dn_conv, L.st0,
-                           pos_ptr(), slot_ptr(), M, (CUdeviceptr)0);
+                           pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0);
                     launch(F(dn_name(lc.dn_dk, lc.dn_dv)), D3(lc.dn_nv), D3(2 * lc.dn_dv), 0, proj_, R, lc.dn_nk, lc.dn_nv, L.dn_A, L.dn_dt,
-                           L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_);
+                           L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_, (CUdeviceptr)0, (CUdeviceptr)0);
                     launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * VD);
                 }
                 if (g_imatrix) imat_acc(bp + "dn_out", hb_, M, VD);
@@ -1146,7 +1372,10 @@ private:
             const float fscalar = c_.ple_dim ? 1.f : lc.layer_scalar;
             launch(f_rms_f16_, D3(M), D3(256), 0, x_, L.ffn_norm, ha_);
             if (lc.n_experts) {
-                moe_prefill(L, M, bp);
+                if (L.cpu_moe >= 0) {
+                    if (stage_layer_[0] == l || stage_layer_[1] == l) moe_streamed(L, l, M, bp);
+                    else moe_cpu(L, M);
+                } else moe_prefill(L, M, bp);
             } else if (lc.ffn) {
                 if (g_imatrix) imat_acc(bp + "wgu", ha_, M, H);
                 gemm(L.wgu, ha_, M, 0, hb_, 2);
@@ -1232,13 +1461,14 @@ private:
     std::map<std::pair<CUfunction, int>, int> occ_;
     int* h_batch_ = nullptr;
     uint8_t* h_moe_ = nullptr;
+    std::unique_ptr<CpuMoe> cmoe_;
     static constexpr int NSTAGE = 4;
     CUevent stage_ev_[NSTAGE] = {};
     int stage_ = 0;
     float* h_out_ = nullptr;
     std::map<std::string, CUfunction> funcs_;
     CUfunction f_embed_, f_rms_q8_, f_rms_q8_rows_, f_rms_f16_, f_argmax_, f_kvcopy_, f_colsq_, f_rowmax_, f_cand_;
-    CUfunction f_embrows_, f_plecomb_, f_plemul_, f_dnpost_;
+    CUfunction f_embrows_, f_plecomb_, f_plemul_, f_dnpost_, f_mpost_, f_mwait_;
     CUdeviceptr dn_cv_ = 0, dn_kt_ = 0, dn_gq_ = 0, dn_kh_ = 0, dn_at_ = 0, dn_vt_ = 0, dn_gam_ = 0;
     DMat ple_embd_, ple_proj_;
     CUdeviceptr ple_proj_norm_ = 0, ple_buf_ = 0, ple_tmp_ = 0, ple_tmp2_ = 0;

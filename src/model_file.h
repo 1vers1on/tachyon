@@ -40,6 +40,7 @@ struct LayerCfg {
     float rope_theta = 10000.f;
     int rope_half = 0;           // rotation pairs are (i, i + rope_half); dims >= 2*rope_half untouched
     int rope_rot = 0;            // number of frequencies actually rotating (proportional rope: rest are 0)
+    int rope_den = 0;            // frequency exponent denominator: theta^(-2i/rope_den) (0 = head_dim; Qwen3.5: 2*rope_half)
     int window = 0;              // sliding window (0 = full causal)
     int qk_norm = 0;             // 0 none, 1 per head, 2 over the full q / k vectors (OLMoE)
     bool v_norm = false;         // Gemma 4: unweighted RMSNorm on values
@@ -83,6 +84,8 @@ struct ModelConfig {
     std::string rope_scaling;  // "" | "llama3" | "linear" | "yarn"
     float rope_factor = 1.f, rope_low_freq = 1.f, rope_high_freq = 4.f;
     int rope_orig_ctx = 8192;
+    std::vector<float> rope_short, rope_long;   // longrope: per-frequency divisors (long ones when ctx > rope_orig_ctx)
+    float rope_mscale = 1.f;                    // longrope attention factor on the rotated dims of q and k
     int max_ctx = 4096;
     QType wtype = QType::Q4;   // main weight type
     // generalized model description

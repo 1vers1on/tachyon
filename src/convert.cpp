@@ -260,16 +260,16 @@ int convert_main(int argc, char** argv) {
     const Json& hc = hc_root.has("text_config") ? hc_root["text_config"] : hc_root;  // multimodal wrappers: text part
     std::string mt = hc.get_str("model_type", hc_root.get_str("model_type", "llama"));
     ModelConfig c;
-    if (mt == "qwen3") c.arch = "qwen3";
+    if (mt == "qwen3" || mt == "qwen3_moe") c.arch = "qwen3";
     else if (mt == "qwen2") c.arch = "qwen2";
-    else if (mt == "llama" || mt == "mistral") c.arch = "llama";
+    else if (mt == "llama" || mt == "mistral" || mt == "smollm3" || mt == "granite" || mt == "phi3") c.arch = "llama";
     else if (mt == "gemma3_text" || mt == "gemma3") c.arch = "gemma3";
     else if (mt == "gemma4_text" || mt == "gemma4" || mt == "gemma4_unified_text" || mt == "gemma4_unified") c.arch = "gemma4";
     else if (mt == "lfm2") c.arch = "lfm2";
     else if (mt == "lfm2_moe") c.arch = "lfm2_moe";
     else if (mt == "olmoe") c.arch = "olmoe";
     else if (mt == "qwen3_5_text" || mt == "qwen3_5") c.arch = "qwen3_5";
-    else die("unsupported model_type %s (supported: qwen3, qwen2, llama, mistral, gemma3, gemma4, lfm2, lfm2_moe, olmoe, qwen3_5)", mt.c_str());
+    else die("unsupported model_type %s (supported: qwen3, qwen3_moe, qwen2, llama, mistral, smollm3, granite, phi3, gemma3, gemma4, lfm2, lfm2_moe, olmoe, qwen3_5)", mt.c_str());
     {
         std::string d = o.in_dir;
         while (!d.empty() && d.back() == '/') d.pop_back();
@@ -310,6 +310,10 @@ int convert_main(int argc, char** argv) {
         c.final_softcap = (float)hc.get_num("final_logit_softcapping", 0);
     }
     if (A == "lfm2" || A == "lfm2_moe" || A == "qwen3_5") c.stateful = true;
+    // Granite: multipliers folded into the graph (embedding scale) and weights (residual / logits, below)
+    const float res_mult = mt == "granite" ? (float)hc.get_num("residual_multiplier", 1.0) : 1.f;
+    const float logit_div = mt == "granite" ? (float)hc.get_num("logits_scaling", 1.0) : 1.f;
+    if (mt == "granite") c.embed_scale = (float)hc.get_num("embedding_multiplier", 1.0);
     if (A == "gemma4") c.ple_dim = (int)hc.get_int("hidden_size_per_layer_input", 0);
     const Json& rs = hc["rope_scaling"];
     if (rs.is_obj()) {
@@ -320,6 +324,14 @@ int convert_main(int argc, char** argv) {
             c.rope_low_freq = (float)rs.get_num("low_freq_factor", 1);
             c.rope_high_freq = (float)rs.get_num("high_freq_factor", 4);
             c.rope_orig_ctx = (int)rs.get_int("original_max_position_embeddings", 8192);
+        } else if (rt == "longrope") {
+            c.rope_scaling = "longrope";
+            for (auto& v : rs["short_factor"].arr) c.rope_short.push_back((float)v.as_num());
+            for (auto& v : rs["long_factor"].arr) c.rope_long.push_back((float)v.as_num());
+            c.rope_orig_ctx = (int)hc.get_int("original_max_position_embeddings", rs.get_int("original_max_position_embeddings", 4096));
+            const double factor = (double)c.max_ctx / c.rope_orig_ctx;
+            c.rope_mscale = rs.has("attention_factor") ? (float)rs.get_num("attention_factor", 1.0)
+                          : factor <= 1 ? 1.f : (float)sqrt(1 + log(factor) / log((double)c.rope_orig_ctx));
         } else if (rt == "linear") {
             c.rope_scaling = "linear";
             c.rope_factor = (float)rs.get_num("factor", 1);
@@ -348,6 +360,15 @@ int convert_main(int argc, char** argv) {
         L.rope_theta = c.rope_theta; L.rope_half = c.head_dim / 2; L.rope_rot = L.rope_half;
         L.ffn = c.ffn;
         if (A == "qwen3") L.qk_norm = 1;
+        if (mt == "smollm3") {   // NoPE layers: no_rope_layers[i] == 0
+            const Json& nr = hc["no_rope_layers"];
+            if (i < (int)nr.arr.size() && nr.arr[i].as_int() == 0) L.rope_rot = 0;
+        }
+        if (mt == "granite") L.attn_scale = (float)hc.get_num("attention_multiplier", 1.0 / sqrt((double)c.head_dim));
+        if (mt == "phi3") {
+            const int rot = (int)(c.head_dim * hc.get_num("partial_rotary_factor", 1.0));
+            L.rope_half = rot / 2; L.rope_rot = rot / 2; L.rope_den = rot;
+        }
         if (A == "olmoe") L.qk_norm = 2;
         if (A == "lfm2" || A == "lfm2_moe") {
             if (lt == "conv") { L.type = "conv"; L.conv_k = (int)hc.get_int("conv_L_cache", 3); }
@@ -398,6 +419,20 @@ int convert_main(int argc, char** argv) {
                 int rot = (int)(c.head_dim * prf);
                 L.rope_half = rot / 2;
                 L.rope_rot = rot / 2;
+            }
+        }
+        if (mt == "qwen3_moe") {
+            // sparse layers: not in mlp_only_layers and (i + 1) % decoder_sparse_step == 0
+            bool dense = false;
+            for (auto& x : hc["mlp_only_layers"].arr) if (x.as_int() == i) dense = true;
+            const int step = (int)hc.get_int("decoder_sparse_step", 1);
+            if (!dense && step > 0 && (i + 1) % step == 0) {
+                L.ffn = 0;
+                L.n_experts = (int)hc.get_int("num_experts", 128);
+                L.top_k = (int)hc.get_int("num_experts_per_tok", 8);
+                L.expert_ffn = (int)hc.get_int("moe_intermediate_size", 768);
+                L.router = "softmax";
+                L.norm_topk = hc.get_bool("norm_topk_prob", true);
             }
         }
         if (A == "olmoe") {
@@ -498,9 +533,13 @@ int convert_main(int argc, char** argv) {
     const int H = c.hidden;
     write_matrix("tok_embd", o.embed_type, V, H, simple(emb));
     write_vec("output_norm", first_of({P + "norm.weight", P + "embedding_norm.weight"}), norm_add);
-    if (c.tied_embed && o.head_type != QType::F32) {
-        // untie: the head (read every token) gets its own, typically smaller, format; the lookup table keeps embed_type
-        write_matrix("output", o.head_type, V, H, simple(emb));
+    if (c.tied_embed && (o.head_type != QType::F32 || logit_div != 1.f)) {
+        // untie: the head (read every token) gets its own, typically smaller, format; the lookup table keeps embed_type.
+        // Granite's logits_scaling is folded into the head.
+        write_matrix("output", o.head_type != QType::F32 ? o.head_type : o.embed_type, V, H, [&](int64_t r, float* buf) {
+            emb->to_float(buf, r * H, H);
+            if (logit_div != 1.f) for (int k = 0; k < H; k++) buf[k] /= logit_div;
+        });
         c.tied_embed = false;
     } else if (!c.tied_embed) {
         const STTensor* lm = st.get("lm_head.weight");
@@ -529,13 +568,15 @@ int convert_main(int argc, char** argv) {
         if (L.type == "attn") {
             std::string ap = p + "self_attn.";
             const int qd = L.q_dim(), kvd = L.kv_dim(), hd = L.head_dim;
-            const STTensor* wq = need(ap + "q_proj.weight");
-            const STTensor* wk = L.kv_src >= 0 ? nullptr : need(ap + "k_proj.weight");
-            const STTensor* wv = (L.kv_src >= 0 || L.k_eq_v) ? nullptr : need(ap + "v_proj.weight");
+            const STTensor* fqkv = st.get(ap + "qkv_proj.weight");   // Phi-3: already fused [q; k; v]
+            const STTensor* wq = fqkv ? nullptr : need(ap + "q_proj.weight");
+            const STTensor* wk = fqkv || L.kv_src >= 0 ? nullptr : need(ap + "k_proj.weight");
+            const STTensor* wv = fqkv || L.kv_src >= 0 || L.k_eq_v ? nullptr : need(ap + "v_proj.weight");
             const int qrows = qd * (L.attn_gate ? 2 : 1);
             // rows: [q (q and gate interleaved per head as in the checkpoint) ; k ; v]
             write_matrix(o_ + "wqkv", o.wtype, L.qkv_rows(), H, [&](int64_t r, float* buf) {
-                if (r < qrows) wq->to_float(buf, r * H, H);
+                if (fqkv) fqkv->to_float(buf, r * H, H);
+                else if (r < qrows) wq->to_float(buf, r * H, H);
                 else if (r < qrows + kvd) wk->to_float(buf, (r - qrows) * H, H);
                 else wv->to_float(buf, (r - qrows - kvd) * H, H);
             });
@@ -552,7 +593,13 @@ int convert_main(int argc, char** argv) {
                 if (L.kv_src < 0) write_vec(o_ + "k_norm", first_of({ap + "k_norm.weight", ap + "k_layernorm.weight"}), norm_add);
             }
             (void)hd;
-            write_matrix(o_ + "wo", o.wtype, H, qd, simple(first_of({ap + "o_proj.weight", ap + "out_proj.weight"})));
+            {
+                const STTensor* wo = first_of({ap + "o_proj.weight", ap + "out_proj.weight"});
+                write_matrix(o_ + "wo", o.wtype, H, qd, [&, wo](int64_t r, float* buf) {
+                    wo->to_float(buf, r * qd, qd);
+                    if (res_mult != 1.f) for (int k = 0; k < qd; k++) buf[k] *= res_mult;
+                });
+            }
         } else if (L.type == "conv") {
             write_matrix(o_ + "conv_in", o.wtype, 3 * H, H, simple(need(p + "conv.in_proj.weight")));
             write_vec(o_ + "conv_w", need(p + "conv.conv.weight"));  // [H][1][K] -> [H][K]
@@ -613,14 +660,22 @@ int convert_main(int argc, char** argv) {
             if (A == "lfm2" || A == "lfm2_moe") {
                 wg = need(p + "feed_forward.w1.weight"); wu = need(p + "feed_forward.w3.weight"); wd = need(p + "feed_forward.w2.weight");
             } else {
-                wg = need(p + "mlp.gate_proj.weight"); wu = need(p + "mlp.up_proj.weight"); wd = need(p + "mlp.down_proj.weight");
+                const STTensor* fgu = st.get(p + "mlp.gate_up_proj.weight");   // Phi-3: fused [gate; up]
+                wg = fgu ? fgu : need(p + "mlp.gate_proj.weight"); wu = fgu ? fgu : need(p + "mlp.up_proj.weight");
+                wd = need(p + "mlp.down_proj.weight");
             }
-            L.ffn = (int)wg->shape[0];
+            const bool fused_gu = wg == wu;
+            L.ffn = (int)wg->shape[0] / (fused_gu ? 2 : 1);
+            const int64_t F = L.ffn;
             // interleaved: row 2i = gate_i, row 2i+1 = up_i
-            write_matrix(o_ + "wgu", o.wtype, 2 * (int64_t)L.ffn, H, [&](int64_t r, float* buf) {
-                (r & 1 ? wu : wg)->to_float(buf, (r >> 1) * H, H);
+            write_matrix(o_ + "wgu", o.wtype, 2 * F, H, [&](int64_t r, float* buf) {
+                if (fused_gu) wg->to_float(buf, ((r & 1 ? F : 0) + (r >> 1)) * H, H);
+                else (r & 1 ? wu : wg)->to_float(buf, (r >> 1) * H, H);
             });
-            write_matrix(o_ + "wdown", o.wtype, H, L.ffn, simple(wd));
+            write_matrix(o_ + "wdown", o.wtype, H, L.ffn, [&, wd](int64_t r, float* buf) {
+                wd->to_float(buf, r * F, F);
+                if (res_mult != 1.f) for (int64_t k = 0; k < F; k++) buf[k] *= res_mult;
+            });
         }
         // Gemma 4 per-layer input embeddings: gate / projection / norm inside every layer
         if (c.ple_dim) {

@@ -21,6 +21,12 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
     }
     if (dev == "cpu") be.reset(create_cpu_backend());
     if (opt.backend.ctx > mf.config.max_ctx) opt.backend.ctx = mf.config.max_ctx;
+    if (opt.prefill_chunk <= 0) {
+        bool moe = false;
+        for (auto& l : mf.config.layers) moe |= l.n_experts > 0;
+        // experts streamed over PCIe once per prefill forward: bigger chunks amortize the transfer
+        opt.prefill_chunk = moe && dev == "cuda" && mf.file_size > (10ull << 30) ? 2048 : 512;
+    }
     opt.backend.max_batch = std::max(opt.backend.max_batch, opt.prefill_chunk);
     double t0 = now_sec();
     if (!opt.draft_model.empty()) {

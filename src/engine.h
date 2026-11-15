@@ -43,7 +43,7 @@ struct EngineOptions {
     BackendOptions backend;
     std::string device = "auto";  // auto | cuda | cpu
     int spec_draft = -1;          // n-gram speculative tokens per step (-1 = auto)
-    int prefill_chunk = 512;
+    int prefill_chunk = 0;        // 0 = auto (512; 2048 when MoE experts are likely streamed from system RAM)
     std::string draft_model;      // optional small model for speculative decoding (same tokenizer)
     int draft_k = 4;              // initial draft length (adapts per slot)
     int draft_vocab = 0;          // >0: draft model scores only token ids below this (experimental)

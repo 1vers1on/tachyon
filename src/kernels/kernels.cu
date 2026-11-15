@@ -420,7 +420,7 @@ struct RopeArgs {
     const int* pos; const int* slot;
     void* qout; kv_t* kc; kv_t* vc; float* ksc; float* vsc;
     int nrows, nh, nkv, qstride, qrows, kvd, half, qk_norm, v_norm, k_eq_v, own_kv, ctx;
-    float qscale;
+    float qscale, mscale;
 };
 template <int HD, int Q_F16>
 __global__ void __launch_bounds__(128) rope_t(const RopeArgs a) {
@@ -462,7 +462,7 @@ __global__ void __launch_bounds__(128) rope_t(const RopeArgs a) {
                 float sn, cs;
                 sincosf((float)pos * fr, &sn, &cs);
                 const float x0 = buf[w][f], x1 = buf[w][f + a.half];
-                v[e] = i < a.half ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
+                v[e] = (i < a.half ? x0 * cs - x1 * sn : x0 * sn + x1 * cs) * a.mscale;
             }
         }
     }
@@ -1629,11 +1629,13 @@ extern "C" __global__ void softcap_rows(float* __restrict__ l, size_t n, float c
 // batch order (one thread per channel walks all tokens, so tokens of one sequence must be in position order).
 //  MODE 0 (LFM2 short conv): row = [B | C | x] (3*C wide); y = C * conv(B * x)            -> out [M][C]
 //  MODE 1 (delta net):       row[0:C] = SiLU(conv(row[0:C]))                               (in place)
+//  MODE 2: MODE 0 with the output quantized to int8 blocks for the next GEMV (oq / ods), C % 32 == 0
 template <int MODE>
 __global__ void causal_conv(float* __restrict__ in, int stride, int C, int K, const float* __restrict__ w, float* __restrict__ state,
-                            const int* __restrict__ pos, const int* __restrict__ slot, int M, float* __restrict__ out) {
+                            const int* __restrict__ pos, const int* __restrict__ slot, int M, float* __restrict__ out,
+                            int8_t* __restrict__ oq, float2* __restrict__ ods) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= C) return;
+    if (ch >= C) return;   // C % 32 == 0: whole warps leave
     float wk[8];
     for (int k = 0; k < K; k++) wk[k] = w[ch * K + k];
     for (int m = 0; m < M; m++) {
@@ -1641,13 +1643,22 @@ __global__ void causal_conv(float* __restrict__ in, int stride, int C, int K, co
         if (pos[m] == 0)
             for (int k = 0; k < K - 1; k++) st[(size_t)k * C + ch] = 0.f;
         float* r = in + (size_t)m * stride;
-        const float xin = MODE == 0 ? r[ch] * r[2 * C + ch] : r[ch];
+        const float xin = MODE != 1 ? r[ch] * r[2 * C + ch] : r[ch];
         float acc = wk[K - 1] * xin;
         for (int k = 0; k < K - 1; k++) acc += wk[k] * st[(size_t)k * C + ch];
         for (int k = 0; k < K - 2; k++) st[(size_t)k * C + ch] = st[(size_t)(k + 1) * C + ch];
         st[(size_t)(K - 2) * C + ch] = xin;
         if (MODE == 0) out[(size_t)m * C + ch] = r[C + ch] * acc;
-        else r[ch] = acc / (1.f + __expf(-acc));
+        else if (MODE == 1) r[ch] = acc / (1.f + __expf(-acc));
+        else {
+            const float v = r[C + ch] * acc;
+            const float amax = warp_max(fabsf(v));
+            const float d = amax / 127.f;
+            const int qi = amax > 0 ? __float2int_rn(v / d) : 0;
+            const int sm = warp_sum_i(qi);
+            oq[(size_t)m * C + ch] = (int8_t)qi;
+            if ((threadIdx.x & 31) == 0) ods[(size_t)m * (C / 32) + ch / 32] = make_float2(d, d * sm);
+        }
     }
 }
 
@@ -1658,7 +1669,8 @@ __global__ void causal_conv(float* __restrict__ in, int stride, int C, int K, co
 template <int DK, int DV>
 __global__ void __launch_bounds__(2 * DV) delta_rule(const float* __restrict__ proj, int R, int NK, int NV, const float* __restrict__ A,
                                                       const float* __restrict__ dt, const float* __restrict__ nw, float* __restrict__ state,
-                                                      const int* __restrict__ pos, const int* __restrict__ slot, int M, float* __restrict__ out) {
+                                                      const int* __restrict__ pos, const int* __restrict__ slot, int M, float* __restrict__ out,
+                                                      int8_t* __restrict__ oq, float2* __restrict__ ods) {
     constexpr int HK = DK / 2;
     const int h = blockIdx.x;
     const int tid = threadIdx.x, j = tid % DV, half = tid / DV;
@@ -1734,7 +1746,17 @@ __global__ void __launch_bounds__(2 * DV) delta_rule(const float* __restrict__ p
             for (int i = 0; i < DV / 32; i++) t += red[i];
             const float sc = rsqrtf(t / DV + EPS);
             const float z = r[CD + h * DV + j];
-            out[(size_t)m * VD + h * DV + j] = o * sc * nw[j] * (z / (1.f + __expf(-z)));
+            const float v = o * sc * nw[j] * (z / (1.f + __expf(-z)));
+            if (oq) {   // int8 blocks for the out-projection GEMV (threads j = 0..DV-1 are whole warps)
+                const float amax = warp_max(fabsf(v));
+                const float d = amax / 127.f;
+                const int qi = amax > 0 ? __float2int_rn(v / d) : 0;
+                const int sm = warp_sum_i(qi);
+                oq[(size_t)m * VD + h * DV + j] = (int8_t)qi;
+                if ((j & 31) == 0) ods[(size_t)m * (VD / 32) + (h * DV + j) / 32] = make_float2(d, d * sm);
+            } else {
+                out[(size_t)m * VD + h * DV + j] = v;
+            }
         }
         __syncthreads();
     }
@@ -2066,6 +2088,45 @@ extern "C" __global__ void __launch_bounds__(256) dn_post(const float* __restric
     const float sc = rsqrtf(ss / DV + EPS);
     const float* z = proj + (size_t)m * R + CD + h * DV;
     for (int j = lane; j < DV; j += 32) oh[(size_t)m * NV * DV + h * DV + j] = __float2half(orow[j] * sc * nw[j] * (z[j] / (1.f + __expf(-z[j]))));
+}
+
+// ---- CPU-computed experts: request / response through host-mapped memory (polled, no host callbacks) ----
+// header (host mapped): [0] request seq, [1] layer, [2] M, [3] K, [16] done seq (own 64 B line)
+// request payload: ids [P] int | weights [P] float | xn [M][H] half ; response: out [M][H] float
+// grid 1, block 1024
+extern "C" __global__ void __launch_bounds__(1024) moe_post(volatile int* hdr, int* counter, int layer, int M, int K, int H,
+                                                            const int* __restrict__ ids, const float* __restrict__ w, const half* __restrict__ xn,
+                                                            uint8_t* hbuf) {
+    const int P = M * K, tid = threadIdx.x;
+    int* hid = (int*)hbuf;
+    float* hw = (float*)(hbuf + (size_t)P * 4);
+    uint4* hx = (uint4*)(hbuf + (size_t)P * 8);
+    for (int i = tid; i < P; i += 1024) { hid[i] = ids[i]; hw[i] = w[i]; }
+    const uint4* sx = (const uint4*)xn;
+    for (int i = tid; i < M * H / 8; i += 1024) hx[i] = sx[i];
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        const int c = *counter + 1;
+        *counter = c;
+        hdr[1] = layer; hdr[2] = M; hdr[3] = K;
+        __threadfence_system();
+        hdr[0] = c;
+    }
+}
+// spin until the CPU answered the current request, then copy its output. grid G, block 256
+extern "C" __global__ void __launch_bounds__(256) moe_wait(volatile int* hdr, const int* counter, const float* hout, float* __restrict__ out, int n) {
+    if (threadIdx.x == 0) {
+        const int c = *counter;
+        while (hdr[16] != c) __nanosleep(200);
+    }
+    __syncthreads();
+    const volatile float4* src = (const volatile float4*)hout;
+    float4* dst = (float4*)out;
+    for (int i = blockIdx.x * 256 + threadIdx.x; i < n / 4; i += gridDim.x * 256) {
+        float4 v; v.x = src[i].x; v.y = src[i].y; v.z = src[i].z; v.w = src[i].w;
+        dst[i] = v;
+    }
 }
 
 // ---- Mixture of experts ----
