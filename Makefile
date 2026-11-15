@@ -35,11 +35,15 @@ tachyon-client: $(BUILD)/client.o $(BUILD)/json.o
 $(BUILD)/file-probe: tests/file_probe.cpp $(BUILD)/model_file.o $(BUILD)/safetensors.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
-test: $(BUILD)/file-probe
-	python3 tests/file_test.py $(BUILD)/file-probe
-
-$(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
+$(BUILD)/kernel-test: tests/kernel_test.cpp $(BUILD)/cpu_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
+
+test: $(BUILD)/file-probe $(BUILD)/kernel-test
+	python3 tests/file_test.py $(BUILD)/file-probe
+	$(BUILD)/kernel-test
+
+$(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
 
 # Optional reference tests: needs torch, transformers, numpy and safetensors (no downloads).
 PYTHON ?= python3

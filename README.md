@@ -137,6 +137,8 @@ with greedy decoding.
 | Qwen3-30B-A3B (half of the experts in RAM) | 50 | 1.66k |
 
 On the CPU backend alone (8 threads), Qwen3-1.7B Q4 decodes at about 52 tok/s.
+With vectorized CPU attention, Qwen3-0.6B Q4 measures about 324 tok/s prefill and 75 tok/s decode
+after a 2048-token prompt (8 threads, 64 generated tokens, speculation off; two runs).
 
 To measure on your own hardware, run `./tachyon bench -m model.tach`.
 
@@ -200,8 +202,9 @@ data/           calibration text (wikitext-2 train) and evaluation text (wikitex
 ## Testing
 
 ```bash
-make test                                # offline model-file validation (Python standard library)
+make test                                # offline file validation + CPU kernel reference checks
 make test-models PYTHON=.venv/bin/python  # tiny model conversion + CPU logits vs Transformers; no downloads
+TACH_TEST_DEVICE=cuda make test-models PYTHON=.venv/bin/python  # quantized references on CUDA
 tools/regress.sh                          # perplexity regression across models, both CUDA paths
 python tools/api_test.py 28657 qwen3:1.7b  # OpenAI + Anthropic SDK tests (pip install openai anthropic)
 python tools/tool_test.py 28657 MODEL...   # tool-call round trip and prefix reuse per model

@@ -127,14 +127,30 @@ inline void dot_q8(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, 
 
 inline float dot_f16(const uint16_t* w, const float* x, int K) {
     __m512 acc = _mm512_setzero_ps();
-    for (int i = 0; i < K; i += 16)
+    int i = 0;
+    for (; i + 16 <= K; i += 16)
         acc = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(w + i))), _mm512_loadu_ps(x + i), acc);
-    return hsum(acc);
+    float sum = hsum(acc);
+    for (; i < K; i++) sum += h2f(w[i]) * x[i];
+    return sum;
 }
 inline float dot_f32(const float* w, const float* x, int K) {
     __m512 acc = _mm512_setzero_ps();
-    for (int i = 0; i < K; i += 16) acc = _mm512_fmadd_ps(_mm512_loadu_ps(w + i), _mm512_loadu_ps(x + i), acc);
-    return hsum(acc);
+    int i = 0;
+    for (; i + 16 <= K; i += 16) acc = _mm512_fmadd_ps(_mm512_loadu_ps(w + i), _mm512_loadu_ps(x + i), acc);
+    float sum = hsum(acc);
+    for (; i < K; i++) sum += w[i] * x[i];
+    return sum;
+}
+
+inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
+    const __m512 p = _mm512_set1_ps(scale);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 value = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(v + i)));
+        _mm512_storeu_ps(out + i, _mm512_fmadd_ps(p, value, _mm512_loadu_ps(out + i)));
+    }
+    for (; i < n; i++) out[i] += scale * h2f(v[i]);
 }
 
 template <int T>
@@ -482,7 +498,7 @@ private:
         const int group = lc.n_heads / lc.n_kv_heads;
         float* out = big_.data() + (size_t)M * nrows;  // [M][qd] (after the qkv rows)
         pool_->parallel_for((int64_t)M * lc.n_heads, [&](int64_t a, int64_t b) {
-            std::vector<float> sc(opt.ctx), kf(hd);
+            std::vector<float> sc(lc.window > 0 ? std::min(opt.ctx, lc.window) : opt.ctx);
             for (int64_t task = a; task < b; task++) {
                 int m = (int)(task / lc.n_heads), h = (int)(task % lc.n_heads);
                 int kvh = h / group;
@@ -493,21 +509,20 @@ private:
                 const uint16_t* vb = kv_ptr(L, vc_, batch[m].slot, kvh, 0);
                 float mx = -INFINITY;
                 for (int t = t0; t <= pos; t++) {
-                    float s = 0;
                     const uint16_t* kr = kb + (size_t)(t % L.kv_cap) * hd;
-                    for (int i = 0; i < hd; i++) s += q[i] * h2f(kr[i]);
-                    sc[t] = s;
+                    float s = dot_f16(kr, q, hd);
+                    sc[t - t0] = s;
                     mx = std::max(mx, s);
                 }
                 float sum = 0;
-                for (int t = t0; t <= pos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+                for (int t = t0; t <= pos; t++) { sc[t - t0] = expf(sc[t - t0] - mx); sum += sc[t - t0]; }
                 float inv = 1.f / sum;
                 float* o = out + (size_t)m * qd + h * hd;
                 for (int i = 0; i < hd; i++) o[i] = 0;
                 for (int t = t0; t <= pos; t++) {
-                    float p = sc[t] * inv;
+                    float p = sc[t - t0] * inv;
                     const uint16_t* vr = vb + (size_t)(t % L.kv_cap) * hd;
-                    for (int i = 0; i < hd; i++) o[i] += p * h2f(vr[i]);
+                    add_scaled_f16(o, vr, p, hd);
                 }
                 if (lc.attn_gate) {
                     const float* g = qkv + (size_t)m * nrows + h * qstride + hd;
@@ -795,10 +810,10 @@ private:
             q.d = ptrs_[n].first; q.s = ptrs_[n].second;
             if (q.t == QType::Q3) {
                 // CPU runs Q3 through the Q4 kernels (values 0..7 fit in nibbles; same scale format)
-                auto* buf = new std::vector<uint8_t>((size_t)q.rows * q.cols / 2);
+                auto& buf = converted_q3_.emplace_back((size_t)q.rows * q.cols / 2);
                 for (int r = 0; r < q.rows; r++) {
                     const uint8_t* src = q.d + (size_t)r * q.cols * 3 / 8;
-                    uint8_t* dst = buf->data() + (size_t)r * q.cols / 2;
+                    uint8_t* dst = buf.data() + (size_t)r * q.cols / 2;
                     for (int b = 0; b < q.cols / 32; b++) {
                         const uint32_t* blk = (const uint32_t*)(src + b * 12);
                         uint8_t v[32];
@@ -809,17 +824,17 @@ private:
                         for (int j = 0; j < 16; j++) dst[b * 16 + j] = v[j] | (v[j + 16] << 4);
                     }
                 }
-                q.t = QType::Q4; q.d = buf->data();
+                q.t = QType::Q4; q.d = buf.data();
             }
             if (getenv("TACH_DEBUG_DEQUANT") && (q.t == QType::Q4 || q.t == QType::Q8)) {
                 // debug: run with dequantized f16 weights (isolates quantization error from kernel bugs)
-                auto* buf = new std::vector<uint16_t>((size_t)q.rows * q.cols);
+                auto& buf = dequantized_.emplace_back((size_t)q.rows * q.cols);
                 std::vector<float> row(q.cols);
                 for (int r = 0; r < q.rows; r++) {
                     dequantize_row(q.t, q.d + qtype_data_bytes(q.t, 1, q.cols) * r, q.s + qtype_scale_bytes(q.t, 1, q.cols) * r, q.cols, row.data());
-                    for (int k = 0; k < q.cols; k++) (*buf)[(size_t)r * q.cols + k] = f2h(row[k]);
+                    for (int k = 0; k < q.cols; k++) buf[(size_t)r * q.cols + k] = f2h(row[k]);
                 }
-                q.t = QType::F16; q.d = (const uint8_t*)buf->data(); q.s = nullptr;
+                q.t = QType::F16; q.d = (const uint8_t*)buf.data(); q.s = nullptr;
             }
             return q;
         };
@@ -880,6 +895,8 @@ private:
     void* wmem_ = nullptr;
     size_t wmem_size_ = 0;
     std::map<std::string, std::pair<uint8_t*, uint8_t*>> ptrs_;
+    std::vector<std::vector<uint8_t>> converted_q3_;
+    std::vector<std::vector<uint16_t>> dequantized_;
     QMat embd_, out_, ple_embd_, ple_proj_;
     const float* out_norm_ = nullptr;
     const float* ple_proj_norm_ = nullptr;
@@ -902,8 +919,31 @@ Backend* create_cpu_backend() { return new CpuBackend(); }
 void cpu_selftest() {
     std::mt19937 rng(1);
     std::normal_distribution<float> nd(0, 1);
-    for (QType qt : {QType::Q4, QType::Q8}) {
-        int K = 1024, N = 4, M = 3;
+    int checks = 0;
+    auto check = [&](float actual, double reference, const char* what) {
+        if (!std::isfinite(actual) || fabs(actual - reference) > 2e-5 * (1 + fabs(reference)))
+            die("selftest %s failed: kernel %.9g reference %.9g", what, actual, reference);
+        checks++;
+    };
+    // Include non-vector-aligned lengths: the attention helpers must never read past a head.
+    for (int K : {1, 15, 16, 17, 64, 128, 256, 512, 1025}) {
+        std::vector<float> w(K), x(K), out(K);
+        std::vector<uint16_t> wh(K);
+        double ref = 0, refh = 0;
+        for (int i = 0; i < K; i++) {
+            w[i] = nd(rng); x[i] = nd(rng); wh[i] = f2h(w[i]);
+            ref += (double)w[i] * x[i]; refh += (double)h2f(wh[i]) * x[i];
+            out[i] = x[i];
+        }
+        check(dot_f32(w.data(), x.data(), K), ref, "f32 dot");
+        check(dot_f16(wh.data(), x.data(), K), refh, "f16 dot");
+        add_scaled_f16(out.data(), wh.data(), 0.375f, K);
+        for (int i = 0; i < K; i++) check(out[i], x[i] + 0.375 * h2f(wh[i]), "attention value");
+    }
+    for (QType qt : {QType::Q4, QType::Q8, QType::F16, QType::F32})
+    for (int K : {64, 128, 1024})
+    for (int M : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17}) {
+        const int N = 4;
         std::vector<float> W((size_t)N * K), X((size_t)M * K);
         for (auto& v : W) v = nd(rng) * 0.02f;
         for (auto& v : X) v = nd(rng);
@@ -917,12 +957,19 @@ void cpu_selftest() {
         for (int m = 0; m < M; m++)
             for (int r = 0; r < N; r++) {
                 std::vector<float> wr(K);
-                dequantize_row(qt, d.data() + qtype_data_bytes(qt, 1, K) * r, s.data() + qtype_scale_bytes(qt, 1, K) * r, K, wr.data());
+                dequantize_row(qt, d.data() + qtype_data_bytes(qt, 1, K) * r,
+                               s.empty() ? nullptr : s.data() + qtype_scale_bytes(qt, 1, K) * r, K, wr.data());
                 double ref = 0;
-                for (int k = 0; k < K; k++) ref += wr[k] * X[m * K + k];
-                printf("%s m=%d r=%d kernel=%.5f ref=%.5f\n", qtype_name(qt), m, r, y[m * N + r], ref);
+                for (int k = 0; k < K; k++) {
+                    // Compare to the actual int8 inputs, so a broken kernel cannot hide behind quantization error.
+                    const float x = qt == QType::Q4 || qt == QType::Q8
+                        ? a.q[(size_t)m * K + k] * a.d[(size_t)m * (K / 64) + k / 64] : X[m * K + k];
+                    ref += (double)wr[k] * x;
+                }
+                check(y[m * N + r], ref, qtype_name(qt));
             }
     }
+    printf("CPU kernels: %d reference checks passed\n", checks);
 }
 
 // ================================================================================================
