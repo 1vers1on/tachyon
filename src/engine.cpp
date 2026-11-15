@@ -48,6 +48,12 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
     logi("model %s loaded on %s in %.2fs (%d layers, hidden %d, vocab %d, %s)", model_name.c_str(), be->name(),
          now_sec() - t0, mf.config.n_layers, mf.config.hidden, mf.config.vocab, qtype_name(mf.config.wtype));
     if (opt.spec_draft < 0) opt.spec_draft = std::string(be->name()) == "cuda" || dbe ? 4 : 0;
+    if (mf.config.stateful) {
+        // recurrent state (short conv / delta net) cannot be rolled back after rejected drafts
+        if (opt.spec_draft > 0 || dbe) logi("model has recurrent state: speculative decoding disabled");
+        opt.spec_draft = 0;
+        dbe.reset();
+    }
     slots_.resize(opt.backend.n_slots);
     logits_buf_.resize(be->vocab());
 }
@@ -123,6 +129,8 @@ void Engine::admit() {
         if (r->prompt.empty()) r->prompt.push_back(tok.bos() >= 0 ? tok.bos() : 0);
         // keep at least one prompt token to evaluate so we get logits
         int keep = std::min(best_lcp, (int)r->prompt.size() - 1);
+        // recurrent state only describes the whole cached sequence: reuse all of it or nothing
+        if (mf.config.stateful && keep != (int)s.cache.size()) keep = 0;
         s.cache.resize(keep);
         if ((int)s.dcache.size() > keep) s.dcache.resize(keep);
         {

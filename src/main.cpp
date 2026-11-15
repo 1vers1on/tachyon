@@ -36,7 +36,7 @@ static void usage() {
 struct Args {
     std::string model, prompt, host = "127.0.0.1", device = "auto", out;
     int port = 8080, n = 256, ctx = 8192, slots = -1, threads = 0, spec = -1, prompt_len = 512;
-    bool chat = false, kv8 = false, graphs = true, no_think = false;
+    bool chat = false, kv8 = false, graphs = true, no_think = false, think = false;
     std::string draft;
     int draft_k = 4, draft_vocab = 0;
     SamplingParams sp;
@@ -67,6 +67,7 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--device") a.device = next();
         else if (s == "--chat") a.chat = true;
         else if (s == "--no-think") a.no_think = true;
+        else if (s == "--think") a.think = true;
         else if (s == "--kv8") a.kv8 = true;
         else if (s == "--no-graphs") a.graphs = false;
         else if (s == "--temp") { a.sp.temperature = atof(next().c_str()); a.temp_set = true; }
@@ -211,7 +212,7 @@ int main(int argc, char** argv) {
     if (cmd == "run") {
         auto r = std::make_shared<GenRequest>();
         std::string text = a.prompt;
-        if (a.chat) text = e.tok.render_chat({{"user", a.prompt, ""}}, true, !a.no_think);
+        if (a.chat) text = e.tok.render_chat({{"user", a.prompt, ""}}, true, a.no_think ? false : (a.think || e.tok.think_default()));
         r->prompt = e.tok.encode(text);
         r->sp = a.sp;
         r->max_tokens = a.n;

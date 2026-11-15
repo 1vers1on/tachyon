@@ -354,7 +354,7 @@ private:
                 msgs.push_back(cm);
             }
             if (msgs.empty()) return c.send_response(400, "application/json", error_json("messages must be a non-empty array").dump(), hr.keep_alive);
-            bool enable_thinking = true;
+            bool enable_thinking = e_.tok.think_default();
             const Json& kw = j["chat_template_kwargs"];
             if (kw.has("enable_thinking")) enable_thinking = kw.get_bool("enable_thinking", true);
             if (j.has("enable_thinking")) enable_thinking = j.get_bool("enable_thinking", true);
@@ -387,7 +387,7 @@ private:
         e_.submit(req);
 
         ThinkSplitter split;
-        split.init(chat && thinking, false);
+        split.init(chat && thinking, chat && e_.tok.think_opens_in_prompt(thinking));
         std::string tool_buf;
         bool in_tool = false;
 

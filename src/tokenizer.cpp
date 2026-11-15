@@ -35,6 +35,10 @@ bool unicode_is_number(uint32_t cp) {
     if (cp < 128) return g_ascii_class[cp] & 2;
     return in_ranges(k_unicode_number_ranges, k_unicode_number_count, cp);
 }
+bool unicode_is_mark(uint32_t cp) {
+    if (cp < 0x300) return false;
+    return in_ranges(k_unicode_mark_ranges, k_unicode_mark_count, cp);
+}
 bool unicode_is_space(uint32_t cp) {
     if (cp < 128) return g_ascii_class[cp] & 4;
     return cp == 0x85 || cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 ||
@@ -85,13 +89,37 @@ void Tokenizer::load(const ModelFile& mf) {
     const uint32_t* offs = (const uint32_t*)vo->data;
     vocab_.resize(nv);
     ttype_.assign(ty->data, ty->data + nv);
+    spm_ = tj.get_str("type", "") == "bpe_spm";
     for (int i = 0; i < nv; i++) {
         vocab_[i].assign((const char*)vd->data + offs[i], offs[i + 1] - offs[i]);
         if (ttype_[i] == 0) tok2id_.emplace(vocab_[i], i);
     }
+    if (spm_) {
+        // decoded form: U+2581 -> ' ', <0xNN> -> byte NN
+        dec_.resize(nv);
+        for (int i = 0; i < nv; i++) {
+            const std::string& v = vocab_[i];
+            if (v.size() == 6 && v.compare(0, 3, "<0x") == 0 && v[5] == '>' && ttype_[i] == 0) {
+                dec_[i] = std::string(1, (char)strtol(v.substr(3, 2).c_str(), nullptr, 16));
+                continue;
+            }
+            std::string d;
+            for (size_t k = 0; k < v.size();) {
+                if (k + 2 < v.size() && (unsigned char)v[k] == 0xE2 && (unsigned char)v[k + 1] == 0x96 && (unsigned char)v[k + 2] == 0x81) { d += ' '; k += 3; }
+                else d += v[k++];
+            }
+            dec_[i] = d;
+        }
+    }
     for (int b = 0; b < 256; b++) {
-        auto it = tok2id_.find(std::string(1, (char)b));
-        byte_tok_[b] = it == tok2id_.end() ? -1 : it->second;
+        if (spm_) {
+            char nm[8]; snprintf(nm, sizeof nm, "<0x%02X>", b);
+            auto it = tok2id_.find(nm);
+            byte_tok_[b] = it == tok2id_.end() ? -1 : it->second;
+        } else {
+            auto it = tok2id_.find(std::string(1, (char)b));
+            byte_tok_[b] = it == tok2id_.end() ? -1 : it->second;
+        }
     }
     const int32_t* m = (const int32_t*)mg->data;
     int64_t nm = mg->size / 12;
@@ -102,12 +130,17 @@ void Tokenizer::load(const ModelFile& mf) {
     }
     for (auto& s : tj["specials"].arr) specials_.push_back({s.get_str("content", ""), (int)s.get_int("id", -1)});
     std::sort(specials_.begin(), specials_.end(), [](const Special& a, const Special& b) { return a.s.size() > b.s.size(); });
+    for (auto& sp : specials_) if (!sp.s.empty()) special_first_[(unsigned char)sp.s[0]] = true;
     pretok_ = tj.get_str("pretokenizer", "qwen2");
     for (auto& e : tj["eos"].arr) eos_.push_back((int)e.as_int());
     bos_ = (int)tj.get_int("bos", -1);
     add_bos_ = tj.get_bool("add_bos", false);
     thinking_ = tj.get_bool("thinking", false);
     chat_format_ = tj.get_str("chat_format", "chatml");
+    chat_prefix_ = tj.get_str("chat_prefix", "");
+    think_default_ = tj.get_bool("think_default", true);
+    think_open_ = tj.get_bool("think_open", false);
+    think_disable_block_ = tj.get_bool("think_disable_block", true);
 }
 
 bool Tokenizer::is_eos(int id) const {
@@ -124,8 +157,9 @@ int Tokenizer::token_id(const std::string& s) const {
 // Hand-written equivalent of the HF pre-tokenizer regexes. Produces [start,end) codepoint spans.
 void Tokenizer::pretokenize(const uint32_t* c, int n, std::vector<std::pair<int, int>>& out) const {
     const bool gpt2 = pretok_ == "gpt2";
+    const bool q35 = pretok_ == "qwen35";
     const int max_digits = pretok_ == "llama3" ? 3 : (gpt2 ? 1 << 30 : 1);
-    auto L = [&](int i) { return i < n && unicode_is_letter(c[i]); };
+    auto L = [&](int i) { return i < n && (unicode_is_letter(c[i]) || (q35 && unicode_is_mark(c[i]))); };
     auto N = [&](int i) { return i < n && unicode_is_number(c[i]); };
     auto S = [&](int i) { return i < n && unicode_is_space(c[i]); };
     auto lower = [](uint32_t x) { return x >= 'A' && x <= 'Z' ? x + 32 : x; };
@@ -197,19 +231,7 @@ void Tokenizer::bpe(const std::string& piece, std::vector<int>& out) const {
     else {
         sym.reserve(piece.size());
         for (unsigned char b : piece) sym.push_back(byte_tok_[b]);
-        while (sym.size() > 1) {
-            int best = -1, best_rank = INT32_MAX, best_id = -1;
-            for (size_t k = 0; k + 1 < sym.size(); k++) {
-                uint64_t key = ((uint64_t)(uint32_t)sym[k] << 32) | (uint32_t)sym[k + 1];
-                auto it = merges_.find(key);
-                if (it != merges_.end() && it->second.first < best_rank) {
-                    best_rank = it->second.first; best = (int)k; best_id = it->second.second;
-                }
-            }
-            if (best < 0) break;
-            sym[best] = best_id;
-            sym.erase(sym.begin() + best + 1);
-        }
+        bpe_merge(sym);
     }
     out.insert(out.end(), sym.begin(), sym.end());
     std::lock_guard<std::mutex> lk(cache_mu_);
@@ -217,8 +239,68 @@ void Tokenizer::bpe(const std::string& piece, std::vector<int>& out) const {
     cache_.emplace(piece, std::move(sym));
 }
 
+// Lowest-rank-first BPE with a heap over adjacent pairs and a linked list of symbols: O(n log n).
+void Tokenizer::bpe_merge(std::vector<int>& sym) const {
+    const int n = (int)sym.size();
+    if (n < 2) return;
+    std::vector<int> prv(n), nxt(n);
+    for (int i = 0; i < n; i++) { prv[i] = i - 1; nxt[i] = i + 1 < n ? i + 1 : -1; }
+    struct Item { int rank, left, a, b; };
+    auto cmp = [](const Item& x, const Item& y) { return x.rank != y.rank ? x.rank > y.rank : x.left > y.left; };
+    std::vector<Item> heap;
+    auto push = [&](int left) {
+        if (left < 0 || nxt[left] < 0) return;
+        int a = sym[left], b = sym[nxt[left]];
+        if (a < 0 || b < 0) return;
+        auto it = merges_.find(((uint64_t)(uint32_t)a << 32) | (uint32_t)b);
+        if (it == merges_.end()) return;
+        heap.push_back({it->second.first, left, a, b});
+        std::push_heap(heap.begin(), heap.end(), cmp);
+    };
+    for (int i = 0; i + 1 < n; i++) push(i);
+    while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), cmp);
+        Item it = heap.back();
+        heap.pop_back();
+        int l = it.left, r = nxt[l];
+        if (sym[l] != it.a || r < 0 || sym[r] != it.b) continue;  // stale entry
+        auto m = merges_.find(((uint64_t)(uint32_t)it.a << 32) | (uint32_t)it.b);
+        sym[l] = m->second.second;
+        sym[r] = -2;  // dead
+        nxt[l] = nxt[r];
+        if (nxt[r] >= 0) prv[nxt[r]] = l;
+        push(prv[l]);
+        push(l);
+    }
+    int w = 0;
+    for (int i = 0; i >= 0 && i < n; i = nxt[i]) sym[w++] = sym[i];
+    sym.resize(w);
+}
+
+// SentencePiece-style BPE (Gemma): spaces -> U+2581, the whole text is one word, characters missing from
+// the vocabulary fall back to <0xNN> byte tokens.
+void Tokenizer::encode_spm(const std::string& text, std::vector<int>& out) const {
+    std::vector<int> sym;
+    size_t i = 0;
+    auto add_bytes = [&](const char* p, size_t n) { for (size_t k = 0; k < n; k++) sym.push_back(byte_tok_[(unsigned char)p[k]]); };
+    std::string ch;
+    while (i < text.size()) {
+        unsigned char c = text[i];
+        int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+        if (i + len > text.size()) len = 1;
+        if (c == ' ') ch = "\xE2\x96\x81"; else ch.assign(text, i, len);
+        auto it = tok2id_.find(ch);
+        if (it != tok2id_.end()) sym.push_back(it->second);
+        else add_bytes(ch.data(), ch.size());
+        i += len;
+    }
+    bpe_merge(sym);
+    out.insert(out.end(), sym.begin(), sym.end());
+}
+
 void Tokenizer::encode_plain(const std::string& text, std::vector<int>& out) const {
     if (text.empty()) return;
+    if (spm_) { encode_spm(text, out); return; }
     std::vector<uint32_t> cps;
     std::vector<int> offs;
     utf8_decode(text, cps, offs);
@@ -234,7 +316,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool parse_special) 
     size_t start = 0, i = 0;
     while (i < text.size()) {
         bool matched = false;
-        if (text[i] == '<' || text[i] == '[' || (unsigned char)text[i] >= 0x80 || text[i] == '|') {
+        if (special_first_[(unsigned char)text[i]]) {
             for (auto& sp : specials_) {
                 if (!sp.s.empty() && text.compare(i, sp.s.size(), sp.s) == 0) {
                     encode_plain(text.substr(start, i - start), out);
@@ -254,7 +336,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool parse_special) 
 
 std::string Tokenizer::decode(const std::vector<int>& ids) const {
     std::string s;
-    for (int id : ids) if (id >= 0 && id < (int)vocab_.size()) s += vocab_[id];
+    for (int id : ids) if (id >= 0 && id < (int)vocab_.size()) s += token_bytes(id);
     return s;
 }
 
@@ -280,18 +362,51 @@ static std::string strip_nl(const std::string& s) {
 
 std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,
                                    const std::vector<std::string>& tools) const {
-    std::string o;
+    std::string o = chat_prefix_;
     if (chat_format_ == "llama3") {
         o += "<|begin_of_text|>";
         for (auto& m : msgs) o += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n" + m.content + "<|eot_id|>";
         if (add_gen) o += "<|start_header_id|>assistant<|end_header_id|>\n\n";
         return o;
     }
+    auto trim = [](const std::string& x) {
+        size_t a = x.find_first_not_of(" \t\n\r"), b = x.find_last_not_of(" \t\n\r");
+        return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
+    };
+    if (chat_format_ == "gemma" || chat_format_ == "gemma4") {
+        // Gemma: the system prompt is prepended to the first user turn; assistant role is "model"
+        const bool g4 = chat_format_ == "gemma4";
+        const std::string so = g4 ? "<|turn>" : "<start_of_turn>", eo = g4 ? "<turn|>\n" : "<end_of_turn>\n";
+        std::string sys;
+        size_t i0 = 0;
+        if (!msgs.empty() && msgs[0].role == "system") {
+            if (g4) o += so + "system\n" + trim(msgs[0].content) + eo;
+            else sys = msgs[0].content + "\n\n";
+            i0 = 1;
+        }
+        for (size_t i = i0; i < msgs.size(); i++) {
+            const auto& m = msgs[i];
+            std::string role = m.role == "assistant" ? "model" : m.role;
+            std::string content = m.content;
+            if (m.role == "assistant") {  // drop reasoning from history
+                size_t p = content.find("</think>");
+                if (p != std::string::npos) content = content.substr(p + 8);
+            }
+            o += so + role + "\n" + (i == i0 ? sys : std::string()) + trim(content) + eo;
+        }
+        if (add_gen) o += so + "model\n";
+        return o;
+    }
+    if (chat_format_ == "tulu") {
+        for (auto& m : msgs) o += "<|" + m.role + "|>\n" + m.content + (m.role == "assistant" ? "<|endoftext|>\n" : "\n");
+        if (add_gen) o += "<|assistant|>\n";
+        return o;
+    }
     if (chat_format_ == "raw") {
         for (auto& m : msgs) o += m.content + "\n";
         return o;
     }
-    // ChatML (Qwen family). Mirrors the Qwen3 template: reasoning of earlier turns is dropped.
+    // ChatML (Qwen / LFM2 family). Mirrors the Qwen3 template: reasoning of earlier turns is dropped.
     int last_user = -1;
     for (int i = (int)msgs.size() - 1; i >= 0; i--) if (msgs[i].role == "user") { last_user = i; break; }
     size_t first = 0;
@@ -332,7 +447,10 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
     }
     if (add_gen) {
         o += "<|im_start|>assistant\n";
-        if (thinking_ && !enable_thinking) o += "<think>\n\n</think>\n\n";
+        if (thinking_) {
+            if (!enable_thinking && think_disable_block_) o += "<think>\n\n</think>\n\n";
+            else if (enable_thinking && think_open_) o += "<think>\n";
+        }
     }
     return o;
 }

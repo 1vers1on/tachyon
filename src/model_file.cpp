@@ -4,6 +4,50 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+Json LayerCfg::to_json() const {
+    Json j = Json::object();
+    j.set("type", type);
+    if (type == "attn") {
+        j.set("n_heads", n_heads); j.set("n_kv_heads", n_kv_heads); j.set("head_dim", head_dim);
+        j.set("rope_theta", (double)rope_theta); j.set("rope_half", rope_half); j.set("rope_rot", rope_rot);
+        j.set("window", window); j.set("qk_norm", qk_norm); j.set("v_norm", v_norm); j.set("attn_gate", attn_gate);
+        j.set("k_eq_v", k_eq_v); j.set("attn_scale", (double)attn_scale); j.set("kv_src", kv_src);
+    } else if (type == "conv") {
+        j.set("conv_k", conv_k);
+    } else if (type == "deltanet") {
+        j.set("dn_nk", dn_nk); j.set("dn_nv", dn_nv); j.set("dn_dk", dn_dk); j.set("dn_dv", dn_dv); j.set("dn_conv", dn_conv);
+    }
+    j.set("ffn", ffn);
+    if (n_experts) {
+        j.set("n_experts", n_experts); j.set("top_k", top_k); j.set("expert_ffn", expert_ffn); j.set("router", router);
+        j.set("norm_topk", norm_topk); j.set("routed_scale", (double)routed_scale); j.set("expert_bias", expert_bias);
+    }
+    j.set("sandwich", sandwich);
+    j.set("layer_scalar", (double)layer_scalar);
+    return j;
+}
+
+LayerCfg LayerCfg::from_json(const Json& j) {
+    LayerCfg l;
+    l.type = j.get_str("type", "attn");
+    l.n_heads = (int)j.get_int("n_heads", 0); l.n_kv_heads = (int)j.get_int("n_kv_heads", 0); l.head_dim = (int)j.get_int("head_dim", 0);
+    l.rope_theta = (float)j.get_num("rope_theta", 10000); l.rope_half = (int)j.get_int("rope_half", l.head_dim / 2);
+    l.rope_rot = (int)j.get_int("rope_rot", l.rope_half);
+    l.window = (int)j.get_int("window", 0); l.qk_norm = (int)j.get_int("qk_norm", 0); l.v_norm = j.get_bool("v_norm", false);
+    l.attn_gate = j.get_bool("attn_gate", false); l.k_eq_v = j.get_bool("k_eq_v", false);
+    l.attn_scale = (float)j.get_num("attn_scale", 0); l.kv_src = (int)j.get_int("kv_src", -1);
+    l.conv_k = (int)j.get_int("conv_k", 0);
+    l.dn_nk = (int)j.get_int("dn_nk", 0); l.dn_nv = (int)j.get_int("dn_nv", 0); l.dn_dk = (int)j.get_int("dn_dk", 0);
+    l.dn_dv = (int)j.get_int("dn_dv", 0); l.dn_conv = (int)j.get_int("dn_conv", 0);
+    l.ffn = (int)j.get_int("ffn", 0);
+    l.n_experts = (int)j.get_int("n_experts", 0); l.top_k = (int)j.get_int("top_k", 0); l.expert_ffn = (int)j.get_int("expert_ffn", 0);
+    l.router = j.get_str("router", "softmax"); l.norm_topk = j.get_bool("norm_topk", false);
+    l.routed_scale = (float)j.get_num("routed_scale", 1); l.expert_bias = j.get_bool("expert_bias", false);
+    l.sandwich = j.get_bool("sandwich", false);
+    l.layer_scalar = (float)j.get_num("layer_scalar", 1);
+    return l;
+}
+
 Json ModelConfig::to_json() const {
     Json j = Json::object();
     j.set("arch", arch);
@@ -27,6 +71,13 @@ Json ModelConfig::to_json() const {
     j.set("rope_orig_ctx", rope_orig_ctx);
     j.set("max_ctx", max_ctx);
     j.set("wtype", qtype_name(wtype));
+    j.set("act", act);
+    j.set("embed_scale", (double)embed_scale);
+    j.set("final_softcap", (double)final_softcap);
+    j.set("stateful", stateful);
+    Json ls = Json::array();
+    for (auto& l : layers) ls.push(l.to_json());
+    j.set("layers", ls);
     return j;
 }
 
@@ -53,6 +104,23 @@ ModelConfig ModelConfig::from_json(const Json& j) {
     c.rope_orig_ctx = (int)j.get_int("rope_orig_ctx", 8192);
     c.max_ctx = (int)j.get_int("max_ctx", 4096);
     c.wtype = qtype_from_name(j.get_str("wtype", "q4"));
+    c.act = j.get_str("act", "silu");
+    c.embed_scale = (float)j.get_num("embed_scale", 1);
+    c.final_softcap = (float)j.get_num("final_softcap", 0);
+    c.stateful = j.get_bool("stateful", false);
+    if (j["layers"].is_arr()) {
+        for (auto& l : j["layers"].arr) c.layers.push_back(LayerCfg::from_json(l));
+    } else {
+        // legacy file: uniform Llama/Qwen3 attention layers
+        for (int i = 0; i < c.n_layers; i++) {
+            LayerCfg l;
+            l.n_heads = c.n_heads; l.n_kv_heads = c.n_kv_heads; l.head_dim = c.head_dim;
+            l.rope_theta = c.rope_theta; l.rope_half = c.head_dim / 2; l.rope_rot = l.rope_half;
+            l.qk_norm = c.qk_norm ? 1 : 0;
+            l.ffn = c.ffn;
+            c.layers.push_back(l);
+        }
+    }
     return c;
 }
 

@@ -179,16 +179,42 @@ void gemm_rows(const QMat& W, const QAct& a, float* y, int ldy, int r0, int r1) 
     }
 }
 
+// out = x / rms(x) * w   (w may be null: unweighted). In-place allowed.
 void rmsnorm(const float* x, const float* w, float* out, int n, float eps) {
     __m512 acc = _mm512_setzero_ps();
-    for (int i = 0; i < n; i += 16) { __m512 v = _mm512_loadu_ps(x + i); acc = _mm512_fmadd_ps(v, v, acc); }
-    float ss = hsum(acc) / n;
-    __m512 sc = _mm512_set1_ps(1.f / sqrtf(ss + eps));
-    for (int i = 0; i < n; i += 16)
-        _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(x + i), sc), _mm512_loadu_ps(w + i)));
+    int i = 0;
+    for (; i + 16 <= n; i += 16) { __m512 v = _mm512_loadu_ps(x + i); acc = _mm512_fmadd_ps(v, v, acc); }
+    float ss = hsum(acc);
+    for (; i < n; i++) ss += x[i] * x[i];
+    const float sc = 1.f / sqrtf(ss / n + eps);
+    for (int j = 0; j < n; j++) out[j] = x[j] * sc * (w ? w[j] : 1.f);
 }
 
 inline float silu(float x) { return x / (1.f + expf(-x)); }
+
+inline float gelu_tanh(float x) { return 0.5f * x * (1.f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))); }
+
+// rows [r0, r0+n) of a quantized matrix as its own matrix
+inline QMat sub_rows(const QMat& W, int r0, int n) {
+    QMat q = W;
+    q.rows = n;
+    q.d = W.d + qtype_data_bytes(W.t, r0, W.cols);
+    if (W.s) q.s = W.s + qtype_scale_bytes(W.t, r0, W.cols);
+    return q;
+}
+
+struct CLayer {
+    LayerCfg c;
+    const float *attn_norm = nullptr, *ffn_norm = nullptr, *post_attn_norm = nullptr, *post_ffn_norm = nullptr;
+    const float *q_norm = nullptr, *k_norm = nullptr, *bqkv = nullptr;
+    QMat wqkv, wo, wgu, wdown;
+    QMat conv_in, conv_out; const float* conv_w = nullptr;
+    QMat dn_in, dn_out; const float *dn_conv = nullptr, *dn_A = nullptr, *dn_dt = nullptr, *dn_norm = nullptr;
+    QMat router, wgu_e, wdown_e; const float* expert_bias = nullptr;
+    std::vector<float> inv_freq;
+    int kv = -1;          // index of the KV buffer used (own or shared)
+    int state = -1;       // index of the recurrent state buffer
+};
 
 class CpuBackend : public Backend {
 public:
@@ -203,39 +229,54 @@ public:
         int nt = o.threads > 0 ? o.threads : std::max(1u, std::thread::hardware_concurrency() / 2);
         pool_ = std::make_unique<ThreadPool>(nt);
         load_weights(mf);
-        // KV cache: [slot][layer][kv_head][pos][head_dim] fp16
-        kv_stride_pos_ = c_.head_dim;
-        kv_stride_head_ = (size_t)opt.ctx * c_.head_dim;
-        kv_stride_layer_ = kv_stride_head_ * c_.n_kv_heads;
-        kv_stride_slot_ = kv_stride_layer_ * c_.n_layers;
-        size_t kv_elems = kv_stride_slot_ * opt.n_slots;
-        kcache_.assign(kv_elems, 0);
-        vcache_.assign(kv_elems, 0);
-        // rope
-        int half = c_.head_dim / 2;
-        inv_freq_.resize(half);
-        for (int i = 0; i < half; i++) {
-            float f = powf(c_.rope_theta, -2.f * i / c_.head_dim);
-            if (c_.rope_scaling == "llama3") {
-                float wl = 2 * M_PI / f;
-                float lo_wl = c_.rope_orig_ctx / c_.rope_low_freq, hi_wl = c_.rope_orig_ctx / c_.rope_high_freq;
-                if (wl > lo_wl) f = f / c_.rope_factor;
-                else if (wl >= hi_wl) {
-                    float sm = (c_.rope_orig_ctx / wl - c_.rope_low_freq) / (c_.rope_high_freq - c_.rope_low_freq);
-                    f = (1 - sm) * f / c_.rope_factor + sm * f;
+        size_t kv_bytes = 0, st_bytes = 0;
+        for (int l = 0; l < c_.n_layers; l++) {
+            CLayer& L = layers_[l];
+            const LayerCfg& lc = L.c;
+            if (lc.is_attn()) {
+                if (lc.kv_src >= 0) { L.kv = layers_[lc.kv_src].kv; }
+                else {
+                    L.kv = (int)kc_.size();
+                    size_t n = (size_t)opt.n_slots * lc.n_kv_heads * opt.ctx * lc.head_dim;
+                    kc_.emplace_back(n, 0); vc_.emplace_back(n, 0);
+                    kv_bytes += n * 4;
                 }
-            } else if (c_.rope_scaling == "linear") f /= c_.rope_factor;
-            inv_freq_[i] = f;
+                // rope frequencies: pairs (i, i + rope_half); only the first rope_rot rotate
+                L.inv_freq.assign(lc.rope_half, 0.f);
+                const int rd = c_.arch == "qwen3_5" ? 2 * lc.rope_half : lc.head_dim;  // exponent denominator
+                for (int i = 0; i < lc.rope_rot; i++) {
+                    float f = powf(lc.rope_theta, -2.f * i / rd);
+                    if (c_.rope_scaling == "llama3") {
+                        float wl = 2 * M_PI / f;
+                        float lo_wl = c_.rope_orig_ctx / c_.rope_low_freq, hi_wl = c_.rope_orig_ctx / c_.rope_high_freq;
+                        if (wl > lo_wl) f = f / c_.rope_factor;
+                        else if (wl >= hi_wl) {
+                            float sm = (c_.rope_orig_ctx / wl - c_.rope_low_freq) / (c_.rope_high_freq - c_.rope_low_freq);
+                            f = (1 - sm) * f / c_.rope_factor + sm * f;
+                        }
+                    } else if (c_.rope_scaling == "linear") f /= c_.rope_factor;
+                    L.inv_freq[i] = f;
+                }
+            } else if (lc.type == "conv") {
+                L.state = (int)state_.size();
+                state_.emplace_back((size_t)opt.n_slots * (lc.conv_k - 1) * c_.hidden, 0.f);
+                st_bytes += state_.back().size() * 4;
+            } else if (lc.type == "deltanet") {
+                L.state = (int)state_.size();
+                state_.emplace_back((size_t)opt.n_slots * (lc.dn_conv - 1) * lc.dn_conv_dim(), 0.f);
+                state_.emplace_back((size_t)opt.n_slots * lc.dn_nv * lc.dn_dk * lc.dn_dv, 0.f);
+                st_bytes += (state_[state_.size() - 2].size() + state_.back().size()) * 4;
+            }
         }
-        logi("cpu backend: %d threads, KV cache %.1f MB (%d slots x %d ctx)", nt, kv_elems * 4 / 1e6, opt.n_slots, opt.ctx);
+        logi("cpu backend: %d threads, KV cache %.1f MB, recurrent state %.1f MB (%d slots x %d ctx)", nt, kv_bytes / 2 / 1e6,
+             st_bytes / 1e6, opt.n_slots, opt.ctx);
     }
 
     int vocab() const override { return c_.vocab; }
 
     void forward(const std::vector<BatchToken>& batch) override {
         const int M = (int)batch.size();
-        const int H = c_.hidden, qd = c_.q_dim(), kvd = c_.kv_dim(), F = c_.ffn, hd = c_.head_dim;
-        const int nqkv = qd + 2 * kvd;
+        const int H = c_.hidden;
         ensure_buffers(M);
         // embeddings
         pool_->parallel_for(M, [&](int64_t a, int64_t b) {
@@ -243,100 +284,25 @@ public:
                 const QMat& E = embd_;
                 int tok = batch[m].token;
                 size_t ds = qtype_data_bytes(E.t, 1, H), ss = qtype_scale_bytes(E.t, 1, H);
-                dequantize_row(E.t, E.d + (size_t)tok * ds, E.s ? E.s + (size_t)tok * ss : nullptr, H, x_.data() + (size_t)m * H);
+                float* x = x_.data() + (size_t)m * H;
+                dequantize_row(E.t, E.d + (size_t)tok * ds, E.s ? E.s + (size_t)tok * ss : nullptr, H, x);
+                if (c_.embed_scale != 1.f) for (int i = 0; i < H; i++) x[i] *= c_.embed_scale;
             }
         });
-        const float scale = 1.f / sqrtf((float)hd);
-        const int nl_dbg = getenv("TACH_DEBUG_NL") ? atoi(getenv("TACH_DEBUG_NL")) : c_.n_layers;
-        for (int l = 0; l < nl_dbg; l++) {
-            const Layer& L = layers_[l];
-            // attn norm + quantize
+        // a new sequence (position 0) starts from zero recurrent state
+        for (int m = 0; m < M; m++) if (batch[m].pos == 0) reset_state(batch[m].slot);
+        const int nl = getenv("TACH_DEBUG_NL") ? atoi(getenv("TACH_DEBUG_NL")) : c_.n_layers;
+        for (int l = 0; l < nl; l++) {
+            CLayer& L = layers_[l];
             norm_quant(M, H, L.attn_norm, act_h_);
-            matmul(L.wqkv, act_h_, qkv_.data(), nqkv);
-            // bias, qk-norm, rope, kv-cache write
-            pool_->parallel_for(M, [&](int64_t a, int64_t b) {
-                for (int64_t m = a; m < b; m++) {
-                    float* row = qkv_.data() + (size_t)m * nqkv;
-                    if (L.bqkv) for (int i = 0; i < nqkv; i++) row[i] += L.bqkv[i];
-                    float* q = row;
-                    float* k = row + qd;
-                    float* v = row + qd + kvd;
-                    if (L.q_norm) {
-                        for (int h = 0; h < c_.n_heads; h++) rmsnorm(q + h * hd, L.q_norm, q + h * hd, hd, c_.rms_eps);
-                        for (int h = 0; h < c_.n_kv_heads; h++) rmsnorm(k + h * hd, L.k_norm, k + h * hd, hd, c_.rms_eps);
-                    }
-                    int pos = batch[m].pos;
-                    float cs[256], sn[256];
-                    for (int i = 0; i < hd / 2; i++) { float th = pos * inv_freq_[i]; cs[i] = cosf(th); sn[i] = sinf(th); }
-                    auto rope = [&](float* vv) {
-                        for (int i = 0; i < hd / 2; i++) {
-                            float x0 = vv[i], x1 = vv[i + hd / 2];
-                            vv[i] = x0 * cs[i] - x1 * sn[i];
-                            vv[i + hd / 2] = x0 * sn[i] + x1 * cs[i];
-                        }
-                    };
-                    for (int h = 0; h < c_.n_heads; h++) rope(q + h * hd);
-                    for (int h = 0; h < c_.n_kv_heads; h++) {
-                        rope(k + h * hd);
-                        uint16_t* kc = kv_ptr(kcache_, batch[m].slot, l, h, pos);
-                        uint16_t* vc = kv_ptr(vcache_, batch[m].slot, l, h, pos);
-                        for (int i = 0; i < hd; i += 16) {
-                            _mm256_storeu_si256((__m256i*)(kc + i), _mm512_cvtps_ph(_mm512_loadu_ps(k + h * hd + i), _MM_FROUND_TO_NEAREST_INT));
-                            _mm256_storeu_si256((__m256i*)(vc + i), _mm512_cvtps_ph(_mm512_loadu_ps(v + h * hd + i), _MM_FROUND_TO_NEAREST_INT));
-                        }
-                    }
-                }
-            });
-            // attention: one task per (token, head)
-            const int group = c_.n_heads / c_.n_kv_heads;
-            pool_->parallel_for((int64_t)M * c_.n_heads, [&](int64_t a, int64_t b) {
-                std::vector<float> sc(opt.ctx);
-                for (int64_t task = a; task < b; task++) {
-                    int m = (int)(task / c_.n_heads), h = (int)(task % c_.n_heads);
-                    int kvh = h / group;
-                    const float* q = qkv_.data() + (size_t)m * nqkv + h * hd;
-                    int n = batch[m].pos + 1;
-                    const uint16_t* kb = kv_ptr(kcache_, batch[m].slot, l, kvh, 0);
-                    const uint16_t* vb = kv_ptr(vcache_, batch[m].slot, l, kvh, 0);
-                    float mx = -INFINITY;
-                    for (int t = 0; t < n; t++) {
-                        float s = dot_f16(kb + (size_t)t * hd, q, hd) * scale;
-                        sc[t] = s;
-                        mx = std::max(mx, s);
-                    }
-                    float sum = 0;
-                    for (int t = 0; t < n; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
-                    float inv = 1.f / sum;
-                    float* o = attn_.data() + (size_t)m * qd + h * hd;
-                    __m512 acc[16];
-                    int nv = hd / 16;
-                    for (int i = 0; i < nv; i++) acc[i] = _mm512_setzero_ps();
-                    for (int t = 0; t < n; t++) {
-                        __m512 p = _mm512_set1_ps(sc[t] * inv);
-                        const uint16_t* vr = vb + (size_t)t * hd;
-                        for (int i = 0; i < nv; i++)
-                            acc[i] = _mm512_fmadd_ps(p, _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(vr + i * 16))), acc[i]);
-                    }
-                    for (int i = 0; i < nv; i++) _mm512_storeu_ps(o + i * 16, acc[i]);
-                }
-            });
-            // output projection + residual
-            quant_rows(M, qd, attn_.data(), act_a_);
-            matmul(L.wo, act_a_, tmp_.data(), H);
-            add_into(x_.data(), tmp_.data(), (size_t)M * H);
-            // ffn
+            if (L.c.is_attn()) attention(L, l, batch);
+            else if (L.c.type == "conv") short_conv(L, batch);
+            else delta_net(L, batch);
+            residual_add(M, L.post_attn_norm, 1.f);
             norm_quant(M, H, L.ffn_norm, act_h_);
-            matmul(L.wgu, act_h_, gu_.data(), 2 * F);
-            pool_->parallel_for(M, [&](int64_t a, int64_t b) {
-                for (int64_t m = a; m < b; m++) {
-                    const float* g = gu_.data() + (size_t)m * 2 * F;
-                    float* o = ff_.data() + (size_t)m * F;
-                    for (int i = 0; i < F; i++) o[i] = silu(g[2 * i]) * g[2 * i + 1];
-                }
-            });
-            quant_rows(M, F, ff_.data(), act_f_);
-            matmul(L.wdown, act_f_, tmp_.data(), H);
-            add_into(x_.data(), tmp_.data(), (size_t)M * H);
+            if (L.c.n_experts) moe(L, M);
+            else dense_ffn(L, M);
+            residual_add(M, L.post_ffn_norm, L.c.layer_scalar);
         }
         // final norm + lm head, only for rows that want logits
         std::vector<int> rows;
@@ -351,6 +317,10 @@ public:
             quantize_act_row(xs.data() + i * H, H, act_o_.q + i * H, act_o_.d + i * (H / CPU_ABLK), act_o_.s + i * (H / CPU_ABLK));
         logits_.resize((size_t)rows.size() * c_.vocab);
         matmul(out_, act_o_, logits_.data(), c_.vocab);
+        if (c_.final_softcap > 0) {
+            const float cap = c_.final_softcap;
+            for (auto& v : logits_) v = tanhf(v / cap) * cap;
+        }
     }
 
     void get_logits(int i, float* dst) override { memcpy(dst, logits_.data() + (size_t)i * c_.vocab, c_.vocab * 4); }
@@ -364,29 +334,343 @@ public:
 
     void copy_kv(int src, int dst, int n) override {
         if (src == dst || n <= 0) return;
-        for (int l = 0; l < c_.n_layers; l++)
-            for (int h = 0; h < c_.n_kv_heads; h++) {
-                memcpy(kv_ptr(kcache_, dst, l, h, 0), kv_ptr(kcache_, src, l, h, 0), (size_t)n * c_.head_dim * 2);
-                memcpy(kv_ptr(vcache_, dst, l, h, 0), kv_ptr(vcache_, src, l, h, 0), (size_t)n * c_.head_dim * 2);
+        for (int l = 0; l < c_.n_layers; l++) {
+            const CLayer& L = layers_[l];
+            if (!L.c.is_attn() || L.c.kv_src >= 0) continue;
+            for (int h = 0; h < L.c.n_kv_heads; h++) {
+                memcpy(kv_ptr(L, kc_, dst, h, 0), kv_ptr(L, kc_, src, h, 0), (size_t)n * L.c.head_dim * 2);
+                memcpy(kv_ptr(L, vc_, dst, h, 0), kv_ptr(L, vc_, src, h, 0), (size_t)n * L.c.head_dim * 2);
             }
+        }
     }
 
 private:
-    uint16_t* kv_ptr(std::vector<uint16_t>& c, int slot, int l, int h, int pos) {
-        return c.data() + slot * kv_stride_slot_ + l * kv_stride_layer_ + h * kv_stride_head_ + (size_t)pos * kv_stride_pos_;
+    uint16_t* kv_ptr(const CLayer& L, std::vector<std::vector<uint16_t>>& c, int slot, int h, int pos) {
+        const LayerCfg& lc = L.c;
+        return c[L.kv].data() + (((size_t)slot * lc.n_kv_heads + h) * opt.ctx + pos) * lc.head_dim;
+    }
+
+    void reset_state(int slot) {
+        for (auto& L : layers_) {
+            if (L.state < 0) continue;
+            if (L.c.type == "conv") {
+                size_t n = (size_t)(L.c.conv_k - 1) * c_.hidden;
+                std::fill(state_[L.state].begin() + slot * n, state_[L.state].begin() + (slot + 1) * n, 0.f);
+            } else {
+                size_t n0 = (size_t)(L.c.dn_conv - 1) * L.c.dn_conv_dim();
+                size_t n1 = (size_t)L.c.dn_nv * L.c.dn_dk * L.c.dn_dv;
+                std::fill(state_[L.state].begin() + slot * n0, state_[L.state].begin() + (slot + 1) * n0, 0.f);
+                std::fill(state_[L.state + 1].begin() + slot * n1, state_[L.state + 1].begin() + (slot + 1) * n1, 0.f);
+            }
+        }
     }
 
     void ensure_buffers(int M) {
-        const int H = c_.hidden, qd = c_.q_dim(), kvd = c_.kv_dim(), F = c_.ffn;
         if (M <= cap_) return;
         cap_ = M;
+        const int H = c_.hidden;
+        size_t maxw = H;
+        for (auto& L : layers_) {
+            const LayerCfg& lc = L.c;
+            maxw = std::max<size_t>(maxw, (size_t)lc.qkv_rows() + lc.q_dim());
+            maxw = std::max<size_t>(maxw, lc.q_dim());
+            maxw = std::max<size_t>(maxw, 3 * (size_t)H);
+            maxw = std::max<size_t>(maxw, lc.dn_in_rows());
+            maxw = std::max<size_t>(maxw, 2 * (size_t)std::max(lc.ffn, lc.expert_ffn));
+        }
         x_.resize((size_t)M * H);
         hn_.resize((size_t)M * H);
-        qkv_.resize((size_t)M * (qd + 2 * kvd));
-        attn_.resize((size_t)M * qd);
+        big_.resize((size_t)M * maxw);
+        mid_.resize((size_t)M * maxw);
         tmp_.resize((size_t)M * H);
-        gu_.resize((size_t)M * 2 * F);
-        ff_.resize((size_t)M * F);
+    }
+
+    // y = mixer output in tmp_ ([M][H]); x += post_norm ? rmsnorm(y) : y; x *= scalar
+    void residual_add(int M, const float* post_norm, float scalar) {
+        const int H = c_.hidden;
+        pool_->parallel_for(M, [&](int64_t a, int64_t b) {
+            std::vector<float> t(H);
+            for (int64_t m = a; m < b; m++) {
+                float* x = x_.data() + (size_t)m * H;
+                const float* y = tmp_.data() + (size_t)m * H;
+                if (post_norm) { rmsnorm(y, post_norm, t.data(), H, c_.rms_eps); y = t.data(); }
+                for (int i = 0; i < H; i++) x[i] = (x[i] + y[i]) * scalar;
+            }
+        });
+    }
+
+    void attention(CLayer& L, int l, const std::vector<BatchToken>& batch) {
+        const LayerCfg& lc = L.c;
+        const int M = (int)batch.size(), H = c_.hidden, hd = lc.head_dim, qd = lc.q_dim(), kvd = lc.kv_dim();
+        const int nrows = lc.qkv_rows();
+        const int qstride = lc.attn_gate ? 2 * hd : hd;  // q (and gate) per head in the projection
+        const int qrows = qd * (lc.attn_gate ? 2 : 1);
+        float* qkv = big_.data();
+        matmul(L.wqkv, act_h_, qkv, nrows);
+        const float scale = lc.attn_scale > 0 ? lc.attn_scale : 1.f / sqrtf((float)hd);
+        const bool own_kv = lc.kv_src < 0;
+        float* qbuf = mid_.data();  // [M][qd] rotated, scaled queries
+        pool_->parallel_for(M, [&](int64_t a, int64_t b) {
+            std::vector<float> cs(lc.rope_half), sn(lc.rope_half), kbuf(kvd), vbuf(kvd);
+            for (int64_t m = a; m < b; m++) {
+                float* row = qkv + (size_t)m * nrows;
+                if (L.bqkv) for (int i = 0; i < nrows; i++) row[i] += L.bqkv[i];
+                const int pos = batch[m].pos;
+                for (int i = 0; i < lc.rope_half; i++) { float th = pos * L.inv_freq[i]; cs[i] = cosf(th); sn[i] = sinf(th); }
+                auto rope = [&](float* v) {
+                    for (int i = 0; i < lc.rope_half; i++) {
+                        float x0 = v[i], x1 = v[i + lc.rope_half];
+                        v[i] = x0 * cs[i] - x1 * sn[i];
+                        v[i + lc.rope_half] = x0 * sn[i] + x1 * cs[i];
+                    }
+                };
+                float* q = qbuf + (size_t)m * qd;
+                for (int h = 0; h < lc.n_heads; h++) memcpy(q + h * hd, row + h * qstride, hd * 4);
+                if (lc.qk_norm == 2) rmsnorm(q, L.q_norm, q, qd, c_.rms_eps);
+                for (int h = 0; h < lc.n_heads; h++) {
+                    if (lc.qk_norm == 1) rmsnorm(q + h * hd, L.q_norm, q + h * hd, hd, c_.rms_eps);
+                    rope(q + h * hd);
+                    for (int i = 0; i < hd; i++) q[h * hd + i] *= scale;
+                }
+                if (!own_kv) continue;
+                const float* kraw = row + qrows;
+                memcpy(kbuf.data(), kraw, kvd * 4);
+                memcpy(vbuf.data(), lc.k_eq_v ? kraw : kraw + kvd, kvd * 4);
+                if (lc.qk_norm == 2) rmsnorm(kbuf.data(), L.k_norm, kbuf.data(), kvd, c_.rms_eps);
+                for (int h = 0; h < lc.n_kv_heads; h++) {
+                    float* k = kbuf.data() + h * hd;
+                    float* v = vbuf.data() + h * hd;
+                    if (lc.qk_norm == 1) rmsnorm(k, L.k_norm, k, hd, c_.rms_eps);
+                    rope(k);
+                    if (lc.v_norm) rmsnorm(v, nullptr, v, hd, c_.rms_eps);
+                    uint16_t* kc = kv_ptr(L, kc_, batch[m].slot, h, pos);
+                    uint16_t* vc = kv_ptr(L, vc_, batch[m].slot, h, pos);
+                    for (int i = 0; i < hd; i++) { kc[i] = f2h(k[i]); vc[i] = f2h(v[i]); }
+                }
+            }
+        });
+        // attention: one task per (token, head)
+        const int group = lc.n_heads / lc.n_kv_heads;
+        float* out = big_.data() + (size_t)M * nrows;  // [M][qd] (after the qkv rows)
+        pool_->parallel_for((int64_t)M * lc.n_heads, [&](int64_t a, int64_t b) {
+            std::vector<float> sc(opt.ctx), kf(hd);
+            for (int64_t task = a; task < b; task++) {
+                int m = (int)(task / lc.n_heads), h = (int)(task % lc.n_heads);
+                int kvh = h / group;
+                const float* q = qbuf + (size_t)m * qd + h * hd;
+                const int pos = batch[m].pos;
+                const int t0 = lc.window > 0 ? std::max(0, pos - lc.window + 1) : 0;
+                const uint16_t* kb = kv_ptr(L, kc_, batch[m].slot, kvh, 0);
+                const uint16_t* vb = kv_ptr(L, vc_, batch[m].slot, kvh, 0);
+                float mx = -INFINITY;
+                for (int t = t0; t <= pos; t++) {
+                    float s = 0;
+                    const uint16_t* kr = kb + (size_t)t * hd;
+                    for (int i = 0; i < hd; i++) s += q[i] * h2f(kr[i]);
+                    sc[t] = s;
+                    mx = std::max(mx, s);
+                }
+                float sum = 0;
+                for (int t = t0; t <= pos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+                float inv = 1.f / sum;
+                float* o = out + (size_t)m * qd + h * hd;
+                for (int i = 0; i < hd; i++) o[i] = 0;
+                for (int t = t0; t <= pos; t++) {
+                    float p = sc[t] * inv;
+                    const uint16_t* vr = vb + (size_t)t * hd;
+                    for (int i = 0; i < hd; i++) o[i] += p * h2f(vr[i]);
+                }
+                if (lc.attn_gate) {
+                    const float* g = qkv + (size_t)m * nrows + h * qstride + hd;
+                    for (int i = 0; i < hd; i++) o[i] *= 1.f / (1.f + expf(-g[i]));
+                }
+            }
+        });
+        (void)l;
+        quant_rows(M, qd, out, act_a_);
+        matmul(L.wo, act_a_, tmp_.data(), H);
+    }
+
+    // LFM2 gated short convolution: [B; C; x] = W_in h; y = W_out (C * conv(B * x))
+    void short_conv(CLayer& L, const std::vector<BatchToken>& batch) {
+        const int M = (int)batch.size(), H = c_.hidden, K = L.c.conv_k;
+        float* bcx = big_.data();
+        matmul(L.conv_in, act_h_, bcx, 3 * H);
+        float* y = mid_.data();
+        std::vector<float>& st = state_[L.state];
+        pool_->parallel_for(H, [&](int64_t a, int64_t b) {
+            for (int64_t ch = a; ch < b; ch++) {
+                const float* w = L.conv_w + ch * K;
+                for (int m = 0; m < M; m++) {  // tokens in order (each slot's tokens are consecutive positions)
+                    float* s = st.data() + (size_t)batch[m].slot * (K - 1) * H;  // [K-1][H], oldest first
+                    const float* r = bcx + (size_t)m * 3 * H;
+                    float bx = r[ch] * r[2 * H + ch];
+                    float acc = w[K - 1] * bx;
+                    for (int k = 0; k < K - 1; k++) acc += w[k] * s[(size_t)k * H + ch];
+                    for (int k = 0; k < K - 2; k++) s[(size_t)k * H + ch] = s[(size_t)(k + 1) * H + ch];
+                    s[(size_t)(K - 2) * H + ch] = bx;
+                    y[(size_t)m * H + ch] = r[H + ch] * acc;
+                }
+            }
+        });
+        quant_rows(M, H, y, act_a_);
+        matmul(L.conv_out, act_a_, tmp_.data(), H);
+    }
+
+    // Qwen3.5 gated delta net (linear attention with a per-head dk x dv state)
+    void delta_net(CLayer& L, const std::vector<BatchToken>& batch) {
+        const LayerCfg& lc = L.c;
+        const int M = (int)batch.size(), H = c_.hidden;
+        const int CD = lc.dn_conv_dim(), KD = lc.dn_key_dim(), VD = lc.dn_val_dim(), NV = lc.dn_nv, NK = lc.dn_nk;
+        const int DK = lc.dn_dk, DV = lc.dn_dv, KC = lc.dn_conv, R = lc.dn_in_rows();
+        float* proj = big_.data();
+        matmul(L.dn_in, act_h_, proj, R);
+        // causal depthwise conv + SiLU over the qkv channels (in place)
+        std::vector<float>& cst = state_[L.state];
+        pool_->parallel_for(CD, [&](int64_t a, int64_t b) {
+            for (int64_t ch = a; ch < b; ch++) {
+                const float* w = L.dn_conv + ch * KC;
+                for (int m = 0; m < M; m++) {
+                    float* s = cst.data() + (size_t)batch[m].slot * (KC - 1) * CD;
+                    float* r = proj + (size_t)m * R;
+                    float xin = r[ch];
+                    float acc = w[KC - 1] * xin;
+                    for (int k = 0; k < KC - 1; k++) acc += w[k] * s[(size_t)k * CD + ch];
+                    for (int k = 0; k < KC - 2; k++) s[(size_t)k * CD + ch] = s[(size_t)(k + 1) * CD + ch];
+                    s[(size_t)(KC - 2) * CD + ch] = xin;
+                    r[ch] = acc / (1.f + expf(-acc));
+                }
+            }
+        });
+        // recurrence per value head
+        std::vector<float>& S = state_[L.state + 1];
+        float* out = mid_.data();
+        const int rep = NV / NK;
+        pool_->parallel_for(NV, [&](int64_t a, int64_t b) {
+            std::vector<float> q(DK), k(DK), kvm(DV), d(DV);
+            for (int64_t h = a; h < b; h++) {
+                const int kh = (int)h / rep;
+                for (int m = 0; m < M; m++) {
+                    float* Sh = S.data() + (((size_t)batch[m].slot * NV + h) * DK) * DV;
+                    const float* r = proj + (size_t)m * R;
+                    const float* qr = r + kh * DK;
+                    const float* kr = r + KD + kh * DK;
+                    const float* vr = r + 2 * KD + h * DV;
+                    float qn = 0, kn = 0;
+                    for (int i = 0; i < DK; i++) { qn += qr[i] * qr[i]; kn += kr[i] * kr[i]; }
+                    qn = 1.f / sqrtf(qn + 1e-6f); kn = 1.f / sqrtf(kn + 1e-6f);
+                    const float qs = qn / sqrtf((float)DK);
+                    for (int i = 0; i < DK; i++) { q[i] = qr[i] * qs; k[i] = kr[i] * kn; }
+                    const float braw = r[CD + VD + h], araw = r[CD + VD + NV + h];
+                    const float beta = 1.f / (1.f + expf(-braw));
+                    const float x = araw + L.dn_dt[h];
+                    const float sp = x > 20.f ? x : log1pf(expf(x));
+                    const float decay = expf(L.dn_A[h] * sp);
+                    for (int j = 0; j < DV; j++) kvm[j] = 0;
+                    for (int i = 0; i < DK; i++) {
+                        float* row = Sh + (size_t)i * DV;
+                        for (int j = 0; j < DV; j++) { row[j] *= decay; kvm[j] += row[j] * k[i]; }
+                    }
+                    for (int j = 0; j < DV; j++) d[j] = (vr[j] - kvm[j]) * beta;
+                    float* o = out + (size_t)m * VD + h * DV;
+                    for (int j = 0; j < DV; j++) o[j] = 0;
+                    for (int i = 0; i < DK; i++) {
+                        float* row = Sh + (size_t)i * DV;
+                        for (int j = 0; j < DV; j++) { row[j] += k[i] * d[j]; o[j] += row[j] * q[i]; }
+                    }
+                    // gated RMSNorm: rmsnorm(o) * w * silu(z)
+                    const float* z = r + CD + h * DV;
+                    float ss = 0;
+                    for (int j = 0; j < DV; j++) ss += o[j] * o[j];
+                    const float sc = 1.f / sqrtf(ss / DV + c_.rms_eps);
+                    for (int j = 0; j < DV; j++) o[j] = o[j] * sc * L.dn_norm[j] * (z[j] / (1.f + expf(-z[j])));
+                }
+            }
+        });
+        quant_rows(M, VD, out, act_a_);
+        matmul(L.dn_out, act_a_, tmp_.data(), H);
+    }
+
+    float act(float g) const { return c_.act == "gelu" ? gelu_tanh(g) : silu(g); }
+
+    void dense_ffn(CLayer& L, int M) {
+        const int H = c_.hidden, F = L.c.ffn;
+        float* gu = big_.data();
+        matmul(L.wgu, act_h_, gu, 2 * F);
+        float* ff = mid_.data();
+        pool_->parallel_for(M, [&](int64_t a, int64_t b) {
+            for (int64_t m = a; m < b; m++) {
+                const float* g = gu + (size_t)m * 2 * F;
+                float* o = ff + (size_t)m * F;
+                for (int i = 0; i < F; i++) o[i] = act(g[2 * i]) * g[2 * i + 1];
+            }
+        });
+        quant_rows(M, F, ff, act_f_);
+        matmul(L.wdown, act_f_, tmp_.data(), H);
+    }
+
+    // Mixture of experts: route each token, then run every used expert on its gathered tokens.
+    void moe(CLayer& L, int M) {
+        const LayerCfg& lc = L.c;
+        const int H = c_.hidden, E = lc.n_experts, K = lc.top_k, F = lc.expert_ffn;
+        std::vector<float> logits((size_t)M * E);
+        matmul(L.router, act_h_, logits.data(), E);
+        std::vector<int> sel((size_t)M * K);
+        std::vector<float> wsel((size_t)M * K);
+        for (int m = 0; m < M; m++) {
+            float* lg = logits.data() + (size_t)m * E;
+            std::vector<float> p(E), score(E);
+            if (lc.router == "softmax") {
+                float mx = *std::max_element(lg, lg + E), sum = 0;
+                for (int e = 0; e < E; e++) { p[e] = expf(lg[e] - mx); sum += p[e]; }
+                for (int e = 0; e < E; e++) p[e] /= sum;
+            } else {
+                for (int e = 0; e < E; e++) p[e] = 1.f / (1.f + expf(-lg[e]));
+            }
+            for (int e = 0; e < E; e++) score[e] = p[e] + (L.expert_bias ? L.expert_bias[e] : 0.f);
+            std::vector<int> idx(E);
+            for (int e = 0; e < E; e++) idx[e] = e;
+            std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int a, int b) { return score[a] > score[b]; });
+            float tot = 0;
+            for (int k = 0; k < K; k++) tot += p[idx[k]];
+            for (int k = 0; k < K; k++) {
+                float w = p[idx[k]];
+                if (lc.norm_topk) w /= (tot + (lc.router == "sigmoid" ? 1e-6f : 0.f));
+                sel[(size_t)m * K + k] = idx[k];
+                wsel[(size_t)m * K + k] = w * lc.routed_scale;
+            }
+        }
+        std::fill(tmp_.begin(), tmp_.begin() + (size_t)M * H, 0.f);
+        for (int e = 0; e < E; e++) {
+            std::vector<std::pair<int, float>> toks;
+            for (int m = 0; m < M; m++)
+                for (int k = 0; k < K; k++) if (sel[(size_t)m * K + k] == e) toks.push_back({m, wsel[(size_t)m * K + k]});
+            if (toks.empty()) continue;
+            const int n = (int)toks.size();
+            QAct ga;
+            ga.resize(n, H);
+            std::vector<float> gx((size_t)n * H);
+            for (int i = 0; i < n; i++) {
+                int m = toks[i].first;
+                memcpy(gx.data() + (size_t)i * H, hn_.data() + (size_t)m * H, H * 4);
+                memcpy(ga.q + (size_t)i * H, act_h_.q + (size_t)m * H, H);
+                memcpy(ga.d + (size_t)i * (H / CPU_ABLK), act_h_.d + (size_t)m * (H / CPU_ABLK), (H / CPU_ABLK) * 4);
+                memcpy(ga.s + (size_t)i * (H / CPU_ABLK), act_h_.s + (size_t)m * (H / CPU_ABLK), (H / CPU_ABLK) * 4);
+            }
+            ga.x = gx.data();
+            std::vector<float> gu((size_t)n * 2 * F), ff((size_t)n * F), dn((size_t)n * H);
+            matmul(sub_rows(L.wgu_e, e * 2 * F, 2 * F), ga, gu.data(), 2 * F);
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < F; j++) ff[(size_t)i * F + j] = act(gu[(size_t)i * 2 * F + 2 * j]) * gu[(size_t)i * 2 * F + 2 * j + 1];
+            QAct fa;
+            quant_rows_into(n, F, ff.data(), fa);
+            matmul(sub_rows(L.wdown_e, e * H, H), fa, dn.data(), H);
+            for (int i = 0; i < n; i++) {
+                float* y = tmp_.data() + (size_t)toks[i].first * H;
+                const float w = toks[i].second;
+                for (int j = 0; j < H; j++) y[j] += w * dn[(size_t)i * H + j];
+            }
+        }
     }
 
     void norm_quant(int M, int H, const float* w, QAct& a) {
@@ -399,7 +683,8 @@ private:
             }
         });
     }
-    void quant_rows(int M, int K, const float* x, QAct& a) {
+    void quant_rows(int M, int K, const float* x, QAct& a) { quant_rows_into(M, K, x, a); }
+    void quant_rows_into(int M, int K, const float* x, QAct& a) {
         a.resize(M, K);
         a.x = x;
         pool_->parallel_for(M, [&](int64_t s, int64_t e) {
@@ -409,16 +694,7 @@ private:
     }
     void matmul(const QMat& W, const QAct& a, float* y, int ldy) {
         if (g_imatrix && a.x) g_imatrix->add(W.name, a.x, a.M, a.K);
-        int64_t chunk = std::max<int64_t>(8, W.rows / (pool_->size() * 4));
-        // dynamic-ish: interleaved static split for balance
         pool_->parallel_for(W.rows, [&](int64_t r0, int64_t r1) { gemm_rows(W, a, y, ldy, (int)r0, (int)r1); }, 16);
-        (void)chunk;
-    }
-    void add_into(float* x, const float* y, size_t n) {
-        for (size_t i = 0; i < n; i += 16) {
-            if (i + 16 <= n) _mm512_storeu_ps(x + i, _mm512_add_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(y + i)));
-            else for (size_t j = i; j < n; j++) x[j] += y[j];
-        }
     }
 
     // Copy weights into anonymous (transparent-hugepage) memory: fewer TLB misses than the file mmap.
@@ -489,16 +765,34 @@ private:
         layers_.resize(c_.n_layers);
         for (int l = 0; l < c_.n_layers; l++) {
             std::string p = "blk." + std::to_string(l) + ".";
-            Layer& L = layers_[l];
+            CLayer& L = layers_[l];
+            L.c = c_.layers[l];
             L.attn_norm = vec(p + "attn_norm");
             L.ffn_norm = vec(p + "ffn_norm");
-            L.q_norm = vec(p + "q_norm", false);
-            L.k_norm = vec(p + "k_norm", false);
-            L.bqkv = vec(p + "bqkv", false);
-            L.wqkv = mat(p + "wqkv");
-            L.wo = mat(p + "wo");
-            L.wgu = mat(p + "wgu");
-            L.wdown = mat(p + "wdown");
+            L.post_attn_norm = vec(p + "post_attn_norm", false);
+            L.post_ffn_norm = vec(p + "post_ffn_norm", false);
+            if (L.c.is_attn()) {
+                L.q_norm = vec(p + "q_norm", false);
+                L.k_norm = vec(p + "k_norm", false);
+                if (!L.k_norm && L.c.kv_src >= 0) L.k_norm = layers_[L.c.kv_src].k_norm;
+                L.bqkv = vec(p + "bqkv", false);
+                L.wqkv = mat(p + "wqkv");
+                L.wo = mat(p + "wo");
+            } else if (L.c.type == "conv") {
+                L.conv_in = mat(p + "conv_in"); L.conv_out = mat(p + "conv_out"); L.conv_w = vec(p + "conv_w");
+            } else if (L.c.type == "deltanet") {
+                L.dn_in = mat(p + "dn_in"); L.dn_out = mat(p + "dn_out");
+                L.dn_conv = vec(p + "dn_conv"); L.dn_A = vec(p + "dn_A"); L.dn_dt = vec(p + "dn_dt"); L.dn_norm = vec(p + "dn_norm");
+            }
+            if (L.c.n_experts) {
+                L.router = mat(p + "router");
+                L.expert_bias = vec(p + "expert_bias", false);
+                L.wgu_e = mat(p + "wgu_e");
+                L.wdown_e = mat(p + "wdown_e");
+            } else if (L.c.ffn) {
+                L.wgu = mat(p + "wgu");
+                L.wdown = mat(p + "wdown");
+            }
         }
         logi("cpu backend: loaded %.2f GB of weights", total / 1e9);
     }
@@ -510,12 +804,11 @@ private:
     std::map<std::string, std::pair<uint8_t*, uint8_t*>> ptrs_;
     QMat embd_, out_;
     const float* out_norm_ = nullptr;
-    std::vector<Layer> layers_;
-    std::vector<uint16_t> kcache_, vcache_;
-    size_t kv_stride_pos_, kv_stride_head_, kv_stride_layer_, kv_stride_slot_;
-    std::vector<float> inv_freq_;
+    std::vector<CLayer> layers_;
+    std::vector<std::vector<uint16_t>> kc_, vc_;
+    std::vector<std::vector<float>> state_;
     int cap_ = 0;
-    std::vector<float> x_, hn_, qkv_, attn_, tmp_, gu_, ff_, logits_;
+    std::vector<float> x_, hn_, big_, mid_, tmp_, logits_;
     QAct act_h_, act_a_, act_f_, act_o_;
     int n_logits_ = 0;
 };

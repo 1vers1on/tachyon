@@ -67,6 +67,7 @@ static std::string detect_pretok(const Json& tj) {
     };
     walk(tj["pre_tokenizer"]);
     if (pat.empty()) return "gpt2";
+    if (pat.find("[\\p{L}\\p{M}]+") != std::string::npos) return "qwen35";
     if (pat.find("\\p{N}{1,3}") != std::string::npos) return "llama3";
     if (pat.find("\\p{N}") != std::string::npos && pat.find("[^\\r\\n\\p{L}\\p{N}]?\\p{L}+") != std::string::npos) return "qwen2";
     return "gpt2";
@@ -80,7 +81,8 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     if (chat_template.empty() && file_exists(dir + "/chat_template.jinja")) chat_template = read_file(dir + "/chat_template.jinja");
     const Json& model = tj["model"];
     if (model.get_str("type", "") != "BPE") die("only BPE tokenizers are supported (got %s)", model.get_str("type", "?").c_str());
-    if (model.get_bool("byte_fallback", false)) die("sentencepiece-style byte_fallback BPE not supported yet");
+    // SentencePiece-style BPE (Gemma): pieces use U+2581 for spaces and <0xNN> byte-fallback tokens; no byte-level mapping
+    const bool spm = model.get_bool("byte_fallback", false);
 
     auto cpmap = bytes_to_unicode_cp();
     std::unordered_map<uint32_t, int> inv;
@@ -97,7 +99,7 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     for (auto& kv : model["vocab"].obj) {
         int id = (int)kv.second.as_int();
         std::string raw;
-        if (!bytelevel_decode(kv.first, inv, raw)) raw = kv.first;
+        if (spm || !bytelevel_decode(kv.first, inv, raw)) raw = kv.first;
         tokens[id] = raw;
         ttype[id] = 0;
         str2id[kv.first] = id;
@@ -145,7 +147,7 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     add_blob("tok.merges", merges.data(), merges.size() * 4);
 
     Json t = Json::object();
-    t.set("type", "bpe_bytelevel");
+    t.set("type", spm ? "bpe_spm" : "bpe_bytelevel");
     t.set("pretokenizer", detect_pretok(tj));
     t.set("n_vocab", n_vocab);
     t.set("n_merges", (int64_t)(merges.size() / 3));
@@ -184,8 +186,25 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     std::string fmt = "raw";
     if (chat_template.find("<|im_start|>") != std::string::npos) fmt = "chatml";
     else if (chat_template.find("<|start_header_id|>") != std::string::npos) fmt = "llama3";
+    else if (chat_template.find("<start_of_turn>") != std::string::npos) fmt = "gemma";
+    else if (chat_template.find("<|turn>") != std::string::npos) fmt = "gemma4";
+    else if (chat_template.find("<|user|>") != std::string::npos) fmt = "tulu";
     t.set("chat_format", fmt);
     t.set("thinking", chat_template.find("<think>") != std::string::npos);
+    // Qwen3: thinking on unless disabled (empty block injected when disabled)
+    // Qwen3.5: thinking off unless enabled; enabling opens the block in the prompt
+    const bool think_opt_in = chat_template.find("enable_thinking is defined and enable_thinking is true") != std::string::npos;
+    const bool think_opt_out = chat_template.find("enable_thinking is defined and enable_thinking is false") != std::string::npos;
+    t.set("think_default", !think_opt_in);
+    t.set("think_open", think_opt_in);
+    t.set("think_disable_block", think_opt_in || think_opt_out);
+    // templates that start by emitting the BOS token text
+    std::string tpl_trim = chat_template.substr(0, 40);
+    if (tpl_trim.find("bos_token") != std::string::npos && !tc.get_bool("add_bos_token", false)) {
+        const Json& bt = tc["bos_token"];
+        std::string bs = bt.is_str() ? bt.str : bt.get_str("content", "");
+        t.set("chat_prefix", bs);
+    }
     t.set("chat_template", chat_template);
     return t;
 }
@@ -225,14 +244,20 @@ int convert_main(int argc, char** argv) {
     if (o.threads <= 0) o.threads = nthreads_default();
     double t0 = now_sec();
 
-    Json hc = Json::parse(read_file(o.in_dir + "/config.json"));
-    if (hc.has("text_config")) die("multimodal / nested configs not supported yet");
-    std::string mt = hc.get_str("model_type", "llama");
+    Json hc_root = Json::parse(read_file(o.in_dir + "/config.json"));
+    const Json& hc = hc_root.has("text_config") ? hc_root["text_config"] : hc_root;  // multimodal wrappers: text part
+    std::string mt = hc.get_str("model_type", hc_root.get_str("model_type", "llama"));
     ModelConfig c;
     if (mt == "qwen3") c.arch = "qwen3";
     else if (mt == "qwen2") c.arch = "qwen2";
     else if (mt == "llama" || mt == "mistral") c.arch = "llama";
-    else die("unsupported model_type %s (supported: qwen3, qwen2, llama, mistral)", mt.c_str());
+    else if (mt == "gemma3_text" || mt == "gemma3") c.arch = "gemma3";
+    else if (mt == "gemma4_text" || mt == "gemma4" || mt == "gemma4_unified_text" || mt == "gemma4_unified") c.arch = "gemma4";
+    else if (mt == "lfm2") c.arch = "lfm2";
+    else if (mt == "lfm2_moe") c.arch = "lfm2_moe";
+    else if (mt == "olmoe") c.arch = "olmoe";
+    else if (mt == "qwen3_5_text" || mt == "qwen3_5") c.arch = "qwen3_5";
+    else die("unsupported model_type %s (supported: qwen3, qwen2, llama, mistral, gemma3, gemma4, lfm2, lfm2_moe, olmoe, qwen3_5)", mt.c_str());
     {
         std::string d = o.in_dir;
         while (!d.empty() && d.back() == '/') d.pop_back();
@@ -245,21 +270,34 @@ int convert_main(int argc, char** argv) {
             c.name = q == std::string::npos ? s : s.substr(q + 2);
         } else c.name = d.substr(d.rfind('/') + 1);
     }
+    const std::string A = c.arch;
+    const bool gemma = A == "gemma3" || A == "gemma4";
     c.n_layers = (int)hc.get_int("num_hidden_layers", 0);
     c.hidden = (int)hc.get_int("hidden_size", 0);
     c.n_heads = (int)hc.get_int("num_attention_heads", 0);
     c.n_kv_heads = (int)hc.get_int("num_key_value_heads", c.n_heads);
-    c.head_dim = (int)hc.get_int("head_dim", c.hidden / c.n_heads);
+    c.head_dim = (int)hc.get_int("head_dim", c.hidden / std::max(1, c.n_heads));
     c.ffn = (int)hc.get_int("intermediate_size", 0);
     c.vocab = (int)hc.get_int("vocab_size", 0);
-    c.rms_eps = (float)hc.get_num("rms_norm_eps", 1e-6);
-    c.rope_theta = (float)hc.get_num("rope_theta", 10000);
-    c.tied_embed = hc.get_bool("tie_word_embeddings", false);
+    c.rms_eps = (float)hc.get_num("rms_norm_eps", hc.get_num("norm_eps", 1e-6));
+    // rope theta: legacy field or rope_parameters
+    const Json& rp = hc["rope_parameters"];
+    c.rope_theta = (float)hc.get_num("rope_theta", rp.get_num("rope_theta", 10000));
+    c.tied_embed = hc.get_bool("tie_word_embeddings", hc_root.get_bool("tie_word_embeddings", gemma || A == "lfm2" || A == "lfm2_moe"));
     c.attn_bias = hc.get_bool("attention_bias", c.arch == "qwen2");
     c.qk_norm = c.arch == "qwen3";
     c.max_ctx = (int)hc.get_int("max_position_embeddings", 4096);
     if (o.max_ctx > 0) c.max_ctx = o.max_ctx;
     c.wtype = o.wtype;
+    if (gemma) {
+        c.act = "gelu";
+        // HF multiplies by sqrt(hidden) rounded to the weight dtype (bf16)
+        float sc = sqrtf((float)c.hidden);
+        uint32_t u; memcpy(&u, &sc, 4); u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000u; memcpy(&sc, &u, 4);
+        c.embed_scale = sc;
+        c.final_softcap = (float)hc.get_num("final_logit_softcapping", 0);
+    }
+    if (A == "lfm2" || A == "lfm2_moe" || A == "qwen3_5") c.stateful = true;
     const Json& rs = hc["rope_scaling"];
     if (rs.is_obj()) {
         std::string rt = rs.get_str("rope_type", rs.get_str("type", ""));
@@ -276,6 +314,99 @@ int convert_main(int argc, char** argv) {
             logi("warning: rope scaling type '%s' ignored", rt.c_str());
         }
     }
+    // ---------------- per-layer configuration ----------------
+    std::vector<std::string> ltypes;
+    for (auto& t : hc["layer_types"].arr) ltypes.push_back(t.str);
+    if (A == "gemma3" && ltypes.empty()) {
+        int pat = (int)hc.get_int("sliding_window_pattern", hc.get_int("_sliding_window_pattern", 6));
+        for (int i = 0; i < c.n_layers; i++) ltypes.push_back((i + 1) % pat ? "sliding_attention" : "full_attention");
+    }
+    int num_kv_shared = (int)hc.get_int("num_kv_shared_layers", 0);
+    std::vector<int> kv_src(c.n_layers, -1);
+    if (A == "gemma4" && num_kv_shared > 0) {
+        int first = c.n_layers - num_kv_shared;
+        for (int i = first; i < c.n_layers; i++)
+            for (int j = first - 1; j >= 0; j--) if (ltypes[j] == ltypes[i]) { kv_src[i] = j; break; }
+    }
+    for (int i = 0; i < c.n_layers; i++) {
+        LayerCfg L;
+        std::string lt = i < (int)ltypes.size() ? ltypes[i] : "full_attention";
+        L.n_heads = c.n_heads; L.n_kv_heads = c.n_kv_heads; L.head_dim = c.head_dim;
+        L.rope_theta = c.rope_theta; L.rope_half = c.head_dim / 2; L.rope_rot = L.rope_half;
+        L.ffn = c.ffn;
+        if (A == "qwen3") L.qk_norm = 1;
+        if (A == "olmoe") L.qk_norm = 2;
+        if (A == "lfm2" || A == "lfm2_moe") {
+            if (lt == "conv") { L.type = "conv"; L.conv_k = (int)hc.get_int("conv_L_cache", 3); }
+            else L.qk_norm = 1;
+        }
+        if (A == "gemma3") {
+            L.qk_norm = 1;
+            L.sandwich = true;
+            L.attn_scale = 1.f / sqrtf((float)hc.get_num("query_pre_attn_scalar", c.head_dim));
+            if (lt == "sliding_attention") {
+                L.window = (int)hc.get_int("sliding_window", 512);
+                L.rope_theta = (float)hc.get_num("rope_local_base_freq", 10000);
+            }
+        }
+        if (A == "gemma4") {
+            L.qk_norm = 1;
+            L.sandwich = true;
+            L.v_norm = true;
+            L.attn_scale = 1.f;
+            const Json& rpl = rp[lt];
+            L.rope_theta = (float)rpl.get_num("rope_theta", lt == "sliding_attention" ? 10000 : 1000000);
+            if (lt == "sliding_attention") {
+                L.window = (int)hc.get_int("sliding_window", 512);
+            } else {
+                L.head_dim = (int)hc.get_int("global_head_dim", c.head_dim);
+                bool keqv = hc.get_bool("attention_k_eq_v", false);
+                L.k_eq_v = keqv;
+                if (keqv && hc["num_global_key_value_heads"].is_num()) L.n_kv_heads = (int)hc.get_int("num_global_key_value_heads", c.n_kv_heads);
+                float prf = (float)rpl.get_num("partial_rotary_factor", 1.0);
+                L.rope_half = L.head_dim / 2;                       // proportional: pairs span the whole head
+                L.rope_rot = (int)(prf * L.head_dim / 2);           // only the first rope_rot frequencies rotate
+            }
+            L.kv_src = kv_src[i];
+            if (L.kv_src >= 0 && hc.get_bool("use_double_wide_mlp", false)) L.ffn = 2 * c.ffn;
+        }
+        if (A == "qwen3_5") {
+            if (lt == "linear_attention") {
+                L.type = "deltanet";
+                L.dn_nk = (int)hc.get_int("linear_num_key_heads", 16);
+                L.dn_nv = (int)hc.get_int("linear_num_value_heads", 16);
+                L.dn_dk = (int)hc.get_int("linear_key_head_dim", 128);
+                L.dn_dv = (int)hc.get_int("linear_value_head_dim", 128);
+                L.dn_conv = (int)hc.get_int("linear_conv_kernel_dim", 4);
+            } else {
+                L.qk_norm = 1;
+                L.attn_gate = hc.get_bool("attn_output_gate", true);
+                float prf = (float)rp.get_num("partial_rotary_factor", 1.0);
+                int rot = (int)(c.head_dim * prf);
+                L.rope_half = rot / 2;
+                L.rope_rot = rot / 2;
+            }
+        }
+        if (A == "olmoe") {
+            L.ffn = 0;
+            L.n_experts = (int)hc.get_int("num_experts", 64);
+            L.top_k = (int)hc.get_int("num_experts_per_tok", 8);
+            L.expert_ffn = c.ffn;
+            L.router = "softmax";
+            L.norm_topk = hc.get_bool("norm_topk_prob", false);
+        }
+        if (A == "lfm2_moe" && i >= (int)hc.get_int("num_dense_layers", 0)) {
+            L.ffn = 0;
+            L.n_experts = (int)hc.get_int("num_experts", 32);
+            L.top_k = (int)hc.get_int("num_experts_per_tok", 4);
+            L.expert_ffn = (int)hc.get_int("moe_intermediate_size", 1792);
+            L.router = "sigmoid";
+            L.norm_topk = hc.get_bool("norm_topk_prob", true);
+            L.routed_scale = (float)hc.get_num("routed_scaling_factor", 1.0);
+            L.expert_bias = hc.get_bool("use_expert_bias", true);
+        }
+        c.layers.push_back(L);
+    }
 
     SafeTensors st;
     st.open_dir(o.in_dir);
@@ -286,10 +417,17 @@ int convert_main(int argc, char** argv) {
     Json gen_defaults = Json::object();
     Json tok = build_tokenizer(o.in_dir, w, c.vocab, gen_defaults);
 
+    // checkpoint prefix: plain models use "model.", multimodal wrappers "model.language_model."
+    std::string P = st.has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
     auto need = [&](const std::string& n) -> const STTensor* {
         const STTensor* t = st.get(n);
         if (!t) die("missing tensor %s in checkpoint", n.c_str());
         return t;
+    };
+    auto first_of = [&](std::initializer_list<std::string> names) -> const STTensor* {
+        for (auto& n : names) if (st.get(n)) return st.get(n);
+        std::string all; for (auto& n : names) all += n + " ";
+        die("missing tensor (tried: %s)", all.c_str());
     };
     size_t total_bytes = 0;
     // Write a matrix assembled from row sources
@@ -297,10 +435,10 @@ int convert_main(int argc, char** argv) {
                             const std::function<void(int64_t, float*)>& src_row) {
         if (qt != QType::F32) for (auto& ov : o.overrides) if (name.find(ov.first) != std::string::npos) qt = ov.second;
         if (qt == QType::Q3 && (name == "tok_embd" || name == "output")) qt = QType::Q4;  // no Q3 embedding kernels
+        if ((qt == QType::Q4 || qt == QType::Q3) && cols % Q4_GROUP) qt = cols % Q8_GROUP ? QType::F16 : QType::Q8;
         std::vector<uint8_t> data, scales;
         const float* imp = nullptr;
         auto it = imat.find(name);
-        if (it == imat.end() && name == "tok_embd" && c.tied_embed) it = imat.find("tok_embd");
         std::vector<float> impv;
         if (it != imat.end() && (int64_t)it->second.size() == cols) {
             // regularize: importance = mean(x^2) + small fraction of its average
@@ -322,59 +460,150 @@ int convert_main(int argc, char** argv) {
         total_bytes += data.size() + scales.size();
         logd("  %-24s %-4s [%lld x %lld]", name.c_str(), qtype_name(qt), (long long)rows, (long long)cols);
     };
-    auto write_vec = [&](const std::string& name, const STTensor* t) {
+    // 1-D float vectors; `add` is added to every element (Gemma/Qwen3.5 store norms as w-1)
+    auto write_vec = [&](const std::string& name, const STTensor* t, float add = 0.f, float mul = 1.f) {
         int64_t n = t->numel();
-        write_matrix(name, QType::F32, 1, n, [&](int64_t, float* buf) { t->to_float(buf, 0, n); });
+        write_matrix(name, QType::F32, 1, n, [&, add, mul](int64_t, float* buf) {
+            t->to_float(buf, 0, n);
+            for (int64_t i = 0; i < n; i++) buf[i] = (buf[i] + add) * mul;
+        });
+    };
+    auto write_const = [&](const std::string& name, int64_t n, float v) {
+        write_matrix(name, QType::F32, 1, n, [&, v](int64_t, float* buf) { for (int64_t i = 0; i < n; i++) buf[i] = v; });
     };
     auto simple = [&](const STTensor* t) {
         int64_t cols = t->shape.back();
         return [t, cols](int64_t r, float* buf) { t->to_float(buf, r * cols, cols); };
     };
+    const float norm_add = (A == "gemma3" || A == "qwen3_5") ? 1.f : 0.f;  // RMSNorm weight stored as (w - 1)
 
     logi("converting %s (%s) -> %s [%s]", c.name.c_str(), c.arch.c_str(), o.out_path.c_str(), qtype_name(o.wtype));
-    const STTensor* emb = need("model.embed_tokens.weight");
+    const STTensor* emb = need(P + "embed_tokens.weight");
     int64_t V = emb->shape[0];
     c.vocab = (int)V;
-    write_matrix("tok_embd", o.embed_type, V, c.hidden, simple(emb));
-    write_vec("output_norm", need("model.norm.weight"));
+    const int H = c.hidden;
+    write_matrix("tok_embd", o.embed_type, V, H, simple(emb));
+    write_vec("output_norm", first_of({P + "norm.weight", P + "embedding_norm.weight"}), norm_add);
     if (!c.tied_embed) {
         const STTensor* lm = st.get("lm_head.weight");
-        if (lm) write_matrix("output", o.embed_type, lm->shape[0], c.hidden, simple(lm));
+        if (lm) write_matrix("output", o.embed_type, lm->shape[0], H, simple(lm));
         else c.tied_embed = true;
     }
-    const int qd = c.q_dim(), kvd = c.kv_dim();
     for (int l = 0; l < c.n_layers; l++) {
-        std::string p = "model.layers." + std::to_string(l) + ".";
+        LayerCfg& L = c.layers[l];
+        std::string p = P + "layers." + std::to_string(l) + ".";
         std::string o_ = "blk." + std::to_string(l) + ".";
-        write_vec(o_ + "attn_norm", need(p + "input_layernorm.weight"));
-        write_vec(o_ + "ffn_norm", need(p + "post_attention_layernorm.weight"));
-        const STTensor *wq = need(p + "self_attn.q_proj.weight"), *wk = need(p + "self_attn.k_proj.weight"),
-                       *wv = need(p + "self_attn.v_proj.weight");
-        write_matrix(o_ + "wqkv", o.wtype, qd + 2 * kvd, c.hidden, [&](int64_t r, float* buf) {
-            if (r < qd) wq->to_float(buf, r * c.hidden, c.hidden);
-            else if (r < qd + kvd) wk->to_float(buf, (r - qd) * c.hidden, c.hidden);
-            else wv->to_float(buf, (r - qd - kvd) * c.hidden, c.hidden);
-        });
-        if (c.attn_bias) {
-            const STTensor *bq = need(p + "self_attn.q_proj.bias"), *bk = need(p + "self_attn.k_proj.bias"),
-                           *bv = need(p + "self_attn.v_proj.bias");
-            write_matrix(o_ + "bqkv", QType::F32, 1, qd + 2 * kvd, [&](int64_t, float* buf) {
-                bq->to_float(buf, 0, qd);
-                bk->to_float(buf + qd, 0, kvd);
-                bv->to_float(buf + qd + kvd, 0, kvd);
+        // ---- norms ----
+        if (A == "lfm2" || A == "lfm2_moe") {
+            write_vec(o_ + "attn_norm", need(p + "operator_norm.weight"));
+            write_vec(o_ + "ffn_norm", need(p + "ffn_norm.weight"));
+        } else if (gemma) {
+            write_vec(o_ + "attn_norm", need(p + "input_layernorm.weight"), norm_add);
+            write_vec(o_ + "post_attn_norm", need(p + "post_attention_layernorm.weight"), norm_add);
+            write_vec(o_ + "ffn_norm", need(p + "pre_feedforward_layernorm.weight"), norm_add);
+            write_vec(o_ + "post_ffn_norm", need(p + "post_feedforward_layernorm.weight"), norm_add);
+            if (const STTensor* ls = st.get(p + "layer_scalar")) { float v; ls->to_float(&v, 0, 1); L.layer_scalar = v; }
+        } else {
+            write_vec(o_ + "attn_norm", need(p + "input_layernorm.weight"), norm_add);
+            write_vec(o_ + "ffn_norm", need(p + "post_attention_layernorm.weight"), norm_add);
+        }
+        // ---- mixer ----
+        if (L.type == "attn") {
+            std::string ap = p + "self_attn.";
+            const int qd = L.q_dim(), kvd = L.kv_dim(), hd = L.head_dim;
+            const STTensor* wq = need(ap + "q_proj.weight");
+            const STTensor* wk = L.kv_src >= 0 ? nullptr : need(ap + "k_proj.weight");
+            const STTensor* wv = (L.kv_src >= 0 || L.k_eq_v) ? nullptr : need(ap + "v_proj.weight");
+            const int qrows = qd * (L.attn_gate ? 2 : 1);
+            // rows: [q (q and gate interleaved per head as in the checkpoint) ; k ; v]
+            write_matrix(o_ + "wqkv", o.wtype, L.qkv_rows(), H, [&](int64_t r, float* buf) {
+                if (r < qrows) wq->to_float(buf, r * H, H);
+                else if (r < qrows + kvd) wk->to_float(buf, (r - qrows) * H, H);
+                else wv->to_float(buf, (r - qrows - kvd) * H, H);
             });
+            if (c.attn_bias) {
+                const STTensor *bq = need(ap + "q_proj.bias"), *bk = need(ap + "k_proj.bias"), *bv = need(ap + "v_proj.bias");
+                write_matrix(o_ + "bqkv", QType::F32, 1, qd + 2 * kvd, [&](int64_t, float* buf) {
+                    bq->to_float(buf, 0, qd);
+                    bk->to_float(buf + qd, 0, kvd);
+                    bv->to_float(buf + qd + kvd, 0, kvd);
+                });
+            }
+            if (L.qk_norm) {
+                write_vec(o_ + "q_norm", first_of({ap + "q_norm.weight", ap + "q_layernorm.weight"}), norm_add);
+                if (L.kv_src < 0) write_vec(o_ + "k_norm", first_of({ap + "k_norm.weight", ap + "k_layernorm.weight"}), norm_add);
+            }
+            (void)hd;
+            write_matrix(o_ + "wo", o.wtype, H, qd, simple(first_of({ap + "o_proj.weight", ap + "out_proj.weight"})));
+        } else if (L.type == "conv") {
+            write_matrix(o_ + "conv_in", o.wtype, 3 * H, H, simple(need(p + "conv.in_proj.weight")));
+            write_vec(o_ + "conv_w", need(p + "conv.conv.weight"));  // [H][1][K] -> [H][K]
+            write_matrix(o_ + "conv_out", o.wtype, H, H, simple(need(p + "conv.out_proj.weight")));
+        } else if (L.type == "deltanet") {
+            std::string dp = p + "linear_attn.";
+            const STTensor *wqkv = need(dp + "in_proj_qkv.weight"), *wz = need(dp + "in_proj_z.weight"),
+                           *wb = need(dp + "in_proj_b.weight"), *wa = need(dp + "in_proj_a.weight");
+            const int cd = L.dn_conv_dim(), vd = L.dn_val_dim(), nv = L.dn_nv;
+            write_matrix(o_ + "dn_in", o.wtype, L.dn_in_rows(), H, [&](int64_t r, float* buf) {
+                if (r < cd) wqkv->to_float(buf, r * H, H);
+                else if (r < cd + vd) wz->to_float(buf, (r - cd) * H, H);
+                else if (r < cd + vd + nv) wb->to_float(buf, (r - cd - vd) * H, H);
+                else wa->to_float(buf, (r - cd - vd - nv) * H, H);
+            });
+            write_vec(o_ + "dn_conv", need(dp + "conv1d.weight"));
+            // store A = -exp(A_log) directly
+            const STTensor* alog = need(dp + "A_log");
+            write_matrix(o_ + "dn_A", QType::F32, 1, nv, [&](int64_t, float* buf) {
+                alog->to_float(buf, 0, nv);
+                for (int i = 0; i < nv; i++) buf[i] = -expf(buf[i]);
+            });
+            write_vec(o_ + "dn_dt", need(dp + "dt_bias"));
+            write_vec(o_ + "dn_norm", need(dp + "norm.weight"));
+            write_matrix(o_ + "dn_out", o.wtype, H, vd, simple(need(dp + "out_proj.weight")));
         }
-        if (c.qk_norm) {
-            write_vec(o_ + "q_norm", need(p + "self_attn.q_norm.weight"));
-            write_vec(o_ + "k_norm", need(p + "self_attn.k_norm.weight"));
+        // ---- feed forward ----
+        if (L.n_experts) {
+            std::string mp = (A == "lfm2_moe") ? p + "feed_forward." : p + "mlp.";
+            const STTensor* router = first_of({mp + "gate.weight", mp + "router.weight"});
+            write_matrix(o_ + "router", QType::F32, L.n_experts, H, simple(router));
+            if (L.expert_bias) {
+                const STTensor* eb = first_of({mp + "expert_bias", mp + "gate.expert_bias"});
+                write_vec(o_ + "expert_bias", eb);
+            }
+            const int F = L.expert_ffn, E = L.n_experts;
+            // experts: per-expert tensors (w1/w3/w2 or gate/up/down) or fused 3D tensors
+            auto ex = [&](int e, const char* a, const char* b) -> const STTensor* {
+                std::string base = mp + "experts." + std::to_string(e) + ".";
+                if (st.get(base + a + ".weight")) return st.get(base + a + ".weight");
+                return need(base + b + ".weight");
+            };
+            const STTensor* fused_gu = st.get(mp + "experts.gate_up_proj");
+            const STTensor* fused_dn = st.get(mp + "experts.down_proj");
+            write_matrix(o_ + "wgu_e", o.wtype, (int64_t)E * 2 * F, H, [&](int64_t r, float* buf) {
+                int e = (int)(r / (2 * F)), rr = (int)(r % (2 * F));
+                bool up = rr & 1; int row = rr >> 1;
+                if (fused_gu) fused_gu->to_float(buf, ((int64_t)e * 2 * F + (up ? F + row : row)) * H, H);
+                else ex(e, up ? "up_proj" : "gate_proj", up ? "w3" : "w1")->to_float(buf, (int64_t)row * H, H);
+            });
+            write_matrix(o_ + "wdown_e", o.wtype, (int64_t)E * H, F, [&](int64_t r, float* buf) {
+                int e = (int)(r / H), row = (int)(r % H);
+                if (fused_dn) fused_dn->to_float(buf, ((int64_t)e * H + row) * F, F);
+                else ex(e, "down_proj", "w2")->to_float(buf, (int64_t)row * F, F);
+            });
+        } else if (L.ffn) {
+            const STTensor *wg, *wu, *wd;
+            if (A == "lfm2" || A == "lfm2_moe") {
+                wg = need(p + "feed_forward.w1.weight"); wu = need(p + "feed_forward.w3.weight"); wd = need(p + "feed_forward.w2.weight");
+            } else {
+                wg = need(p + "mlp.gate_proj.weight"); wu = need(p + "mlp.up_proj.weight"); wd = need(p + "mlp.down_proj.weight");
+            }
+            L.ffn = (int)wg->shape[0];
+            // interleaved: row 2i = gate_i, row 2i+1 = up_i
+            write_matrix(o_ + "wgu", o.wtype, 2 * (int64_t)L.ffn, H, [&](int64_t r, float* buf) {
+                (r & 1 ? wu : wg)->to_float(buf, (r >> 1) * H, H);
+            });
+            write_matrix(o_ + "wdown", o.wtype, H, L.ffn, simple(wd));
         }
-        write_matrix(o_ + "wo", o.wtype, c.hidden, qd, simple(need(p + "self_attn.o_proj.weight")));
-        const STTensor *wg = need(p + "mlp.gate_proj.weight"), *wu = need(p + "mlp.up_proj.weight");
-        // interleaved: row 2i = gate_i, row 2i+1 = up_i
-        write_matrix(o_ + "wgu", o.wtype, 2 * (int64_t)c.ffn, c.hidden, [&](int64_t r, float* buf) {
-            (r & 1 ? wu : wg)->to_float(buf, (r >> 1) * c.hidden, c.hidden);
-        });
-        write_matrix(o_ + "wdown", o.wtype, c.hidden, c.ffn, simple(need(p + "mlp.down_proj.weight")));
         if (g_log_level >= 1) { fprintf(stderr, "\r[tachyon] layer %d/%d", l + 1, c.n_layers); fflush(stderr); }
     }
     if (g_log_level >= 1) fprintf(stderr, "\n");
