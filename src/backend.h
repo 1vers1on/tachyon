@@ -21,7 +21,8 @@ struct BackendOptions {
     size_t reserve_bytes = 0;      // GPU memory to leave free (e.g. draft model weights)
     size_t extra_kv_per_tok = 0;   // additional KV bytes per token per slot to budget (draft model KV)
     int vocab_limit = 0;   // >0: only compute logits for token ids < vocab_limit (draft models)
-    int cpu_moe = -1;      // CUDA: MoE layers whose experts run on the CPU from system RAM (-1 = auto: what does not fit)
+    int cpu_moe = -1;
+    bool state_rollback = false;  // stateful models: keep per-row state snapshots in decode batches + a per-slot backup      // CUDA: MoE layers whose experts run on the CPU from system RAM (-1 = auto: what does not fit)
 };
 
 class Backend {
@@ -42,6 +43,12 @@ public:
     // unsupported (caller falls back to get_logits). Rows whose candidate count overflows `cap` are truncated.
     virtual bool candidates(int n, float delta, int cap, std::vector<std::vector<std::pair<float, int>>>& out) { return false; }
     virtual void imat_flush() {}  // move device-side importance statistics into g_imatrix
+    // Recurrent-state rollback (speculative decoding on conv / delta-net models; needs opt.state_rollback):
+    virtual bool supports_state_rollback() const { return false; }
+    // the slot's state becomes the state right after batch row `row` of the last forward (rows of one slot in order)
+    virtual void state_restore_row(int slot, int row) {}
+    virtual void state_save(int slot) {}      // per-slot backup of the recurrent state
+    virtual void state_restore(int slot) {}
     BackendOptions opt;
 };
 

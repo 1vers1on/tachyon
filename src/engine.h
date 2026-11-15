@@ -82,6 +82,7 @@ private:
         int spec_k = 0;
         std::vector<int> dcache;  // tokens whose KV is valid in the draft model's slot
         int dk = 0;               // current draft-model depth
+        int dsaved = -1;          // stateful draft model: dcache length at its last state backup
         int spec_miss = 0;
         double last_used = 0;
     };

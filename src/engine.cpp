@@ -37,7 +37,10 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
         opt.backend.reserve_bytes = dmf.file_size + (256ull << 20);
         opt.backend.extra_kv_per_tok = per_tok;
     }
+    // stateful models can speculate when the backend keeps per-row state snapshots (CUDA)
+    opt.backend.state_rollback = mf.config.stateful && dev == "cuda" && (opt.spec_draft != 0 || !opt.draft_model.empty());
     be->init(mf, opt.backend);
+    opt.backend.state_rollback = false;
     opt.backend.reserve_bytes = 0;
     opt.backend.extra_kv_per_tok = 0;
     opt.backend.ctx = be->opt.ctx;          // the backend may have shrunk the context to fit memory
@@ -47,6 +50,7 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
         dbe.reset(dev == "cuda" ? create_cuda_backend() : create_cpu_backend());
         BackendOptions dbo = opt.backend;
         dbo.vocab_limit = opt.draft_vocab;  // drafts only need likely tokens; verification stays exact
+        dbo.state_rollback = dmf.config.stateful && dev == "cuda";   // per-slot backup to undo rejected drafts
         dbe->init(dmf, dbo);
         if (dbe->opt.ctx < opt.backend.ctx) opt.backend.ctx = dbe->opt.ctx;
         logi("draft model %s loaded for speculative decoding (k=%d)", dmf.config.name.c_str(), opt.draft_k);
@@ -54,10 +58,14 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
     logi("model %s loaded on %s in %.2fs (%d layers, hidden %d, vocab %d, %s)", model_name.c_str(), be->name(),
          now_sec() - t0, mf.config.n_layers, mf.config.hidden, mf.config.vocab, qtype_name(mf.config.wtype));
     if (opt.spec_draft < 0) opt.spec_draft = std::string(be->name()) == "cuda" || dbe ? 4 : 0;
-    if (mf.config.stateful) {
-        // recurrent state (short conv / delta net) cannot be rolled back after rejected drafts
+    if (mf.config.stateful && !be->supports_state_rollback()) {
+        // recurrent state (short conv / delta net) cannot be rolled back after rejected drafts on this backend
         if (opt.spec_draft > 0 || dbe) logi("model has recurrent state: speculative decoding disabled");
         opt.spec_draft = 0;
+        dbe.reset();
+    }
+    if (dbe && dmf.config.stateful && !dbe->supports_state_rollback()) {
+        logi("draft model has recurrent state but its backend cannot roll it back: draft model disabled");
         dbe.reset();
     }
     slots_.resize(opt.backend.n_slots);
@@ -254,6 +262,12 @@ void Engine::draft_with_model(const std::vector<std::pair<int, int>>& need, std:
         ctx.push_back(s.last);
         int lcp = 0;
         while (lcp < (int)s.dcache.size() && lcp < (int)ctx.size() && s.dcache[lcp] == ctx[lcp]) lcp++;
+        if (dmf.config.stateful && lcp < (int)s.dcache.size()) {
+            // the draft's recurrent state includes rejected tokens: go back to the backup taken after the last catch-up
+            if (s.dsaved > 0 && lcp >= s.dsaved) { dbe->state_restore(need[i].first); lcp = s.dsaved; }
+            else lcp = 0;   // position 0 resets the state
+        }
+        if (dmf.config.stateful && lcp >= (int)ctx.size()) lcp = 0;   // never feed a token twice into the state
         lcp = std::min(lcp, (int)ctx.size() - 1);
         for (int p0 = lcp; p0 < (int)ctx.size(); p0 += opt.prefill_chunk) {
             int n = std::min(opt.prefill_chunk, (int)ctx.size() - p0);
@@ -263,6 +277,7 @@ void Engine::draft_with_model(const std::vector<std::pair<int, int>>& need, std:
         }
         dbe->argmax_all(&cur[i]);
         s.dcache = ctx;
+        if (dmf.config.stateful) { dbe->state_save(need[i].first); s.dsaved = (int)ctx.size(); }
         out[i].push_back(cur[i]);
     }
     // autoregressive drafting, all slots batched
@@ -416,6 +431,8 @@ bool Engine::step() {
             break;
         }
         req->n_draft_accepted += accepted;
+        // recurrent state: undo the rows of rejected drafts (state after the last kept row = row first + accepted)
+        if (mf.config.stateful && accepted < nd) be->state_restore_row(rr.slot, rr.first + accepted);
         // adapt speculation depth
         if (nd > 0 && from_model[rr.slot]) {
             if (accepted == nd) s.dk = std::min(s.dk + 1, 7);

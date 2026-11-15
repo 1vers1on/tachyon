@@ -29,6 +29,7 @@ static const char kKernelSource[] = {
 constexpr int MAX_DEC = 16;     // max tokens on the GEMV (decode) path
 constexpr int MAX_LOGITS = 64;  // max logits rows per forward
 constexpr int SPLITS = 16;      // attention KV splits for decode
+constexpr int SNAP_ROWS = 8;    // decode batch rows with recurrent-state snapshots (SNAP_ROWS in kernels.cu)
 
 struct DMat {
     QType t = QType::Q4;
@@ -45,6 +46,8 @@ struct DLayer {
     int kv_cap = 0;                                 // positions stored (ring of window + batch for sliding layers)
     int cpu_moe = -1;                               // CpuMoe layer handle when the experts live in system RAM
     CUdeviceptr st0 = 0, st1 = 0;                   // recurrent state (conv / delta net)
+    CUdeviceptr snap0 = 0, snap1 = 0;               // per-batch-row snapshots (speculative rollback)
+    CUdeviceptr bak0 = 0, bak1 = 0;                 // per-slot backups
     DMat ple_gate, ple_out; CUdeviceptr ple_post_norm = 0;
     int in_rows() const { return c.is_attn() ? c.qkv_rows() : c.type == "conv" ? 3 * conv_in.cols : c.dn_in_rows(); }
 };
@@ -240,6 +243,41 @@ public:
             launch(f_kvcopy_, D3(L.c.n_kv_heads), D3(256), 0, L.kc, L.vc, src, dst, std::min(n, L.kv_cap), L.c.n_kv_heads, L.c.head_dim, L.kv_cap, L.ksc, L.vsc);
         }
     }
+
+    bool supports_state_rollback() const override { return opt.state_rollback; }
+    void state_restore_row(int slot, int row) override {
+        bind();
+        if (!opt.state_rollback || row >= SNAP_ROWS) die("state_restore_row: no snapshot for row %d", row);
+        for (auto& L : layers_) {
+            const LayerCfg& lc = L.c;
+            if (lc.type == "conv") {
+                const size_t per = (size_t)(lc.conv_k - 1) * c_.hidden * 4;
+                CU(cuMemcpyDtoDAsync(L.st0 + slot * per, L.snap0 + row * per, per, stream_));
+            } else if (lc.type == "deltanet") {
+                const size_t p0 = (size_t)(lc.dn_conv - 1) * lc.dn_conv_dim() * 4, p1 = (size_t)lc.dn_nv * lc.dn_dk * lc.dn_dv * 4;
+                CU(cuMemcpyDtoDAsync(L.st0 + slot * p0, L.snap0 + row * p0, p0, stream_));
+                CU(cuMemcpyDtoDAsync(L.st1 + slot * p1, L.snap1 + row * p1, p1, stream_));
+            }
+        }
+    }
+    void state_copy(int slot, bool save) {
+        bind();
+        if (!opt.state_rollback) return;
+        for (auto& L : layers_) {
+            const LayerCfg& lc = L.c;
+            auto cp = [&](CUdeviceptr live, CUdeviceptr bak, size_t per) {
+                if (save) CU(cuMemcpyDtoDAsync(bak + slot * per, live + slot * per, per, stream_));
+                else CU(cuMemcpyDtoDAsync(live + slot * per, bak + slot * per, per, stream_));
+            };
+            if (lc.type == "conv") cp(L.st0, L.bak0, (size_t)(lc.conv_k - 1) * c_.hidden * 4);
+            else if (lc.type == "deltanet") {
+                cp(L.st0, L.bak0, (size_t)(lc.dn_conv - 1) * lc.dn_conv_dim() * 4);
+                cp(L.st1, L.bak1, (size_t)lc.dn_nv * lc.dn_dk * lc.dn_dv * 4);
+            }
+        }
+    }
+    void state_save(int slot) override { state_copy(slot, true); }
+    void state_restore(int slot) override { state_copy(slot, false); }
 
     void imat_flush() override {
         if (!g_imatrix) return;
@@ -507,7 +545,7 @@ private:
         size_t free_b, total_b;
         cuMemGetInfo(&free_b, &total_b);
         const size_t kv_elt = opt.kv_int8 ? 1 : 2;
-        size_t per_tok = 0, state_bytes = 0;
+        size_t per_tok = 0, state_bytes = 0, snap_bytes = 0;
         size_t ring_bytes = 0;  // sliding-window layers: fixed-size ring, independent of ctx
         for (auto& L : layers_) {
             const LayerCfg& lc = L.c;
@@ -516,13 +554,21 @@ private:
                 if (lc.window > 0) ring_bytes += tokb * (lc.window + opt.max_batch);
                 else per_tok += tokb;
             }
-            if (lc.type == "conv") state_bytes += (size_t)(lc.conv_k - 1) * c_.hidden * 4;
-            if (lc.type == "deltanet") state_bytes += ((size_t)(lc.dn_conv - 1) * lc.dn_conv_dim() + (size_t)lc.dn_nv * lc.dn_dk * lc.dn_dv) * 4;
+            const size_t rb = opt.state_rollback ? 2 : 1;   // backup per slot (+ row snapshots, below)
+            if (lc.type == "conv") {
+                state_bytes += rb * (size_t)(lc.conv_k - 1) * c_.hidden * 4;
+                if (opt.state_rollback) snap_bytes += SNAP_ROWS * (size_t)(lc.conv_k - 1) * c_.hidden * 4;
+            }
+            if (lc.type == "deltanet") {
+                const size_t b = ((size_t)(lc.dn_conv - 1) * lc.dn_conv_dim() + (size_t)lc.dn_nv * lc.dn_dk * lc.dn_dv) * 4;
+                state_bytes += rb * b;
+                if (opt.state_rollback) snap_bytes += SNAP_ROWS * b;
+            }
         }
         size_t act_bytes = 256ull << 20;
         size_t reserve = (512ull << 20) + opt.reserve_bytes;
         size_t avail = free_b > reserve + act_bytes ? free_b - reserve - act_bytes : 0;
-        const size_t st_total = (state_bytes + ring_bytes) * opt.n_slots;
+        const size_t st_total = (state_bytes + ring_bytes) * opt.n_slots + snap_bytes;
         avail = avail > st_total ? avail - st_total : 0;
         const size_t budget_tok = per_tok + opt.extra_kv_per_tok;
         if (budget_tok > 0) {
@@ -581,12 +627,20 @@ private:
                 size_t n = (size_t)opt.n_slots * (lc.conv_k - 1) * c_.hidden * 4;
                 L.st0 = alloc(n);
                 CU(cuMemsetD8Async(L.st0, 0, n, stream_));
+                if (opt.state_rollback) {
+                    const size_t per = (size_t)(lc.conv_k - 1) * c_.hidden * 4;
+                    L.snap0 = alloc(SNAP_ROWS * per); L.bak0 = alloc(opt.n_slots * per);
+                }
             } else {
                 size_t n0 = (size_t)opt.n_slots * (lc.dn_conv - 1) * lc.dn_conv_dim() * 4;
                 size_t n1 = (size_t)opt.n_slots * lc.dn_nv * lc.dn_dk * lc.dn_dv * 4;
                 L.st0 = alloc(n0); L.st1 = alloc(n1);
                 CU(cuMemsetD8Async(L.st0, 0, n0, stream_));
                 CU(cuMemsetD8Async(L.st1, 0, n1, stream_));
+                if (opt.state_rollback) {
+                    L.snap0 = alloc(SNAP_ROWS * (n0 / opt.n_slots)); L.snap1 = alloc(SNAP_ROWS * (n1 / opt.n_slots));
+                    L.bak0 = alloc(n0); L.bak1 = alloc(n1);
+                }
             }
         }
         logi("cuda: KV cache %.2f GB (%d slots x %d ctx, %s)%s", per_tok * opt.ctx * opt.n_slots / 1e9, opt.n_slots, opt.ctx,
@@ -1083,15 +1137,15 @@ private:
             } else if (lc.type == "conv") {
                 gemv(L.conv_in, 1, 0, M, x_, L.attn_norm, 0, 0, 0, proj_);
                 launch(F("causal_conv<2>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
-                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, xq_, xds_);
+                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, xq_, xds_, L.snap0);
                 gemv(L.conv_out, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
             } else {
                 const int R = lc.dn_in_rows(), CD = lc.dn_conv_dim(), VD = lc.dn_val_dim();
                 gemv(L.dn_in, 1, 0, M, x_, L.attn_norm, 0, 0, 0, proj_);
                 launch(F("causal_conv<1>"), D3((CD + 127) / 128), D3(128), 0, proj_, R, CD, lc.dn_conv, L.dn_conv, L.st0,
-                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0);
+                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0, L.snap0);
                 launch(F(dn_name(lc.dn_dk, lc.dn_dv)), D3(lc.dn_nv), D3(2 * lc.dn_dv), 0, proj_, R, lc.dn_nk, lc.dn_nv, L.dn_A, L.dn_dt,
-                       L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, xq_, xds_);
+                       L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, xq_, xds_, L.snap1);
                 gemv(L.dn_out, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
             }
             if (!dadd) residual(M, tmp_, L.post_attn_norm, 1.f);
@@ -1338,7 +1392,7 @@ private:
                     launch(F("conv_state<0>"), D3((H + 255) / 256), D3(256), 0, proj_, 3 * H, H, lc.conv_k, st, M);
                 } else {
                     launch(F("causal_conv<0>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
-                           pos_ptr(), slot_ptr(), M, tmp_, (CUdeviceptr)0, (CUdeviceptr)0);
+                           pos_ptr(), slot_ptr(), M, tmp_, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0);
                 }
                 launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * H);
                 if (g_imatrix) imat_acc(bp + "conv_out", hb_, M, H);
@@ -1358,9 +1412,9 @@ private:
                     launch(f_dnpost_, D3(M, (NV + 7) / 8), D3(256), 0, tmp_, proj_, R, CD, NV, DV, L.dn_norm, hb_);
                 } else {
                     launch(F("causal_conv<1>"), D3((CD + 127) / 128), D3(128), 0, proj_, R, CD, lc.dn_conv, L.dn_conv, L.st0,
-                           pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0);
+                           pos_ptr(), slot_ptr(), M, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0);
                     launch(F(dn_name(lc.dn_dk, lc.dn_dv)), D3(lc.dn_nv), D3(2 * lc.dn_dv), 0, proj_, R, lc.dn_nk, lc.dn_nv, L.dn_A, L.dn_dt,
-                           L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_, (CUdeviceptr)0, (CUdeviceptr)0);
+                           L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0);
                     launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * VD);
                 }
                 if (g_imatrix) imat_acc(bp + "dn_out", hb_, M, VD);

@@ -1630,10 +1630,11 @@ extern "C" __global__ void softcap_rows(float* __restrict__ l, size_t n, float c
 //  MODE 0 (LFM2 short conv): row = [B | C | x] (3*C wide); y = C * conv(B * x)            -> out [M][C]
 //  MODE 1 (delta net):       row[0:C] = SiLU(conv(row[0:C]))                               (in place)
 //  MODE 2: MODE 0 with the output quantized to int8 blocks for the next GEMV (oq / ods), C % 32 == 0
+#define SNAP_ROWS 8   // batch rows with state snapshots (decode batches with speculative drafts are <= 8 rows)
 template <int MODE>
 __global__ void causal_conv(float* __restrict__ in, int stride, int C, int K, const float* __restrict__ w, float* __restrict__ state,
                             const int* __restrict__ pos, const int* __restrict__ slot, int M, float* __restrict__ out,
-                            int8_t* __restrict__ oq, float2* __restrict__ ods) {
+                            int8_t* __restrict__ oq, float2* __restrict__ ods, float* __restrict__ snap) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= C) return;   // C % 32 == 0: whole warps leave
     float wk[8];
@@ -1648,6 +1649,9 @@ __global__ void causal_conv(float* __restrict__ in, int stride, int C, int K, co
         for (int k = 0; k < K - 1; k++) acc += wk[k] * st[(size_t)k * C + ch];
         for (int k = 0; k < K - 2; k++) st[(size_t)k * C + ch] = st[(size_t)(k + 1) * C + ch];
         st[(size_t)(K - 2) * C + ch] = xin;
+        // speculative rows: snapshot the state after row m when the next row continues the same sequence
+        if (snap && m + 1 < M && m < SNAP_ROWS && slot[m + 1] == slot[m])
+            for (int k = 0; k < K - 1; k++) snap[((size_t)m * (K - 1) + k) * C + ch] = st[(size_t)k * C + ch];
         if (MODE == 0) out[(size_t)m * C + ch] = r[C + ch] * acc;
         else if (MODE == 1) r[ch] = acc / (1.f + __expf(-acc));
         else {
@@ -1670,7 +1674,7 @@ template <int DK, int DV>
 __global__ void __launch_bounds__(2 * DV) delta_rule(const float* __restrict__ proj, int R, int NK, int NV, const float* __restrict__ A,
                                                       const float* __restrict__ dt, const float* __restrict__ nw, float* __restrict__ state,
                                                       const int* __restrict__ pos, const int* __restrict__ slot, int M, float* __restrict__ out,
-                                                      int8_t* __restrict__ oq, float2* __restrict__ ods) {
+                                                      int8_t* __restrict__ oq, float2* __restrict__ ods, float* __restrict__ snap) {
     constexpr int HK = DK / 2;
     const int h = blockIdx.x;
     const int tid = threadIdx.x, j = tid % DV, half = tid / DV;
@@ -1757,6 +1761,11 @@ __global__ void __launch_bounds__(2 * DV) delta_rule(const float* __restrict__ p
             } else {
                 out[(size_t)m * VD + h * DV + j] = v;
             }
+        }
+        if (snap && m + 1 < M && m < SNAP_ROWS && slot[m + 1] == sl) {
+            float* sp = snap + ((size_t)m * NV + h) * DK * DV;
+#pragma unroll
+            for (int i = 0; i < HK; i++) sp[(size_t)(half * HK + i) * DV + j] = S[i];
         }
         __syncthreads();
     }
