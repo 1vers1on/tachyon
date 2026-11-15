@@ -210,6 +210,7 @@ public:
         std::pair<std::string, std::string> out;
         buf_ += d;
         while (true) {
+            if (mode_ == 3) break;  // after the reasoning block: handled below
             if (mode_ == 2) { out.second += buf_; buf_.clear(); break; }
             if (mode_ == 0) {  // undecided: does output start with <think>?
                 size_t i = 0;
