@@ -1657,5 +1657,48 @@ extern "C" __global__ void scatter_add_rows(const float* __restrict__ y, const i
     const int i = blockIdx.x;
     float* o = out + (size_t)rows[i] * K;
     const float wi = w[i];
-    for (int j = threadIdx.x; j < K; j += blockDim.x) o[j] += wi * y[(size_t)i * K + j];
+    // a token appears once per selected expert, in different blocks: accumulate atomically
+    for (int j = threadIdx.x; j < K; j += blockDim.x) atomicAdd(&o[j], wi * y[(size_t)i * K + j]);
+}
+
+// ---- Gemma 4 per-layer inputs ----
+// generic embedding-row lookup with runtime width / qtype (3 Q4, 2 Q8). grid M, block 256
+extern "C" __global__ void embed_rows(const uint8_t* __restrict__ E, const uint8_t* __restrict__ ES, int qt, const int* __restrict__ tokens,
+                                      int W, float scale, float* __restrict__ out) {
+    const int m = blockIdx.x;
+    const size_t tok = tokens[m];
+    for (int i = threadIdx.x; i < W; i += blockDim.x) {
+        float v;
+        if (qt == QT_Q4) {
+            const uint8_t* row = E + tok * (W / 2);
+            const int blk = i / 32, j = i % 32;
+            const uint8_t b = row[blk * 16 + (j & 15)];
+            const int q = j < 16 ? (b & 15) : (b >> 4);
+            const half2 sm = ((const half2*)ES)[tok * (W / 64) + i / 64];
+            v = __low2float(sm) * q + __high2float(sm);
+        } else {
+            v = __half2float(((const half*)ES)[tok * (W / 32) + i / 32]) * (float)((const int8_t*)E)[tok * W + i];
+        }
+        out[(size_t)m * W + i] = v * scale;
+    }
+}
+// ple[m][l][:] = (rmsnorm(proj[m][l][:] / sqrt(H)) * w + tok[m][l][:] * sqrt(D)) / sqrt(2). grid (M, NL), block D
+extern "C" __global__ void ple_combine(const float* __restrict__ proj, const float* __restrict__ tok, const float* __restrict__ w, int D, int NL,
+                                       float* __restrict__ out) {
+    const int m = blockIdx.x, l = blockIdx.y, i = threadIdx.x;
+    const size_t o = (size_t)m * NL * D + (size_t)l * D + i;
+    const float v = proj[o] * rsqrtf((float)HID);
+    __shared__ float red[32];
+    float ss = warp_sum(v * v);
+    if (i % 32 == 0) red[i / 32] = ss;
+    __syncthreads();
+    float t = 0;
+    for (int k = 0; k < D / 32; k++) t += red[k];
+    const float sc = rsqrtf(t / D + EPS);
+    out[o] = (v * sc * w[i] + tok[o] * sqrtf((float)D)) * 0.70710678f;
+}
+// g[m][i] = act(g[m][i]) * ple[m][l][i]. grid M, block D
+extern "C" __global__ void ple_mul(float* __restrict__ g, const float* __restrict__ ple, int l, int D, int W) {
+    const int m = blockIdx.x, i = threadIdx.x;
+    g[(size_t)m * D + i] = act_fn(g[(size_t)m * D + i]) * ple[(size_t)m * W + (size_t)l * D + i];
 }

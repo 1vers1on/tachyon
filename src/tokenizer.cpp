@@ -138,6 +138,9 @@ void Tokenizer::load(const ModelFile& mf) {
     thinking_ = tj.get_bool("thinking", false);
     chat_format_ = tj.get_str("chat_format", "chatml");
     chat_prefix_ = tj.get_str("chat_prefix", "");
+    think_tag_open_ = tj.get_str("think_tag_open", "<think>");
+    think_tag_close_ = tj.get_str("think_tag_close", "</think>");
+    think_system_token_ = tj.get_str("think_system_token", "");
     think_default_ = tj.get_bool("think_default", true);
     think_open_ = tj.get_bool("think_open", false);
     think_disable_block_ = tj.get_bool("think_disable_block", true);
@@ -379,9 +382,18 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
         const std::string so = g4 ? "<|turn>" : "<start_of_turn>", eo = g4 ? "<turn|>\n" : "<end_of_turn>\n";
         std::string sys;
         size_t i0 = 0;
-        if (!msgs.empty() && msgs[0].role == "system") {
-            if (g4) o += so + "system\n" + trim(msgs[0].content) + eo;
-            else sys = msgs[0].content + "\n\n";
+        const bool has_sys = !msgs.empty() && msgs[0].role == "system";
+        if (g4) {
+            const bool think = enable_thinking && !think_system_token_.empty();
+            if (think || has_sys) {
+                o += so + "system\n";
+                if (think) o += think_system_token_ + "\n";
+                if (has_sys) o += trim(msgs[0].content);
+                o += eo;
+            }
+            if (has_sys) i0 = 1;
+        } else if (has_sys) {
+            sys = msgs[0].content + "\n\n";
             i0 = 1;
         }
         for (size_t i = i0; i < msgs.size(); i++) {
@@ -389,8 +401,8 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
             std::string role = m.role == "assistant" ? "model" : m.role;
             std::string content = m.content;
             if (m.role == "assistant") {  // drop reasoning from history
-                size_t p = content.find("</think>");
-                if (p != std::string::npos) content = content.substr(p + 8);
+                size_t p = content.find(think_tag_close_);
+                if (p != std::string::npos) content = content.substr(p + think_tag_close_.size());
             }
             o += so + role + "\n" + (i == i0 ? sys : std::string()) + trim(content) + eo;
         }
@@ -398,7 +410,8 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
         return o;
     }
     if (chat_format_ == "tulu") {
-        for (auto& m : msgs) o += "<|" + m.role + "|>\n" + m.content + (m.role == "assistant" ? "<|endoftext|>\n" : "\n");
+        const std::string eos = eos_.empty() ? std::string() : token_bytes(eos_[0]);
+        for (auto& m : msgs) o += "<|" + m.role + "|>\n" + m.content + (m.role == "assistant" ? eos + "\n" : "\n");
         if (add_gen) o += "<|assistant|>\n";
         return o;
     }

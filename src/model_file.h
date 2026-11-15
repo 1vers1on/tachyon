@@ -90,6 +90,7 @@ struct ModelConfig {
     float embed_scale = 1.f;
     float final_softcap = 0.f;
     bool stateful = false;     // has recurrent state (conv / delta net): no KV rollback
+    int ple_dim = 0;           // Gemma 4 per-layer input embedding width (0 = none)
     std::vector<LayerCfg> layers;
     int max_head_dim() const { int m = 0; for (auto& l : layers) if (l.is_attn()) m = std::max(m, l.head_dim); return m; }
     Json to_json() const;

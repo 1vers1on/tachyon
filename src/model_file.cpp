@@ -75,6 +75,7 @@ Json ModelConfig::to_json() const {
     j.set("embed_scale", (double)embed_scale);
     j.set("final_softcap", (double)final_softcap);
     j.set("stateful", stateful);
+    j.set("ple_dim", ple_dim);
     Json ls = Json::array();
     for (auto& l : layers) ls.push(l.to_json());
     j.set("layers", ls);
@@ -108,6 +109,7 @@ ModelConfig ModelConfig::from_json(const Json& j) {
     c.embed_scale = (float)j.get_num("embed_scale", 1);
     c.final_softcap = (float)j.get_num("final_softcap", 0);
     c.stateful = j.get_bool("stateful", false);
+    c.ple_dim = (int)j.get_int("ple_dim", 0);
     if (j["layers"].is_arr()) {
         for (auto& l : j["layers"].arr) c.layers.push_back(LayerCfg::from_json(l));
     } else {

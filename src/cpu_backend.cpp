@@ -211,6 +211,7 @@ struct CLayer {
     QMat conv_in, conv_out; const float* conv_w = nullptr;
     QMat dn_in, dn_out; const float *dn_conv = nullptr, *dn_A = nullptr, *dn_dt = nullptr, *dn_norm = nullptr;
     QMat router, wgu_e, wdown_e; const float* expert_bias = nullptr;
+    QMat ple_gate, ple_out; const float* ple_post_norm = nullptr;
     std::vector<float> inv_freq;
     int kv = -1;          // index of the KV buffer used (own or shared)
     int state = -1;       // index of the recurrent state buffer
@@ -278,6 +279,8 @@ public:
         const int M = (int)batch.size();
         const int H = c_.hidden;
         ensure_buffers(M);
+        for (auto& t : batch)
+            if (t.pos < 0 || t.pos >= opt.ctx || t.slot < 0 || t.slot >= opt.n_slots) die("token position %d / slot %d out of range (ctx %d, slots %d)", t.pos, t.slot, opt.ctx, opt.n_slots);
         // embeddings
         pool_->parallel_for(M, [&](int64_t a, int64_t b) {
             for (int64_t m = a; m < b; m++) {
@@ -291,6 +294,7 @@ public:
         });
         // a new sequence (position 0) starts from zero recurrent state
         for (int m = 0; m < M; m++) if (batch[m].pos == 0) reset_state(batch[m].slot);
+        if (c_.ple_dim) ple_inputs(batch);
         const int nl = getenv("TACH_DEBUG_NL") ? atoi(getenv("TACH_DEBUG_NL")) : c_.n_layers;
         for (int l = 0; l < nl; l++) {
             CLayer& L = layers_[l];
@@ -302,7 +306,13 @@ public:
             norm_quant(M, H, L.ffn_norm, act_h_);
             if (L.c.n_experts) moe(L, M);
             else dense_ffn(L, M);
-            residual_add(M, L.post_ffn_norm, L.c.layer_scalar);
+            if (c_.ple_dim) {
+                residual_add(M, L.post_ffn_norm, 1.f);
+                ple_layer(L, l, M);
+                residual_add(M, L.ple_post_norm, L.c.layer_scalar);
+            } else {
+                residual_add(M, L.post_ffn_norm, L.c.layer_scalar);
+            }
         }
         // final norm + lm head, only for rows that want logits
         std::vector<int> rows;
@@ -593,6 +603,45 @@ private:
 
     float act(float g) const { return c_.act == "gelu" ? gelu_tanh(g) : silu(g); }
 
+    // Gemma 4 per-layer inputs: ple[m][l][:] = (rmsnorm(P x / sqrt(H)) + E_ple[tok] * sqrt(D)) / sqrt(2)
+    void ple_inputs(const std::vector<BatchToken>& batch) {
+        const int M = (int)batch.size(), H = c_.hidden, D = c_.ple_dim, NL = c_.n_layers, W = NL * D;
+        ple_.resize((size_t)M * W);
+        QAct xa;
+        quant_rows_into(M, H, x_.data(), xa);
+        std::vector<float> proj((size_t)M * W);
+        matmul(ple_proj_, xa, proj.data(), W);
+        const float ps = 1.f / sqrtf((float)H), ts = sqrtf((float)D), is2 = 1.f / sqrtf(2.f);
+        pool_->parallel_for(M, [&](int64_t a, int64_t b) {
+            std::vector<float> tok(W);
+            for (int64_t m = a; m < b; m++) {
+                const QMat& E = ple_embd_;
+                size_t ds = qtype_data_bytes(E.t, 1, W), ss = qtype_scale_bytes(E.t, 1, W);
+                dequantize_row(E.t, E.d + (size_t)batch[m].token * ds, E.s ? E.s + (size_t)batch[m].token * ss : nullptr, W, tok.data());
+                for (int l = 0; l < NL; l++) {
+                    float* pr = proj.data() + (size_t)m * W + l * D;
+                    for (int i = 0; i < D; i++) pr[i] *= ps;
+                    rmsnorm(pr, ple_proj_norm_, pr, D, c_.rms_eps);
+                    float* o = ple_.data() + (size_t)m * W + l * D;
+                    for (int i = 0; i < D; i++) o[i] = (pr[i] + tok[l * D + i] * ts) * is2;
+                }
+            }
+        });
+    }
+    // per layer: tmp = W_out (act(W_gate x) * ple[l])   (residual + post norm applied by the caller)
+    void ple_layer(CLayer& L, int l, int M) {
+        const int H = c_.hidden, D = c_.ple_dim, W = c_.n_layers * D;
+        QAct xa;
+        quant_rows_into(M, H, x_.data(), xa);
+        std::vector<float> g((size_t)M * D);
+        matmul(L.ple_gate, xa, g.data(), D);
+        for (int m = 0; m < M; m++)
+            for (int i = 0; i < D; i++) g[(size_t)m * D + i] = act(g[(size_t)m * D + i]) * ple_[(size_t)m * W + l * D + i];
+        QAct ga;
+        quant_rows_into(M, D, g.data(), ga);
+        matmul(L.ple_out, ga, tmp_.data(), H);
+    }
+
     void dense_ffn(CLayer& L, int M) {
         const int H = c_.hidden, F = L.c.ffn;
         float* gu = big_.data();
@@ -762,6 +811,11 @@ private:
         embd_ = mat("tok_embd");
         out_ = c_.tied_embed ? embd_ : mat("output");
         out_norm_ = vec("output_norm");
+        if (c_.ple_dim) {
+            ple_embd_ = mat("ple_embd");
+            ple_proj_ = mat("ple_proj");
+            ple_proj_norm_ = vec("ple_proj_norm");
+        }
         layers_.resize(c_.n_layers);
         for (int l = 0; l < c_.n_layers; l++) {
             std::string p = "blk." + std::to_string(l) + ".";
@@ -784,6 +838,11 @@ private:
                 L.dn_in = mat(p + "dn_in"); L.dn_out = mat(p + "dn_out");
                 L.dn_conv = vec(p + "dn_conv"); L.dn_A = vec(p + "dn_A"); L.dn_dt = vec(p + "dn_dt"); L.dn_norm = vec(p + "dn_norm");
             }
+            if (c_.ple_dim) {
+                L.ple_gate = mat(p + "ple_gate");
+                L.ple_out = mat(p + "ple_out");
+                L.ple_post_norm = vec(p + "ple_post_norm");
+            }
             if (L.c.n_experts) {
                 L.router = mat(p + "router");
                 L.expert_bias = vec(p + "expert_bias", false);
@@ -802,8 +861,10 @@ private:
     void* wmem_ = nullptr;
     size_t wmem_size_ = 0;
     std::map<std::string, std::pair<uint8_t*, uint8_t*>> ptrs_;
-    QMat embd_, out_;
+    QMat embd_, out_, ple_embd_, ple_proj_;
     const float* out_norm_ = nullptr;
+    const float* ple_proj_norm_ = nullptr;
+    std::vector<float> ple_;
     std::vector<CLayer> layers_;
     std::vector<std::vector<uint16_t>> kc_, vc_;
     std::vector<std::vector<float>> state_;

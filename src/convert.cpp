@@ -198,9 +198,18 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     t.set("think_default", !think_opt_in);
     t.set("think_open", think_opt_in);
     t.set("think_disable_block", think_opt_in || think_opt_out);
-    // templates that start by emitting the BOS token text
-    std::string tpl_trim = chat_template.substr(0, 40);
-    if (tpl_trim.find("bos_token") != std::string::npos && !tc.get_bool("add_bos_token", false)) {
+    // reasoning delimiters
+    if (chat_template.find("<|channel>") != std::string::npos) {
+        t.set("thinking", true);
+        t.set("think_tag_open", "<|channel>thought\n");
+        t.set("think_tag_close", "<channel|>");
+        t.set("think_default", false);
+        t.set("think_disable_block", false);
+    }
+    if (chat_template.find("<|think|>") != std::string::npos) t.set("think_system_token", "<|think|>");
+    // templates that emit the BOS token text themselves
+    const bool emits_bos = chat_template.find("{{ bos_token") != std::string::npos || chat_template.find("{{- bos_token") != std::string::npos;
+    if (emits_bos && !tc.get_bool("add_bos_token", false)) {
         const Json& bt = tc["bos_token"];
         std::string bs = bt.is_str() ? bt.str : bt.get_str("content", "");
         t.set("chat_prefix", bs);
@@ -298,6 +307,7 @@ int convert_main(int argc, char** argv) {
         c.final_softcap = (float)hc.get_num("final_logit_softcapping", 0);
     }
     if (A == "lfm2" || A == "lfm2_moe" || A == "qwen3_5") c.stateful = true;
+    if (A == "gemma4") c.ple_dim = (int)hc.get_int("hidden_size_per_layer_input", 0);
     const Json& rs = hc["rope_scaling"];
     if (rs.is_obj()) {
         std::string rt = rs.get_str("rope_type", rs.get_str("type", ""));
@@ -604,7 +614,19 @@ int convert_main(int argc, char** argv) {
             });
             write_matrix(o_ + "wdown", o.wtype, H, L.ffn, simple(wd));
         }
+        // Gemma 4 per-layer input embeddings: gate / projection / norm inside every layer
+        if (c.ple_dim) {
+            write_matrix(o_ + "ple_gate", o.wtype, c.ple_dim, H, simple(need(p + "per_layer_input_gate.weight")));
+            write_matrix(o_ + "ple_out", o.wtype, H, c.ple_dim, simple(need(p + "per_layer_projection.weight")));
+            write_vec(o_ + "ple_post_norm", need(p + "post_per_layer_input_norm.weight"));
+        }
         if (g_log_level >= 1) { fprintf(stderr, "\r[tachyon] layer %d/%d", l + 1, c.n_layers); fflush(stderr); }
+    }
+    if (c.ple_dim) {
+        const STTensor* pe = need(P + "embed_tokens_per_layer.weight");
+        write_matrix("ple_embd", o.embed_type, pe->shape[0], pe->shape[1], simple(pe));
+        write_matrix("ple_proj", o.wtype, (int64_t)c.n_layers * c.ple_dim, H, simple(need(P + "per_layer_model_projection.weight")));
+        write_vec("ple_proj_norm", need(P + "per_layer_projection_norm.weight"));
     }
     if (g_log_level >= 1) fprintf(stderr, "\n");
     Json header = Json::object();

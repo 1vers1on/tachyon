@@ -175,7 +175,9 @@ Json error_json(const std::string& msg, const std::string& type = "invalid_reque
 // Splits "<think>...</think>" reasoning from the visible answer, robust to tags split across deltas.
 class ThinkSplitter {
 public:
-    void init(bool active, bool starts_inside) { active_ = active; mode_ = active ? (starts_inside ? 1 : 0) : 2; }
+    void init(bool active, bool starts_inside, const std::string& open = "<think>", const std::string& close = "</think>") {
+        active_ = active; mode_ = active ? (starts_inside ? 1 : 0) : 2; open_ = open; close_ = close;
+    }
     // returns (reasoning_delta, content_delta)
     std::pair<std::string, std::string> push(const std::string& d, bool final = false) {
         std::pair<std::string, std::string> out;
@@ -186,14 +188,14 @@ public:
                 size_t i = 0;
                 while (i < buf_.size() && (buf_[i] == '\n' || buf_[i] == ' ')) i++;
                 std::string rest = buf_.substr(i);
-                const std::string tag = "<think>";
+                const std::string& tag = open_;
                 if (rest.compare(0, tag.size(), tag) == 0) { buf_ = rest.substr(tag.size()); mode_ = 1; continue; }
                 if (rest.size() < tag.size() && tag.compare(0, rest.size(), rest) == 0 && !final) break;
                 mode_ = 2;
                 continue;
             }
             // mode 1: inside reasoning
-            const std::string tag = "</think>";
+            const std::string& tag = close_;
             size_t p = buf_.find(tag);
             if (p != std::string::npos) {
                 out.first += buf_.substr(0, p);
@@ -228,7 +230,7 @@ public:
 private:
     bool active_ = false, seen_content_ = false;
     int mode_ = 2;  // 0 undecided, 1 reasoning, 2 plain, 3 after reasoning
-    std::string buf_;
+    std::string buf_, open_ = "<think>", close_ = "</think>";
 };
 
 class Server {
@@ -387,7 +389,7 @@ private:
         e_.submit(req);
 
         ThinkSplitter split;
-        split.init(chat && thinking, chat && e_.tok.think_opens_in_prompt(thinking));
+        split.init(chat && thinking, chat && e_.tok.think_opens_in_prompt(thinking), e_.tok.think_open_tag(), e_.tok.think_close_tag());
         std::string tool_buf;
         bool in_tool = false;
 

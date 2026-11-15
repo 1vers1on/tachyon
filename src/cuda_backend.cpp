@@ -39,6 +39,7 @@ struct DLayer {
     CUdeviceptr conv_w = 0, dn_conv = 0, dn_A = 0, dn_dt = 0, dn_norm = 0, router = 0, expert_bias = 0;
     CUdeviceptr kc = 0, vc = 0, ksc = 0, vsc = 0;   // KV cache (shared with kv_src for Gemma 4)
     CUdeviceptr st0 = 0, st1 = 0;                   // recurrent state (conv / delta net)
+    DMat ple_gate, ple_out; CUdeviceptr ple_post_norm = 0;
     int in_rows() const { return c.is_attn() ? c.qkv_rows() : c.type == "conv" ? 3 * conv_in.cols : c.dn_in_rows(); }
 };
 
@@ -128,6 +129,8 @@ public:
         const int M = (int)batch.size();
         if (M == 0) return;
         if (M > opt.max_batch) die("batch too large (%d > %d)", M, opt.max_batch);
+        for (auto& t : batch)
+            if (t.pos < 0 || t.pos >= opt.ctx || t.slot < 0 || t.slot >= opt.n_slots) die("token position %d / slot %d out of range (ctx %d, slots %d)", t.pos, t.slot, opt.ctx, opt.n_slots);
         lrows_.clear();
         for (int i = 0; i < M; i++) if (batch[i].logits) lrows_.push_back(i);
         n_logits_ = (int)lrows_.size();
@@ -354,6 +357,11 @@ private:
         embd_ = mat("tok_embd");
         out_ = c_.tied_embed ? embd_ : mat("output");
         out_norm_ = vec("output_norm");
+        if (c_.ple_dim) {
+            ple_embd_ = mat("ple_embd");
+            ple_proj_ = mat("ple_proj");
+            ple_proj_norm_ = vec("ple_proj_norm");
+        }
         layers_.resize(c_.n_layers);
         for (int l = 0; l < c_.n_layers; l++) {
             std::string p = "blk." + std::to_string(l) + ".";
@@ -374,6 +382,11 @@ private:
             } else {
                 L.dn_in = mat(p + "dn_in"); L.dn_out = mat(p + "dn_out");
                 L.dn_conv = vec(p + "dn_conv"); L.dn_A = vec(p + "dn_A"); L.dn_dt = vec(p + "dn_dt"); L.dn_norm = vec(p + "dn_norm");
+            }
+            if (c_.ple_dim) {
+                L.ple_gate = mat(p + "ple_gate");
+                L.ple_out = mat(p + "ple_out");
+                L.ple_post_norm = vec(p + "ple_post_norm");
             }
             if (L.c.n_experts) {
                 L.router = vec(p + "router");
@@ -510,6 +523,12 @@ private:
         d_ccount_ = alloc(MAX_LOGITS * 4);
         d_cand_ = alloc((size_t)MAX_DEC * CAND_CAP * 8);
         d_batch_ = alloc(4 * cap_ * sizeof(int));
+        if (c_.ple_dim) {
+            const size_t W = (size_t)c_.n_layers * c_.ple_dim;
+            ple_buf_ = alloc((size_t)cap_ * W * 4);
+            ple_tmp_ = alloc((size_t)cap_ * W * 4);
+            ple_tmp2_ = alloc((size_t)cap_ * W * 4);
+        }
         if (has_moe_) {
             moe_ids_ = alloc(P * 4);
             moe_w_ = alloc(P * 4);
@@ -599,6 +618,10 @@ private:
                 if (tc_ok(L.wgu.t) && L.wgu.cols % 256 == 0) names.insert(tc_name(L.wgu.t, L.wgu.cols, 2));
                 add_out(L.wdown);
             }
+        }
+        if (c_.ple_dim) {
+            add_out(ple_proj_);
+            for (auto& L : layers_) { add_out(L.ple_gate); add_out(L.ple_out); }
         }
         names.insert("causal_conv<0>");
         names.insert("causal_conv<1>");
@@ -696,6 +719,9 @@ private:
         f_combine_ = fn("moe_combine");
         f_gather_ = fn("gather_rows_f16");
         f_scatter_ = fn("scatter_add_rows");
+        f_embrows_ = fn("embed_rows");
+        f_plecomb_ = fn("ple_combine");
+        f_plemul_ = fn("ple_mul");
     }
     static constexpr int TC_SMEM = 3 * (64 * 144 + 64 * 16 + 8 * 272 + 512);
     int gemm_smem() const { return 2 * 64 * 72 * 2 + 2 * 128 * 72 * 2; }
@@ -841,12 +867,45 @@ private:
         return a;
     }
 
+    // Gemma 4 per-layer inputs (after the embedding): ple_buf_ [M][NL*D]
+    void ple_inputs(int M, bool prefill) {
+        const int H = c_.hidden, D = c_.ple_dim, NL = c_.n_layers, W = NL * D;
+        if (prefill) {
+            launch(f_tof16_, D3(256), D3(256), 0, x_, ha_, (size_t)M * H);
+            gemm(ple_proj_, ha_, M, ple_tmp_, 0, 0);
+        } else {
+            launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
+            gemv(ple_proj_, 0, 0, M, 0, 0, 0, xq_, xds_, ple_tmp_);
+        }
+        launch(f_embrows_, D3(M), D3(256), 0, ple_embd_.d, ple_embd_.s, qt_code(ple_embd_.t), tok_ptr(), W, 1.f, ple_tmp2_);
+        launch(f_plecomb_, D3(M, NL), D3(D), 0, ple_tmp_, ple_tmp2_, ple_proj_norm_, D, NL, ple_buf_);
+    }
+    // per layer, after the FFN residual: x = (x + norm(W_out(act(W_gate x) * ple_l))) * layer_scalar
+    void ple_layer(const DLayer& L, int l, int M, bool prefill) {
+        const int H = c_.hidden, D = c_.ple_dim, W = c_.n_layers * D;
+        if (prefill) {
+            launch(f_tof16_, D3(256), D3(256), 0, x_, ha_, (size_t)M * H);
+            gemm(L.ple_gate, ha_, M, proj_, 0, 0);
+            launch(f_plemul_, D3(M), D3(D), 0, proj_, ple_buf_, l, D, W);
+            launch(f_tof16_, D3(64), D3(256), 0, proj_, hb_, (size_t)M * D);
+            gemm(L.ple_out, hb_, M, tmp_, 0, 0);
+        } else {
+            launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
+            gemv(L.ple_gate, 0, 0, M, 0, 0, 0, xq_, xds_, proj_);
+            launch(f_plemul_, D3(M), D3(D), 0, proj_, ple_buf_, l, D, W);
+            launch(f_quant_, D3(M), D3(256), 0, proj_, D, xq_, xds_);
+            gemv(L.ple_out, 0, 0, M, 0, 0, 0, xq_, xds_, tmp_);
+        }
+        residual(M, tmp_, L.ple_post_norm, L.c.layer_scalar);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // decode pass (M <= 16 tokens, any slots / positions): captured as one CUDA graph per M
     // ---------------------------------------------------------------------------------------------
     void decode_pass(int M) {
         const int H = c_.hidden;
         launch(f_embed_, D3(M), D3(256), 0, embd_.d, embd_.s, tok_ptr(), x_, c_.embed_scale);
+        if (c_.ple_dim) ple_inputs(M, false);
         const int nl = getenv("TACH_DEBUG_NL") ? atoi(getenv("TACH_DEBUG_NL")) : c_.n_layers;
         for (int l = 0; l < nl; l++) {
             const DLayer& L = layers_[l];
@@ -879,14 +938,16 @@ private:
             }
             if (!dadd) residual(M, tmp_, L.post_attn_norm, 1.f);
             // ---- feed forward ----
-            const bool fadd = direct_add(L, true);
+            const bool fadd = direct_add(L, true) && !c_.ple_dim;
+            const float fscalar = c_.ple_dim ? 1.f : lc.layer_scalar;
             if (lc.n_experts) {
                 moe_decode(L, M);
             } else if (lc.ffn) {
                 gemv_gu(L.wgu, M, x_, L.ffn_norm, fq_, fds_);
                 gemv(L.wdown, 0, fadd ? 1 : 0, M, 0, 0, 0, fq_, fds_, fadd ? x_ : tmp_);
-                if (!fadd) residual(M, tmp_, L.post_ffn_norm, lc.layer_scalar);
+                if (!fadd) residual(M, tmp_, L.post_ffn_norm, fscalar);
             }
+            if (c_.ple_dim) ple_layer(L, l, M, false);
         }
         logits_pass();
     }
@@ -934,6 +995,7 @@ private:
     void prefill_pass(int M, int slot, int p0) {
         const int H = c_.hidden;
         launch(f_embed_, D3(M), D3(256), 0, embd_.d, embd_.s, tok_ptr(), x_, c_.embed_scale);
+        if (c_.ple_dim) ple_inputs(M, true);
         if (g_imatrix) imat_rows_ += M;
         const int nl = getenv("TACH_DEBUG_NL") ? atoi(getenv("TACH_DEBUG_NL")) : c_.n_layers;
         for (int l = 0; l < nl; l++) {
@@ -980,7 +1042,8 @@ private:
             }
             if (!dadd) residual(M, tmp_, L.post_attn_norm, 1.f);
             // ---- feed forward ----
-            const bool fadd = direct_add(L, true);
+            const bool fadd = direct_add(L, true) && !c_.ple_dim;
+            const float fscalar = c_.ple_dim ? 1.f : lc.layer_scalar;
             launch(f_rms_f16_, D3(M), D3(256), 0, x_, L.ffn_norm, ha_);
             if (lc.n_experts) {
                 moe_prefill(L, M);
@@ -989,8 +1052,9 @@ private:
                 gemm(L.wgu, ha_, M, 0, hb_, 2);
                 if (g_imatrix) imat_acc(bp + "wdown", hb_, M, lc.ffn);
                 gemm(L.wdown, hb_, M, fadd ? x_ : tmp_, 0, fadd ? 1 : 0);
-                if (!fadd) residual(M, tmp_, L.post_ffn_norm, lc.layer_scalar);
+                if (!fadd) residual(M, tmp_, L.post_ffn_norm, fscalar);
             }
+            if (c_.ple_dim) ple_layer(L, l, M, true);
         }
         if (g_imatrix) {
             launch(f_rms_f16_, D3(M), D3(256), 0, x_, out_norm_, ha_);
@@ -1072,6 +1136,9 @@ private:
     float* h_out_ = nullptr;
     std::map<std::string, CUfunction> funcs_;
     CUfunction f_embed_, f_rms_q8_, f_rms_q8_rows_, f_rms_f16_, f_argmax_, f_kvcopy_, f_colsq_, f_rowmax_, f_cand_;
+    CUfunction f_embrows_, f_plecomb_, f_plemul_;
+    DMat ple_embd_, ple_proj_;
+    CUdeviceptr ple_proj_norm_ = 0, ple_buf_ = 0, ple_tmp_ = 0, ple_tmp2_ = 0;
     CUfunction f_quant_, f_tof16_, f_normadd_, f_softcap_, f_normslice_, f_route_, f_actq_, f_combine_, f_gather_, f_scatter_;
     std::map<int, CUgraphExec> graphs_;
     std::vector<int> lrows_;
