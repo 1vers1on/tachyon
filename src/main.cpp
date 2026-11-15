@@ -273,6 +273,9 @@ int main(int argc, char** argv) {
     if (cmd == "ppl") {
         // perplexity over a text file: independent windows of `ctx_win` tokens, scored in chunks of 64
         auto ids = e.tok.encode(a.prompt, false);
+        // models that expect <bos> (Gemma) get it at position 0 of every window (replacing that token)
+        const int bos = e.tok.add_bos() ? e.tok.bos() : -1;
+        if (bos >= 0 && !ids.empty() && ids[0] == bos) ids.erase(ids.begin());
         int win = std::min(a.prompt_len > 0 ? a.prompt_len : 512, e.opt.backend.ctx);
         int V = e.be->vocab();
         std::vector<float> lg(V);
@@ -282,15 +285,22 @@ int main(int argc, char** argv) {
         int nwin = 0;
         for (size_t st = 0; st + win <= ids.size() && nwin < a.n; st += win, nwin++) {
             const int pchunk = getenv("TACH_PPL_CHUNK") ? atoi(getenv("TACH_PPL_CHUNK")) : 64;
+            // chunks above 64 tokens (big prefill batches): score a rotating subset of at most 64 rows per forward
+            const int stride = (pchunk + 63) / 64;
             for (int c = 0; c < win; c += pchunk) {
                 int n = std::min(pchunk, win - c);
                 std::vector<BatchToken> b(n);
-                for (int i = 0; i < n; i++) b[i] = {ids[st + c + i], 0, c + i, true};
-                e.be->forward(b);
+                std::vector<int> rows;
                 for (int i = 0; i < n; i++) {
-                    int p = c + i;
+                    const bool want = i % stride == (nwin + c / pchunk) % stride;
+                    b[i] = {c + i == 0 && bos >= 0 ? bos : ids[st + c + i], 0, c + i, want};
+                    if (want) rows.push_back(i);
+                }
+                e.be->forward(b);
+                for (size_t ri = 0; ri < rows.size(); ri++) {
+                    int p = c + rows[ri];
                     if (p + 1 >= win || p < win / 4) continue;  // score positions with some context
-                    e.be->get_logits(i, lg.data());
+                    e.be->get_logits((int)ri, lg.data());
                     float mx = *std::max_element(lg.begin(), lg.end());
                     double se = 0;
                     for (float v : lg) se += exp(v - mx);

@@ -568,7 +568,11 @@ private:
         for (int g = 4; g >= 1; g--) if (gqa % g == 0) return g;
         return 1;
     }
-    std::string flash_name(int hd) { return "flash_prefill<" + I(hd) + ">"; }
+    std::string flash_name(int hd) { return (hd > 128 ? "flash_wide<" : "flash_prefill<") + I(hd) + ">"; }
+    // tensor-core prefill attention: FA2-style kernel up to 128 dims, sliced-head kernel for 256 / 512
+    static bool flash_ok(int hd) { return hd <= 128 || hd == 256 || hd == 512; }
+    static int flash_smem(int hd) { return hd > 128 ? 32 * (hd + 8) * 2 + 4 * 32 * 16 * 4 : 2 * 64 * (hd + 8) * 2; }
+    static int flash_qrows(int hd) { return hd > 128 ? 16 * (4 / (hd / 128)) : 64; }
     std::string dn_name(int dk, int dv) { return "delta_rule<" + I(dk) + "," + I(dv) + ">"; }
     static bool tc_ok(QType t) { return t == QType::Q4 || t == QType::Q3; }
 
@@ -604,7 +608,7 @@ private:
                 names.insert(rope_name(lc.head_dim, 1));
                 const int g = attn_group(lc);
                 names.insert(attn_name(lc.head_dim, g, SPLITS, 0));
-                if (lc.head_dim <= 128) names.insert(flash_name(lc.head_dim));
+                if (flash_ok(lc.head_dim) && !no_flash_wide(lc.head_dim)) names.insert(flash_name(lc.head_dim));
                 else names.insert(attn_name(lc.head_dim, g, 1, 1));
             } else if (lc.type == "conv") {
                 add_in(L.conv_in, 0);
@@ -702,10 +706,8 @@ private:
             if (n.rfind("gemm<", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gemm_smem()));
             if (n.rfind("gemv_tc", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, TC_SMEM));
             if (n.rfind("gemv2", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_pro_smem));
-            if (n.rfind("flash_prefill", 0) == 0) {
-                int hd = atoi(n.c_str() + 14);
-                CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 2 * 64 * (hd + 8) * 2));
-            }
+            if (n.rfind("flash_", 0) == 0)
+                CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, flash_smem(atoi(n.c_str() + n.find('<') + 1))));
         }
         f_embed_ = fn("embed");
         f_rms_q8_ = fn("rmsnorm_q8");
@@ -762,6 +764,8 @@ private:
         return epi == 2 ? W.rows % 64 == 0 : W.rows % 16 == 0;
     }
     bool no_mma_ = getenv("TACH_NO_MMA") != nullptr;
+    // debug: TACH_NO_FLASH_WIDE=1 runs wide heads through the scalar per-token attention (reference path)
+    static bool no_flash_wide(int hd) { static const bool off = getenv("TACH_NO_FLASH_WIDE") != nullptr; return off && hd > 128; }
 
     void gemv_tc(const DMat& W, int epi, int M, CUdeviceptr xq, CUdeviceptr xds, CUdeviceptr y, CUdeviceptr bias,
                  CUdeviceptr oq = 0, CUdeviceptr ods = 0) {
@@ -1016,10 +1020,11 @@ private:
                 gemm(L.wqkv, ha_, M, proj_, 0, 0, L.bqkv);
                 full_qk_norm(L, M);
                 const int qd = lc.q_dim();
-                if (lc.head_dim <= 128) {
+                if (flash_ok(lc.head_dim) && !no_flash_wide(lc.head_dim)) {
                     RopeArgs ra = rope_args(L, M, qh_);
                     launch(F(rope_name(lc.head_dim, 1)), D3(M, (lc.n_heads + lc.n_kv_heads + 3) / 4), D3(128), 0, ra);
-                    launch(F(flash_name(lc.head_dim)), D3((M + 63) / 64, lc.n_heads), D3(128), 2 * 64 * (lc.head_dim + 8) * 2,
+                    const int qr = flash_qrows(lc.head_dim);
+                    launch(F(flash_name(lc.head_dim)), D3((M + qr - 1) / qr, lc.n_heads), D3(128), flash_smem(lc.head_dim),
                            qh_, L.kc, L.vc, hb_, M, p0, slot, lc.n_heads, lc.n_kv_heads, L.kv_cap, lc.window,
                            (CUdeviceptr)(lc.attn_gate ? proj_ : 0), lc.qkv_rows(), lc.attn_gate ? 2 * lc.head_dim : lc.head_dim, L.ksc, L.vsc);
                 } else {

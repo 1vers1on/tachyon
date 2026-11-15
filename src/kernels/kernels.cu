@@ -708,6 +708,207 @@ __global__ void __launch_bounds__(128) flash_prefill(const half* __restrict__ Q,
 }
 
 // ------------------------------------------------------------------------------------------------
+// Prefill flash attention for wide heads (HD = 256 / 512, Gemma 3 / 4). The head dimension is split into
+// 128-wide slices, one per warp: every warp computes the partial S = Q K^T of its slice with tensor cores,
+// the partials are summed through shared memory (canonical order, so all slices of a query group see
+// bit-identical scores), each warp runs the same online softmax, then accumulates P V for its slice.
+// CTA = 4 warps = (4 / NS) query groups of 16 rows x NS slices. One smem tile buffer holds K, then V.
+// grid (ceil(M / QR), nh), block 128. Same arguments as flash_prefill.
+// ------------------------------------------------------------------------------------------------
+#define WKV 32
+template <int HD>
+__global__ void __launch_bounds__(128) flash_wide(const half* __restrict__ Q, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
+                                                  half* __restrict__ O, int M, int p0, int slot, int nh, int nkv, int ctx, int window,
+                                                  const float* __restrict__ gate, int nrows, int qstride,
+                                                  const float* __restrict__ ksc, const float* __restrict__ vsc) {
+    constexpr int NS = HD / 128, NQ = 4 / NS, QR = 16 * NQ, FLD = HD + 8, NF = WKV / 8;
+    extern __shared__ __align__(16) uint8_t smem[];
+    half* Ts = (half*)smem;                          // [WKV][FLD]: K tile, then V tile
+    float* Sp = (float*)(smem + WKV * FLD * 2);      // [4 warps][NF * 4][32 lanes] partial scores
+    const int QD = nh * HD;
+    const int h = blockIdx.y, kvh = h / (nh / nkv);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int qg = warp / NS, sl = warp % NS;
+    const int qb = blockIdx.x * QR;
+    const int q0 = qb + qg * 16;
+    const int dc0 = sl * 128;                        // first head dim of this warp's slice
+    const float sl2 = rsqrtf((float)HD) * 1.4426950408889634f;
+    uint32_t qf[8][4];
+    {
+        const int r0 = q0 + (lane >> 2), r1 = r0 + 8;
+        const int c = (lane & 3) * 2;
+#pragma unroll
+        for (int kk = 0; kk < 8; kk++) {
+            const half* p0r = Q + (size_t)r0 * QD + h * HD + dc0 + kk * 16 + c;
+            const half* p1r = Q + (size_t)r1 * QD + h * HD + dc0 + kk * 16 + c;
+            qf[kk][0] = r0 < M ? *(const uint32_t*)p0r : 0u;
+            qf[kk][1] = r1 < M ? *(const uint32_t*)p1r : 0u;
+            qf[kk][2] = r0 < M ? *(const uint32_t*)(p0r + 8) : 0u;
+            qf[kk][3] = r1 < M ? *(const uint32_t*)(p1r + 8) : 0u;
+        }
+    }
+    float o[16][4];
+#pragma unroll
+    for (int i = 0; i < 16; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+    float mrow[2] = {-INFINITY, -INFINITY}, lrow[2] = {0.f, 0.f};
+    const int qpos0 = p0 + q0 + (lane >> 2);
+    const int last_q = min(M, qb + QR) - 1;
+    const int n_kv = p0 + last_q + 1;
+    const int kv_lo = window > 0 ? max(0, p0 + qb - window + 1) & ~(WKV - 1) : 0;
+    const size_t sb = kv_sindex(slot, nkv, kvh, ctx, 0);
+    const kv_t* kb = kc + sb * HD;
+    const kv_t* vb = vc + sb * HD;
+#if KV8
+    const float* ksb = ksc + sb;
+    const float* vsb = vsc + sb;
+#endif
+    auto load_tile = [&](const kv_t* base, const float* scb, int kv0) {
+#if KV8
+        for (int c = threadIdx.x; c < WKV * HD / 16; c += 128) {
+            const int r = c / (HD / 16), col = (c % (HD / 16)) * 16;
+            half2 hv[8];
+            if (kv0 + r < n_kv) {
+                const int pr = (kv0 + r) % ctx;
+                const uint4 raw = *(const uint4*)(base + (size_t)pr * HD + col);
+                const float sc = scb[pr];
+                const int8_t* b8 = (const int8_t*)&raw;
+#pragma unroll
+                for (int j = 0; j < 8; j++) hv[j] = __floats2half2_rn(b8[2 * j] * sc, b8[2 * j + 1] * sc);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; j++) hv[j] = __floats2half2_rn(0.f, 0.f);
+            }
+            uint4* d = (uint4*)(Ts + r * FLD + col);
+            d[0] = *(uint4*)&hv[0]; d[1] = *(uint4*)&hv[4];
+        }
+#else
+        for (int c = threadIdx.x; c < WKV * HD / 8; c += 128) {
+            const int r = c / (HD / 8), col = (c % (HD / 8)) * 8;
+            const bool ok = kv0 + r < n_kv;
+            cp_async16(Ts + r * FLD + col, base + (size_t)(ok ? (kv0 + r) % ctx : 0) * HD + col, ok);
+        }
+        cp_async_commit();
+#endif
+    };
+    for (int kv0 = kv_lo; kv0 < n_kv; kv0 += WKV) {
+#if KV8
+        load_tile(kb, ksb, kv0);
+#else
+        load_tile(kb, nullptr, kv0);
+        cp_async_wait_all();
+#endif
+        __syncthreads();
+        // same for all slices of a query group: tile entirely in the future / entirely out of the window
+        const bool active = !(kv0 > p0 + q0 + 15) && !(window > 0 && kv0 + WKV - 1 < p0 + q0 - window + 1);
+        float s[NF][4];
+        if (active) {
+#pragma unroll
+            for (int i = 0; i < NF; i++) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < 8; kk++) {
+#pragma unroll
+                for (int ni = 0; ni < NF; ni += 2) {
+                    uint32_t b0, b1, b2, b3;
+                    const half* p = Ts + (ni * 8 + (lane & 7) + ((lane >> 4) << 3)) * FLD + dc0 + kk * 16 + ((lane >> 3) & 1) * 8;
+                    ldmatrix_x4(b0, b1, b2, b3, p);
+                    mma16816(s[ni], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], b0, b1);
+                    mma16816(s[ni + 1], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], b2, b3);
+                }
+            }
+#pragma unroll
+            for (int ni = 0; ni < NF; ni++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) Sp[(warp * NF * 4 + ni * 4 + e) * 32 + lane] = s[ni][e];
+        }
+        __syncthreads();   // partial scores visible; nobody reads the K tile any more
+#if KV8
+        load_tile(vb, vsb, kv0);
+#else
+        load_tile(vb, nullptr, kv0);
+#endif
+        float alpha[2] = {1.f, 1.f};
+        if (active) {
+            float mx[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+            for (int ni = 0; ni < NF; ni++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    float v = 0.f;
+#pragma unroll
+                    for (int k = 0; k < NS; k++) v += Sp[((qg * NS + k) * NF * 4 + ni * 4 + e) * 32 + lane];
+                    const int kpos = kv0 + ni * 8 + (lane & 3) * 2 + (e & 1);
+                    const int qpos = qpos0 + (e >> 1) * 8;
+                    v *= sl2;
+                    if (kpos > qpos || (window > 0 && kpos <= qpos - window)) v = -INFINITY;
+                    s[ni][e] = v;
+                    mx[e >> 1] = fmaxf(mx[e >> 1], v);
+                }
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+                mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+                const float mn = fmaxf(mrow[r], mx[r]);
+                alpha[r] = mn == -INFINITY ? 1.f : exp2f(mrow[r] - mn);
+                mrow[r] = mn;
+                lrow[r] *= alpha[r];
+            }
+#pragma unroll
+            for (int ni = 0; ni < NF; ni++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const float m_ = mrow[e >> 1];
+                    const float pv = m_ == -INFINITY ? 0.f : exp2f(s[ni][e] - m_);
+                    s[ni][e] = pv;
+                    lrow[e >> 1] += pv;
+                }
+#pragma unroll
+            for (int i = 0; i < 16; i++) { o[i][0] *= alpha[0]; o[i][1] *= alpha[0]; o[i][2] *= alpha[1]; o[i][3] *= alpha[1]; }
+        }
+#if !KV8
+        cp_async_wait_all();
+#endif
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (int kk = 0; kk < WKV / 16; kk++) {
+                const uint32_t a0 = pack_half2(s[2 * kk][0], s[2 * kk][1]);
+                const uint32_t a1 = pack_half2(s[2 * kk][2], s[2 * kk][3]);
+                const uint32_t a2 = pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+                const uint32_t a3 = pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+#pragma unroll
+                for (int dn = 0; dn < 16; dn += 2) {
+                    uint32_t b0, b1, b2, b3;
+                    const half* p = Ts + (kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * FLD + dc0 + (dn + (lane >> 4)) * 8;
+                    ldmatrix_x4_trans(b0, b1, b2, b3, p);
+                    mma16816(o[dn], a0, a1, a2, a3, b0, b1);
+                    mma16816(o[dn + 1], a0, a1, a2, a3, b2, b3);
+                }
+            }
+        }
+        __syncthreads();   // V tile fully consumed before the next K tile overwrites it
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        lrow[r] += __shfl_xor_sync(0xffffffff, lrow[r], 1);
+        lrow[r] += __shfl_xor_sync(0xffffffff, lrow[r], 2);
+    }
+    const int r0 = q0 + (lane >> 2), r1 = r0 + 8;
+    const float il0 = 1.f / lrow[0], il1 = 1.f / lrow[1];
+#pragma unroll
+    for (int dn = 0; dn < 16; dn++) {
+        const int d = dc0 + dn * 8 + (lane & 3) * 2;
+        const int col = h * HD + d;
+        float v00 = o[dn][0] * il0, v01 = o[dn][1] * il0, v10 = o[dn][2] * il1, v11 = o[dn][3] * il1;
+        if (gate) {
+            if (r0 < M) { const float* g = gate + (size_t)r0 * nrows + h * qstride + HD + d; v00 *= 1.f / (1.f + __expf(-g[0])); v01 *= 1.f / (1.f + __expf(-g[1])); }
+            if (r1 < M) { const float* g = gate + (size_t)r1 * nrows + h * qstride + HD + d; v10 *= 1.f / (1.f + __expf(-g[0])); v11 *= 1.f / (1.f + __expf(-g[1])); }
+        }
+        if (r0 < M) *(half2*)(O + (size_t)r0 * QD + col) = __floats2half2_rn(v00, v01);
+        if (r1 < M) *(half2*)(O + (size_t)r1 * QD + col) = __floats2half2_rn(v10, v11);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
 // argmax over vocab rows. grid rows, block 1024
 // ------------------------------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(1024) argmax_rows(const float* __restrict__ logits, int V, int Vlim, int* __restrict__ out) {
