@@ -106,15 +106,21 @@ curl localhost:28657/v1/chat/completions \
 | Qwen3.5 (Gated DeltaNet hybrid) | `qwen3.5:0.8b`, `2b`, `4b`, `9b` |
 | Qwen2 / Qwen2.5 | `qwen2.5:0.5b` … `7b`, `qwen2.5-coder:7b`, `deepseek-r1:1.5b`, `7b` |
 | Gemma 3 / Gemma 4 | `gemma3:270m`, `gemma4:e2b`, `e4b`, `12b` |
+| Gemma (first generation) | `gemma:2b`, `gemma:7b` (gated) |
 | LFM2 / LFM2.5 (short-conv hybrid, MoE) | `lfm2.5:350m` … `2.6b`, `lfm2.5:8b-a1b` |
 | OLMoE | `olmoe:1b-7b` |
 | Llama / Mistral | `mistral:7b` (Llama 3.x is wired in but untested) |
+| Mixtral | `mixtral:8x7b`, `mixtral:8x22b` (large MoE models; require substantial system RAM) |
 | SmolLM3 | `smollm3:3b` |
 | Granite 3.x | `granite3.3:2b`, `8b` |
 | Phi-3 / Phi-4-mini | `phi4-mini` |
 
 Run `./tachyon catalog` for the full list. Each family's perplexity was checked against Hugging Face
 transformers, or CPU against CUDA for MoE models that are too large for a reference run.
+
+Gemma (first generation) and Mixtral are validated with tiny random checkpoints against Transformers
+logits, including both packed and original per-expert Mixtral weights. Full-size quality and throughput
+have not been measured for these additions. Mistral/Mixtral sliding-attention windows are preserved.
 
 ## Performance
 
@@ -194,6 +200,8 @@ data/           calibration text (wikitext-2 train) and evaluation text (wikitex
 ## Testing
 
 ```bash
+make test                                # offline model-file validation (Python standard library)
+make test-models PYTHON=.venv/bin/python  # tiny model conversion + CPU logits vs Transformers; no downloads
 tools/regress.sh                          # perplexity regression across models, both CUDA paths
 python tools/api_test.py 28657 qwen3:1.7b  # OpenAI + Anthropic SDK tests (pip install openai anthropic)
 python tools/tool_test.py 28657 MODEL...   # tool-call round trip and prefix reuse per model
@@ -201,6 +209,7 @@ python tools/tool_test.py 28657 MODEL...   # tool-call round trip and prefix reu
 
 `tools/hf_ppl.py` and `tools/hf_compare.py` produce Hugging Face transformers reference outputs. They
 need `torch` and `transformers`.
+`make test-models` additionally needs `numpy` and `safetensors` in the selected Python environment.
 
 ## Limitations
 

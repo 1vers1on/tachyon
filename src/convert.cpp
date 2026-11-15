@@ -262,14 +262,15 @@ int convert_main(int argc, char** argv) {
     ModelConfig c;
     if (mt == "qwen3" || mt == "qwen3_moe") c.arch = "qwen3";
     else if (mt == "qwen2") c.arch = "qwen2";
-    else if (mt == "llama" || mt == "mistral" || mt == "smollm3" || mt == "granite" || mt == "phi3") c.arch = "llama";
+    else if (mt == "llama" || mt == "mistral" || mt == "mixtral" || mt == "smollm3" || mt == "granite" || mt == "phi3") c.arch = "llama";
+    else if (mt == "gemma") c.arch = "gemma";
     else if (mt == "gemma3_text" || mt == "gemma3") c.arch = "gemma3";
     else if (mt == "gemma4_text" || mt == "gemma4" || mt == "gemma4_unified_text" || mt == "gemma4_unified") c.arch = "gemma4";
     else if (mt == "lfm2") c.arch = "lfm2";
     else if (mt == "lfm2_moe") c.arch = "lfm2_moe";
     else if (mt == "olmoe") c.arch = "olmoe";
     else if (mt == "qwen3_5_text" || mt == "qwen3_5") c.arch = "qwen3_5";
-    else die("unsupported model_type %s (supported: qwen3, qwen3_moe, qwen2, llama, mistral, smollm3, granite, phi3, gemma3, gemma4, lfm2, lfm2_moe, olmoe, qwen3_5)", mt.c_str());
+    else die("unsupported model_type %s (supported: qwen3, qwen3_moe, qwen2, llama, mistral, mixtral, smollm3, granite, phi3, gemma, gemma3, gemma4, lfm2, lfm2_moe, olmoe, qwen3_5)", mt.c_str());
     {
         std::string d = o.in_dir;
         while (!d.empty() && d.back() == '/') d.pop_back();
@@ -283,7 +284,7 @@ int convert_main(int argc, char** argv) {
         } else c.name = d.substr(d.rfind('/') + 1);
     }
     const std::string A = c.arch;
-    const bool gemma = A == "gemma3" || A == "gemma4";
+    const bool gemma = A == "gemma" || A == "gemma3" || A == "gemma4";
     c.n_layers = (int)hc.get_int("num_hidden_layers", 0);
     c.hidden = (int)hc.get_int("hidden_size", 0);
     c.n_heads = (int)hc.get_int("num_attention_heads", 0);
@@ -303,6 +304,9 @@ int convert_main(int argc, char** argv) {
     c.wtype = o.wtype;
     if (gemma) {
         c.act = "gelu";
+        const std::string act = hc.get_str("hidden_activation", hc.get_str("hidden_act", "gelu_pytorch_tanh"));
+        if (act != "gelu_pytorch_tanh" && act != "gelu_new" && act != "gelu")
+            die("unsupported Gemma activation %s", act.c_str());
         // HF multiplies by sqrt(hidden) rounded to the weight dtype (bf16)
         float sc = sqrtf((float)c.hidden);
         uint32_t u; memcpy(&u, &sc, 4); u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000u; memcpy(&sc, &u, 4);
@@ -365,6 +369,7 @@ int convert_main(int argc, char** argv) {
             if (i < (int)nr.arr.size() && nr.arr[i].as_int() == 0) L.rope_rot = 0;
         }
         if (mt == "granite") L.attn_scale = (float)hc.get_num("attention_multiplier", 1.0 / sqrt((double)c.head_dim));
+        if (mt == "mistral" || mt == "mixtral") L.window = (int)hc.get_int("sliding_window", 0);
         if (mt == "phi3") {
             const int rot = (int)(c.head_dim * hc.get_num("partial_rotary_factor", 1.0));
             L.rope_half = rot / 2; L.rope_rot = rot / 2; L.rope_den = rot;
@@ -434,6 +439,14 @@ int convert_main(int argc, char** argv) {
                 L.router = "softmax";
                 L.norm_topk = hc.get_bool("norm_topk_prob", true);
             }
+        }
+        if (mt == "mixtral") {
+            L.ffn = 0;
+            L.n_experts = (int)hc.get_int("num_local_experts", 8);
+            L.top_k = (int)hc.get_int("num_experts_per_tok", 2);
+            L.expert_ffn = c.ffn;
+            L.router = "softmax";
+            L.norm_topk = true;
         }
         if (A == "olmoe") {
             L.ffn = 0;
@@ -517,14 +530,11 @@ int convert_main(int argc, char** argv) {
             for (int64_t i = 0; i < n; i++) buf[i] = (buf[i] + add) * mul;
         });
     };
-    auto write_const = [&](const std::string& name, int64_t n, float v) {
-        write_matrix(name, QType::F32, 1, n, [&, v](int64_t, float* buf) { for (int64_t i = 0; i < n; i++) buf[i] = v; });
-    };
     auto simple = [&](const STTensor* t) {
         int64_t cols = t->shape.back();
         return [t, cols](int64_t r, float* buf) { t->to_float(buf, r * cols, cols); };
     };
-    const float norm_add = (A == "gemma3" || A == "qwen3_5") ? 1.f : 0.f;  // RMSNorm weight stored as (w - 1)
+    const float norm_add = (A == "gemma" || A == "gemma3" || A == "qwen3_5") ? 1.f : 0.f;  // RMSNorm weight stored as (w - 1)
 
     logi("converting %s (%s) -> %s [%s]", c.name.c_str(), c.arch.c_str(), o.out_path.c_str(), qtype_name(o.wtype));
     const STTensor* emb = need(P + "embed_tokens.weight");
@@ -554,7 +564,7 @@ int convert_main(int argc, char** argv) {
         if (A == "lfm2" || A == "lfm2_moe") {
             write_vec(o_ + "attn_norm", need(p + "operator_norm.weight"));
             write_vec(o_ + "ffn_norm", need(p + "ffn_norm.weight"));
-        } else if (gemma) {
+        } else if (A == "gemma3" || A == "gemma4") {
             write_vec(o_ + "attn_norm", need(p + "input_layernorm.weight"), norm_add);
             write_vec(o_ + "post_attn_norm", need(p + "post_attention_layernorm.weight"), norm_add);
             write_vec(o_ + "ffn_norm", need(p + "pre_feedforward_layernorm.weight"), norm_add);
@@ -629,6 +639,8 @@ int convert_main(int argc, char** argv) {
         // ---- feed forward ----
         if (L.n_experts) {
             std::string mp = (A == "lfm2_moe") ? p + "feed_forward." : p + "mlp.";
+            // Original Mixtral checkpoints use block_sparse_moe; newer Transformers saves use mlp.
+            if (mt == "mixtral" && st.has(p + "block_sparse_moe.gate.weight")) mp = p + "block_sparse_moe.";
             const STTensor* router = first_of({mp + "gate.weight", mp + "router.weight"});
             write_matrix(o_ + "router", QType::F32, L.n_experts, H, simple(router));
             if (L.expert_bias) {

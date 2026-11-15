@@ -74,7 +74,7 @@ struct LayerCfg {
 };
 
 struct ModelConfig {
-    std::string arch;          // qwen3 | qwen2 | llama | gemma3 | gemma4 | lfm2 | lfm2_moe | olmoe | qwen3_5
+    std::string arch;          // qwen3 | qwen2 | llama (incl. Mixtral) | gemma | gemma3 | gemma4 | lfm2 | lfm2_moe | olmoe | qwen3_5
     std::string name;
     int n_layers = 0, hidden = 0, n_heads = 0, n_kv_heads = 0, head_dim = 0, ffn = 0, vocab = 0;
     float rms_eps = 1e-6f;

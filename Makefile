@@ -38,7 +38,15 @@ $(BUILD)/file-probe: tests/file_probe.cpp $(BUILD)/model_file.o $(BUILD)/safeten
 test: $(BUILD)/file-probe
 	python3 tests/file_test.py $(BUILD)/file-probe
 
+$(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
+
+# Optional reference tests: needs torch, transformers, numpy and safetensors (no downloads).
+PYTHON ?= python3
+test-models: tachyon $(BUILD)/inference-probe
+	$(PYTHON) tests/model_test.py ./tachyon $(BUILD)/inference-probe
+
 clean:
 	rm -rf $(BUILD) tachyon tachyon-client
 
-.PHONY: all clean test
+.PHONY: all clean test test-models
