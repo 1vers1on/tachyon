@@ -1,4 +1,5 @@
 #include "model_file.h"
+#include "file_validation.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -142,56 +143,73 @@ ModelFile::~ModelFile() {
 }
 
 void ModelFile::open(const std::string& p) {
+    if (map_) { munmap(map_, file_size); map_ = nullptr; }
+    tensors.clear(); blobs.clear();
     path = p;
     int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0) die("cannot open model %s", p.c_str());
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0 || st.st_size < 16) die("%s is truncated or incomplete", p.c_str());
     file_size = st.st_size;
     map_ = mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
     if (map_ == MAP_FAILED) die("mmap failed for %s", p.c_str());
     const uint8_t* base = (const uint8_t*)map_;
     std::string err;
-    size_t data_start;
+    size_t data_start, data_end = file_size;
     if (file_size >= 24 && memcmp(base, "TACHYON2", 8) == 0) {
         // v2: [magic][u64 header_off][u64 header_len] ... data at DATA_ALIGN ... [header JSON]
         uint64_t hoff, hlen;
         memcpy(&hoff, base + 8, 8);
         memcpy(&hlen, base + 16, 8);
-        if (hoff + hlen > file_size || hoff == 0) die("%s is truncated or incomplete", p.c_str());
+        if (hoff < DATA_ALIGN || hoff > file_size || hlen > file_size - hoff) die("%s is truncated or incomplete", p.c_str());
         header_ = Json::parse(std::string((const char*)base + hoff, hlen), &err);
         data_start = DATA_ALIGN;
+        data_end = hoff;
     } else if (file_size >= 16 && memcmp(base, "TACHYON1", 8) == 0) {
         uint64_t hlen;
         memcpy(&hlen, base + 8, 8);
+        if (hlen > file_size - 16) die("%s is truncated or incomplete", p.c_str());
         header_ = Json::parse(std::string((const char*)base + 16, hlen), &err);
         data_start = align_up(16 + hlen, DATA_ALIGN);
     } else die("%s is not a tachyon model file", p.c_str());
-    if (!err.empty()) die("bad header: %s", err.c_str());
+    if (!err.empty() || !header_.is_obj()) die("bad header: %s", err.c_str());
+    if (data_start > data_end) die("%s is truncated or incomplete", p.c_str());
+    const size_t payload = data_end - data_start;
     config = ModelConfig::from_json(header_["config"]);
     for (auto& t : header_["tensors"].arr) {
         TensorInfo ti;
         ti.name = t.get_str("name", "");
         ti.type = qtype_from_name(t.get_str("type", "f32"));
-        ti.rows = t.get_int("rows", 1);
-        ti.cols = t.get_int("cols", 1);
-        ti.offset = t.get_int("offset", 0);
-        ti.data_bytes = t.get_int("data_bytes", 0);
-        ti.scale_offset = t.get_int("scale_offset", 0);
-        ti.scale_bytes = t.get_int("scale_bytes", 0);
+        ti.rows = file_size_value(t["rows"], "tensor rows");
+        ti.cols = file_size_value(t["cols"], "tensor cols");
+        ti.offset = file_size_value(t["offset"], "tensor offset");
+        ti.data_bytes = file_size_value(t["data_bytes"], "tensor data_bytes");
+        ti.scale_offset = t.has("scale_offset") ? file_size_value(t["scale_offset"], "tensor scale_offset") : 0;
+        ti.scale_bytes = t.has("scale_bytes") ? file_size_value(t["scale_bytes"], "tensor scale_bytes") : 0;
+        if (ti.rows <= 0 || ti.cols <= 0 || ti.rows > INT32_MAX || ti.cols > INT32_MAX)
+            die("invalid dimensions for tensor %s", ti.name.c_str());
+        size_t n = file_product(ti.rows, ti.cols, "tensor");
+        file_product(n, 4, "tensor");  // bound all weight format size calculations
+        int group = ti.type == QType::Q8 ? Q8_GROUP : ti.type == QType::Q4 || ti.type == QType::Q3 ? Q4_GROUP : 1;
+        if (ti.cols % group || ti.data_bytes != qtype_data_bytes(ti.type, ti.rows, ti.cols) ||
+            ti.scale_bytes != qtype_scale_bytes(ti.type, ti.rows, ti.cols))
+            die("tensor %s byte size does not match shape/format", ti.name.c_str());
+        if (!file_range(ti.offset, ti.data_bytes, payload) ||
+            (ti.scale_bytes && !file_range(ti.scale_offset, ti.scale_bytes, payload)))
+            die("tensor %s out of range", ti.name.c_str());
         ti.data = base + data_start + ti.offset;
         ti.scales = ti.scale_bytes ? base + data_start + ti.scale_offset : nullptr;
-        if (data_start + ti.offset + ti.data_bytes > file_size) die("tensor %s out of range", ti.name.c_str());
-        tensors[ti.name] = ti;
+        if (!tensors.emplace(ti.name, ti).second) die("duplicate tensor %s", ti.name.c_str());
     }
     for (auto& b : header_["blobs"].arr) {
         BlobInfo bi;
         bi.name = b.get_str("name", "");
-        bi.offset = b.get_int("offset", 0);
-        bi.size = b.get_int("size", 0);
+        bi.offset = file_size_value(b["offset"], "blob offset");
+        bi.size = file_size_value(b["size"], "blob size");
+        if (!file_range(bi.offset, bi.size, payload)) die("blob %s out of range", bi.name.c_str());
         bi.data = base + data_start + bi.offset;
-        blobs[bi.name] = bi;
+        if (!blobs.emplace(bi.name, bi).second) die("duplicate blob %s", bi.name.c_str());
     }
 }
 

@@ -19,9 +19,9 @@ $(BUILD)/%.o: src/%.cpp src/*.h src/kernels/*.cu data/calib.txt
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) $(INCS) -MMD -c $< -o $@
 
+ifneq ($(OUT),tachyon)
 tachyon: $(OUT)
 
-ifneq ($(OUT),tachyon)
 $(OUT): $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDCUDA)
 else
@@ -32,7 +32,13 @@ endif
 tachyon-client: $(BUILD)/client.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
+$(BUILD)/file-probe: tests/file_probe.cpp $(BUILD)/model_file.o $(BUILD)/safetensors.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
+
+test: $(BUILD)/file-probe
+	python3 tests/file_test.py $(BUILD)/file-probe
+
 clean:
 	rm -rf $(BUILD) tachyon tachyon-client
 
-.PHONY: all clean
+.PHONY: all clean test
