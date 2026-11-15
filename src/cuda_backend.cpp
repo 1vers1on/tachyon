@@ -55,6 +55,12 @@ struct AttnArgs {
     int nh, nkv, ctx, window, nrows, qstride;
 };
 
+struct DnArgs {
+    CUdeviceptr proj, qkv, A, dt, kt, gq, at, kh, vt, gam;
+    int M, R, NK, NV, nch;
+};
+constexpr int DN_CHUNK = 64;    // tokens per chunk of the chunked delta rule (DC in kernels.cu)
+
 struct dim3_ { unsigned x = 1, y = 1, z = 1; };
 inline dim3_ D3(unsigned x, unsigned y = 1, unsigned z = 1) { dim3_ d; d.x = x; d.y = y; d.z = z; return d; }
 
@@ -149,7 +155,7 @@ public:
         for (int i = 0; i < n_logits_; i++) hb[3 * cap_ + i] = lrows_[i];
         CU(cuMemcpyHtoDAsync(d_batch_, hb, 4 * cap_ * sizeof(int), stream_));
         CU(cuEventRecord(stage_ev_[stage_], stream_));
-        if (prof_ && ++prof_count_ % 50 == 0) prof_report();
+        if (prof_ && ++prof_count_ % prof_every_ == 0) prof_report();
         if (M <= MAX_DEC) {
             const bool graphable = opt.use_graphs && n_logits_ == M && !prof_;
             if (graphable) {
@@ -285,6 +291,7 @@ private:
     }
     bool prof_ = getenv("TACH_PROFILE") != nullptr;
     int prof_count_ = 0;
+    int prof_every_ = prof_ && atoi(getenv("TACH_PROFILE")) > 1 ? atoi(getenv("TACH_PROFILE")) : 50;   // TACH_PROFILE=N: report every N forwards
     std::vector<std::pair<CUfunction, std::pair<CUevent, CUevent>>> prof_events_;
 
     // Timing of one full decode step (graph replay) + memory bandwidth probe.
@@ -536,6 +543,18 @@ private:
             ple_tmp_ = alloc((size_t)cap_ * W * 4);
             ple_tmp2_ = alloc((size_t)cap_ * W * 4);
         }
+        size_t maxCD = 0, maxNV = 0;
+        for (auto& L : layers_) if (dn_chunk_ok(L.c)) { maxCD = std::max<size_t>(maxCD, L.c.dn_conv_dim()); maxNV = std::max<size_t>(maxNV, L.c.dn_nv); }
+        if (maxCD) {
+            const size_t hc = maxNV * ((cap_ + DN_CHUNK - 1) / DN_CHUNK);   // (head, chunk) pairs, dk = dv = 128
+            dn_cv_ = alloc((size_t)cap_ * maxCD * 4);
+            dn_kt_ = alloc(hc * DN_CHUNK * 128 * 2);
+            dn_gq_ = alloc(hc * DN_CHUNK * 128 * 2);
+            dn_kh_ = alloc(hc * DN_CHUNK * 128 * 2);
+            dn_at_ = alloc(hc * DN_CHUNK * DN_CHUNK * 2);
+            dn_vt_ = alloc(hc * DN_CHUNK * 128 * 4);
+            dn_gam_ = alloc(hc * 4);
+        }
         if (has_moe_) {
             moe_ids_ = alloc(P * 4);
             moe_w_ = alloc(P * 4);
@@ -574,6 +593,16 @@ private:
     static int flash_smem(int hd) { return hd > 128 ? 32 * (hd + 8) * 2 + 4 * 32 * 16 * 4 : 2 * 64 * (hd + 8) * 2; }
     static int flash_qrows(int hd) { return hd > 128 ? 16 * (4 / (hd / 128)) : 64; }
     std::string dn_name(int dk, int dv) { return "delta_rule<" + I(dk) + "," + I(dv) + ">"; }
+    // chunked (tensor-core) delta rule for prefill; TACH_NO_DN_CHUNK=1 / TACH_NO_CONV_PAR=1 select the sequential kernels
+    static bool dn_chunk_ok(const LayerCfg& lc) {
+        static const bool off = getenv("TACH_NO_DN_CHUNK") != nullptr;
+        return !off && lc.type == "deltanet" && lc.dn_dk == 128 && lc.dn_dv == 128 && lc.dn_nv % lc.dn_nk == 0 && lc.dn_conv <= 8;
+    }
+    static bool conv_par_ok(const LayerCfg& lc) {
+        static const bool off = getenv("TACH_NO_CONV_PAR") != nullptr;
+        return !off && lc.type == "conv" && lc.conv_k >= 2 && lc.conv_k <= 8;
+    }
+    static constexpr int DN_PREP_SMEM = DN_CHUNK * (128 + 4) * 2 + DN_CHUNK * DN_CHUNK * 4 + 3 * DN_CHUNK * 4;
     static bool tc_ok(QType t) { return t == QType::Q4 || t == QType::Q3; }
 
     void compile_kernels() {
@@ -617,7 +646,12 @@ private:
                 add_in(L.dn_in, 0);
                 add_out(L.dn_out);
                 names.insert(dn_name(lc.dn_dk, lc.dn_dv));
+                if (dn_chunk_ok(lc)) {
+                    names.insert("dn_prep<128,128>"); names.insert("dn_chunk<128,128>");
+                    names.insert("conv_par<1>"); names.insert("conv_state<1>");
+                }
             }
+            if (conv_par_ok(lc)) { names.insert("conv_par<0>"); names.insert("conv_state<0>"); }
             if (lc.n_experts) {
                 names.insert(ind_name(L.wgu_e.t, L.wgu_e.cols));
                 names.insert(ind_name(L.wdown_e.t, L.wdown_e.cols));
@@ -706,6 +740,7 @@ private:
             if (n.rfind("gemm<", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gemm_smem()));
             if (n.rfind("gemv_tc", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, TC_SMEM));
             if (n.rfind("gemv2", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_pro_smem));
+            if (n.rfind("dn_prep", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DN_PREP_SMEM));
             if (n.rfind("flash_", 0) == 0)
                 CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, flash_smem(atoi(n.c_str() + n.find('<') + 1))));
         }
@@ -731,6 +766,7 @@ private:
         f_embrows_ = fn("embed_rows");
         f_plecomb_ = fn("ple_combine");
         f_plemul_ = fn("ple_mul");
+        f_dnpost_ = fn("dn_post");
     }
     static constexpr int TC_SMEM = 3 * (64 * 144 + 64 * 16 + 8 * 272 + 512);
     int gemm_smem() const { return 2 * 64 * 72 * 2 + 2 * 128 * 72 * 2; }
@@ -1038,18 +1074,35 @@ private:
                 gemm(L.wo, hb_, M, dadd ? x_ : tmp_, 0, dadd ? 1 : 0);
             } else if (lc.type == "conv") {
                 gemm(L.conv_in, ha_, M, proj_, 0, 0);
-                launch(F("causal_conv<0>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
-                       pos_ptr(), slot_ptr(), M, tmp_);
+                if (conv_par_ok(lc)) {
+                    const CUdeviceptr st = L.st0 + (size_t)slot * (lc.conv_k - 1) * H * 4;
+                    launch(F("conv_par<0>"), D3((H + 127) / 128, (M + 31) / 32), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, st, p0 == 0 ? 1 : 0, M, tmp_);
+                    launch(F("conv_state<0>"), D3((H + 255) / 256), D3(256), 0, proj_, 3 * H, H, lc.conv_k, st, M);
+                } else {
+                    launch(F("causal_conv<0>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
+                           pos_ptr(), slot_ptr(), M, tmp_);
+                }
                 launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * H);
                 gemm(L.conv_out, hb_, M, dadd ? x_ : tmp_, 0, dadd ? 1 : 0);
             } else {
                 const int R = lc.dn_in_rows(), CD = lc.dn_conv_dim(), VD = lc.dn_val_dim();
                 gemm(L.dn_in, ha_, M, proj_, 0, 0);
-                launch(F("causal_conv<1>"), D3((CD + 127) / 128), D3(128), 0, proj_, R, CD, lc.dn_conv, L.dn_conv, L.st0,
-                       pos_ptr(), slot_ptr(), M, (CUdeviceptr)0);
-                launch(F(dn_name(lc.dn_dk, lc.dn_dv)), D3(lc.dn_nv), D3(2 * lc.dn_dv), 0, proj_, R, lc.dn_nk, lc.dn_nv, L.dn_A, L.dn_dt,
-                       L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_);
-                launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * VD);
+                if (dn_chunk_ok(lc)) {
+                    const int NV = lc.dn_nv, DK = lc.dn_dk, DV = lc.dn_dv, nch = (M + DN_CHUNK - 1) / DN_CHUNK;
+                    const CUdeviceptr cst = L.st0 + (size_t)slot * (lc.dn_conv - 1) * CD * 4;
+                    launch(F("conv_par<1>"), D3((CD + 127) / 128, (M + 31) / 32), D3(128), 0, proj_, R, CD, lc.dn_conv, L.dn_conv, cst, p0 == 0 ? 1 : 0, M, dn_cv_);
+                    launch(F("conv_state<1>"), D3((CD + 255) / 256), D3(256), 0, proj_, R, CD, lc.dn_conv, cst, M);
+                    DnArgs da{proj_, dn_cv_, L.dn_A, L.dn_dt, dn_kt_, dn_gq_, dn_at_, dn_kh_, dn_vt_, dn_gam_, M, R, lc.dn_nk, NV, nch};
+                    launch(F("dn_prep<128,128>"), D3(nch, NV), D3(256), DN_PREP_SMEM, da);
+                    launch(F("dn_chunk<128,128>"), D3(NV), D3(32 * DV / 16), 0, da, (CUdeviceptr)(L.st1 + (size_t)slot * NV * DK * DV * 4), p0 == 0 ? 1 : 0, tmp_);
+                    launch(f_dnpost_, D3(M, (NV + 7) / 8), D3(256), 0, tmp_, proj_, R, CD, NV, DV, L.dn_norm, hb_);
+                } else {
+                    launch(F("causal_conv<1>"), D3((CD + 127) / 128), D3(128), 0, proj_, R, CD, lc.dn_conv, L.dn_conv, L.st0,
+                           pos_ptr(), slot_ptr(), M, (CUdeviceptr)0);
+                    launch(F(dn_name(lc.dn_dk, lc.dn_dv)), D3(lc.dn_nv), D3(2 * lc.dn_dv), 0, proj_, R, lc.dn_nk, lc.dn_nv, L.dn_A, L.dn_dt,
+                           L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_);
+                    launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * VD);
+                }
                 gemm(L.dn_out, hb_, M, dadd ? x_ : tmp_, 0, dadd ? 1 : 0);
             }
             if (!dadd) residual(M, tmp_, L.post_attn_norm, 1.f);
@@ -1148,7 +1201,8 @@ private:
     float* h_out_ = nullptr;
     std::map<std::string, CUfunction> funcs_;
     CUfunction f_embed_, f_rms_q8_, f_rms_q8_rows_, f_rms_f16_, f_argmax_, f_kvcopy_, f_colsq_, f_rowmax_, f_cand_;
-    CUfunction f_embrows_, f_plecomb_, f_plemul_;
+    CUfunction f_embrows_, f_plecomb_, f_plemul_, f_dnpost_;
+    CUdeviceptr dn_cv_ = 0, dn_kt_ = 0, dn_gq_ = 0, dn_kh_ = 0, dn_at_ = 0, dn_vt_ = 0, dn_gam_ = 0;
     DMat ple_embd_, ple_proj_;
     CUdeviceptr ple_proj_norm_ = 0, ple_buf_ = 0, ple_tmp_ = 0, ple_tmp2_ = 0;
     CUfunction f_quant_, f_tof16_, f_normadd_, f_softcap_, f_normslice_, f_route_, f_actq_, f_combine_, f_gather_, f_scatter_;

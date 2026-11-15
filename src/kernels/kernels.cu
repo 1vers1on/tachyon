@@ -1744,6 +1744,330 @@ __global__ void __launch_bounds__(2 * DV) delta_rule(const float* __restrict__ p
     }
 }
 
+// ================================================================================================
+// Prefill versions of the stateful mixers (tokens of ONE slot at consecutive positions)
+// ================================================================================================
+// Parallel causal depthwise conv: one thread per channel walks a segment of CSEG tokens with the K-1 previous
+// inputs in registers (taken from the preceding rows, or from the rolling state for the first tokens).
+// Out of place; the rolling state is written afterwards by conv_state. Modes as in causal_conv.
+// grid (ceil(C/128), ceil(M/CSEG)), block 128
+#define CSEG 32
+template <int MODE>
+__device__ __forceinline__ float conv_xin(const float* __restrict__ in, int stride, int C, int m, int ch) {
+    const float* r = in + (size_t)m * stride;
+    return MODE == 0 ? r[ch] * r[2 * C + ch] : r[ch];
+}
+template <int MODE>
+__global__ void __launch_bounds__(128) conv_par(const float* __restrict__ in, int stride, int C, int K, const float* __restrict__ w,
+                                                const float* __restrict__ state, int fresh, int M, float* __restrict__ out) {
+    const int ch = blockIdx.x * 128 + threadIdx.x;
+    if (ch >= C) return;
+    const int m0 = blockIdx.y * CSEG, m1 = min(M, m0 + CSEG);
+    float wk[8], hist[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) { wk[k] = k < K ? w[ch * K + k] : 0.f; hist[k] = 0.f; }
+    for (int k = 0; k < K - 1; k++) {
+        const int mm = m0 - (K - 1) + k;
+        hist[k] = mm >= 0 ? conv_xin<MODE>(in, stride, C, mm, ch) : (fresh ? 0.f : state[(size_t)(mm + K - 1) * C + ch]);
+    }
+    for (int m = m0; m < m1; m++) {
+        const float xin = conv_xin<MODE>(in, stride, C, m, ch);
+        float acc = wk[K - 1] * xin;
+        for (int k = 0; k < K - 1; k++) acc += wk[k] * hist[k];
+        for (int k = 0; k < K - 2; k++) hist[k] = hist[k + 1];
+        hist[K - 2] = xin;
+        if (MODE == 0) out[(size_t)m * C + ch] = in[(size_t)m * stride + C + ch] * acc;
+        else out[(size_t)m * C + ch] = acc / (1.f + __expf(-acc));
+    }
+}
+// rolling state <- last K-1 inputs of the batch (M >= K-1). grid ceil(C/256), block 256
+template <int MODE>
+__global__ void conv_state(const float* __restrict__ in, int stride, int C, int K, float* __restrict__ state, int M) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= C) return;
+    for (int k = 0; k < K - 1; k++) state[(size_t)k * C + ch] = conv_xin<MODE>(in, stride, C, M - (K - 1) + k, ch);
+}
+
+// ---- chunked gated delta rule (Qwen3.5 prefill) --------------------------------------------------
+// The recurrence S_t = d_t S_{t-1} + k_t (x) u_t, u_t = beta_t (v_t - (d_t S_{t-1})^T k_t), o_t = S_t^T q_t is solved
+// DC tokens at a time. With c_t = sum_{s<=t} log d_s, G(t,s) = exp(c_t - c_s), A[t][s] = beta_t G(t,s) k_t.k_s (s < t):
+//   (I + A) U = beta V - (beta gamma K) S_0            ->  U = V~ - K~ S_0   (V~, K~ by forward substitution)
+//   O   = diag(gamma) Q S_0 + tril(G * Q K^T) U
+//   S_C = gamma_C S_0 + (G(C,.) K)^T U
+// dn_prep (parallel over heads x chunks) computes everything that does not depend on the state: K~, gamma*Q,
+// the attention matrix and the decayed keys as fp16 mma operands, V~ in fp32. dn_chunk then walks the chunks with
+// three small tensor-core products per chunk. dn_post applies the gated RMSNorm.
+#define DC 64
+struct DnArgs {
+    const float* proj;   // [M][R]: z | b | a behind the conv channels
+    const float* qkv;    // [M][CD] conv + SiLU'd q | k | v
+    const float* A; const float* dt;
+    half* kt;            // [NV][NCH][DC][DK]  K~
+    half* gq;            // [NV][NCH][DC][DK]  gamma_t q_t
+    half* at;            // [NV][NCH][DC][DC]  attn[t][s]
+    half* kh;            // [NV][NCH][DK][DC]  decayed keys, transposed
+    float* vt;           // [NV][NCH][DV][DC]  V~ transposed
+    float* gam;          // [NV][NCH]          decay over the whole chunk
+    int M, R, NK, NV, nch;
+};
+// grid (nch, NV), block 256 (DK = DV = 128), dynamic smem DN_PREP_SMEM
+#define DN_KLD(DK) ((DK) + 4)
+template <int DK, int DV>
+__global__ void __launch_bounds__(256) dn_prep(const DnArgs a) {
+    constexpr int KLD = DN_KLD(DK);
+    extern __shared__ __align__(16) uint8_t dsm[];
+    half* Kn = (half*)dsm;                               // [DC][KLD] normalized keys
+    float* Am = (float*)(dsm + DC * KLD * 2);            // [DC][DC]
+    float* beta_s = Am + DC * DC;
+    float* cs = beta_s + DC;                             // cumulative log decay (inclusive)
+    float* qsc_s = cs + DC;
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const int c = blockIdx.x, h = blockIdx.y, kh = h / (a.NV / a.NK);
+    const int KD = a.NK * DK, VD = a.NV * DV, CD = 2 * KD + VD;
+    const int m0 = c * DC;
+    const size_t hc = (size_t)h * a.nch + c;
+    // 1. per token: l2 norms, beta, log decay; normalized keys -> smem
+    for (int t = warp; t < DC; t += 8) {
+        const int m = m0 + t;
+        const bool ok = m < a.M;
+        const float* qr = a.qkv + (size_t)(ok ? m : 0) * CD + kh * DK;
+        float kv[DK / 32], qq = 0.f, kk = 0.f;
+#pragma unroll
+        for (int e = 0; e < DK / 32; e++) {
+            const float q = ok ? qr[lane + 32 * e] : 0.f;
+            kv[e] = ok ? qr[KD + lane + 32 * e] : 0.f;
+            qq += q * q; kk += kv[e] * kv[e];
+        }
+        qq = warp_sum(qq); kk = warp_sum(kk);
+        const float ksc = rsqrtf(kk + 1e-6f);
+#pragma unroll
+        for (int e = 0; e < DK / 32; e++) Kn[t * KLD + lane + 32 * e] = __float2half(kv[e] * ksc);
+        if (lane == 0) {
+            qsc_s[t] = rsqrtf(qq + 1e-6f) * rsqrtf((float)DK);
+            if (ok) {
+                const float* r = a.proj + (size_t)m * a.R;
+                beta_s[t] = 1.f / (1.f + __expf(-r[CD + VD + h]));
+                const float x = r[CD + VD + a.NV + h] + a.dt[h];
+                cs[t] = a.A[h] * (x > 20.f ? x : log1pf(__expf(x)));
+            } else { beta_s[t] = 0.f; cs[t] = 0.f; }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float acc = 0.f;
+        for (int t = 0; t < DC; t++) { acc += cs[t]; cs[t] = acc; }
+        a.gam[hc] = __expf(acc);
+    }
+    __syncthreads();
+    // 2. Gram matrices: thread (t, group of 16 s): k_t.k_s and q_t.k_s for s <= t
+    {
+        const int t = tid / 4, s0 = (tid % 4) * 16;
+        const int m = m0 + t;
+        const bool ok = m < a.M;
+        float gk[16], qk[16];
+#pragma unroll
+        for (int i = 0; i < 16; i++) { gk[i] = 0.f; qk[i] = 0.f; }
+        if (s0 <= t) {
+            const float2* qr = (const float2*)(a.qkv + (size_t)(ok ? m : 0) * CD + kh * DK);
+            const float qs = ok ? qsc_s[t] : 0.f;
+            for (int d = 0; d < DK / 2; d++) {
+                const float2 q2 = qr[d];
+                const float2 kt2 = __half22float2(*(const half2*)(Kn + t * KLD + 2 * d));
+#pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    const float2 ks2 = __half22float2(*(const half2*)(Kn + (s0 + i) * KLD + 2 * d));
+                    gk[i] += kt2.x * ks2.x + kt2.y * ks2.y;
+                    qk[i] += q2.x * ks2.x + q2.y * ks2.y;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 16; i++) qk[i] *= qs;
+        }
+        half* arow = a.at + (hc * DC + t) * DC + s0;
+        const float ct = cs[t], bt = beta_s[t];
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+            const int s2 = s0 + i;
+            const float dec = s2 <= t ? __expf(ct - cs[s2]) : 0.f;
+            Am[t * DC + s2] = s2 < t ? bt * dec * gk[i] : 0.f;
+            arow[i] = __float2half(dec * qk[i]);
+        }
+    }
+    __syncthreads();
+    // 3. forward substitution, one column per thread (registers): V~ columns (tid < DV), K~ columns (tid >= DV)
+    float x[DC];
+    const int col = tid < DV ? tid : tid - DV;
+    if (tid < DV) {
+#pragma unroll
+        for (int t = 0; t < DC; t++) x[t] = m0 + t < a.M ? beta_s[t] * a.qkv[(size_t)(m0 + t) * CD + 2 * KD + h * DV + col] : 0.f;
+    } else {
+#pragma unroll
+        for (int t = 0; t < DC; t++) x[t] = beta_s[t] * __expf(cs[t]) * __half2float(Kn[t * KLD + col]);
+    }
+#pragma unroll
+    for (int t = 1; t < DC; t++) {
+        float v = x[t];
+#pragma unroll
+        for (int s2 = 0; s2 < t; s2++) v -= Am[t * DC + s2] * x[s2];
+        x[t] = v;
+    }
+    if (tid < DV) {
+        float* dst = a.vt + (hc * DV + col) * DC;
+#pragma unroll
+        for (int t = 0; t < DC; t += 4) *(float4*)(dst + t) = make_float4(x[t], x[t + 1], x[t + 2], x[t + 3]);
+    } else {
+        half* kt = a.kt + hc * DC * DK;
+        half* gq = a.gq + hc * DC * DK;
+        half* khp = a.kh + (hc * DK + col) * DC;
+        const float cC = cs[DC - 1];
+        for (int t = 0; t < DC; t++) {
+            kt[t * DK + col] = __float2half(x[t]);
+            const float q = m0 + t < a.M ? a.qkv[(size_t)(m0 + t) * CD + kh * DK + col] * qsc_s[t] : 0.f;
+            gq[t * DK + col] = __float2half(__expf(cs[t]) * q);
+            khp[t] = __float2half(__expf(cC - cs[t]) * __half2float(Kn[t * KLD + col]));
+        }
+    }
+}
+
+// Sequential part: one CTA per value head, warp w owns state columns dv in [16w, 16w+16) as S^T tiles in
+// registers (fp32, mma accumulator layout), which double as the A operand of the next products. No communication
+// between warps except the shared operand tile in smem. grid NV, block 32 * DV / 16.
+template <int DK, int DV>
+__global__ void __launch_bounds__(32 * DV / 16) dn_chunk(const DnArgs a, float* __restrict__ state, int fresh, float* __restrict__ out) {
+    constexpr int NT = 32 * DV / 16;
+    constexpr int LDK = DK + 8, LDC = DC + 8;
+    __shared__ __align__(16) half buf[(DC * LDK > DK * LDC ? DC * LDK : DK * LDC)];
+    const int h = blockIdx.x, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const int VD = a.NV * DV;
+    const int dv0 = warp * 16 + (lane >> 2);        // rows dv0, dv0 + 8
+    const int c2 = (lane & 3) * 2;                  // column pair inside an 8-wide tile
+    float S[DK / 8][4];
+    float* Sg = state + (size_t)h * DK * DV;
+#pragma unroll
+    for (int j = 0; j < DK / 8; j++)
+#pragma unroll
+        for (int e = 0; e < 4; e++)
+            S[j][e] = fresh ? 0.f : Sg[(size_t)(8 * j + c2 + (e & 1)) * DV + dv0 + 8 * (e >> 1)];
+    auto load_rows = [&](const half* src, int rows, int cols) {
+        const int cpr = cols / 8;
+        for (int i = tid; i < rows * cpr; i += NT) {
+            const int r = i / cpr, cc = (i % cpr) * 8;
+            cp_async16(buf + r * (cols + 8) + cc, src + (size_t)r * cols + cc, true);
+        }
+        cp_async_commit();
+        cp_async_wait_all();
+        __syncthreads();
+    };
+    for (int c = 0; c < a.nch; c++) {
+        const size_t hc = (size_t)h * a.nch + c;
+        // ---- U^T = V~^T - S^T K~^T ----
+        load_rows(a.kt + hc * DC * DK, DC, DK);
+        float u[DC / 8][4];
+#pragma unroll
+        for (int i = 0; i < DC / 8; i++) u[i][0] = u[i][1] = u[i][2] = u[i][3] = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < DK / 16; kk++) {
+            const uint32_t a0 = pack_half2(S[2 * kk][0], S[2 * kk][1]), a1 = pack_half2(S[2 * kk][2], S[2 * kk][3]);
+            const uint32_t a2 = pack_half2(S[2 * kk + 1][0], S[2 * kk + 1][1]), a3 = pack_half2(S[2 * kk + 1][2], S[2 * kk + 1][3]);
+#pragma unroll
+            for (int ni = 0; ni < DC / 8; ni += 2) {
+                uint32_t b0, b1, b2, b3;
+                ldmatrix_x4(b0, b1, b2, b3, buf + (ni * 8 + (lane & 7) + ((lane >> 4) << 3)) * LDK + kk * 16 + ((lane >> 3) & 1) * 8);
+                mma16816(u[ni], a0, a1, a2, a3, b0, b1);
+                mma16816(u[ni + 1], a0, a1, a2, a3, b2, b3);
+            }
+        }
+        {
+            const float* v0 = a.vt + (hc * DV + dv0) * DC + c2;
+#pragma unroll
+            for (int ni = 0; ni < DC / 8; ni++) {
+                const float2 x0 = *(const float2*)(v0 + ni * 8), x1 = *(const float2*)(v0 + 8 * DC + ni * 8);
+                u[ni][0] = x0.x - u[ni][0]; u[ni][1] = x0.y - u[ni][1];
+                u[ni][2] = x1.x - u[ni][2]; u[ni][3] = x1.y - u[ni][3];
+            }
+        }
+        __syncthreads();
+        // ---- O^T = S^T (gamma Q)^T + U^T attn^T ----
+        load_rows(a.gq + hc * DC * DK, DC, DK);
+        float o[DC / 8][4];
+#pragma unroll
+        for (int i = 0; i < DC / 8; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < DK / 16; kk++) {
+            const uint32_t a0 = pack_half2(S[2 * kk][0], S[2 * kk][1]), a1 = pack_half2(S[2 * kk][2], S[2 * kk][3]);
+            const uint32_t a2 = pack_half2(S[2 * kk + 1][0], S[2 * kk + 1][1]), a3 = pack_half2(S[2 * kk + 1][2], S[2 * kk + 1][3]);
+#pragma unroll
+            for (int ni = 0; ni < DC / 8; ni += 2) {
+                uint32_t b0, b1, b2, b3;
+                ldmatrix_x4(b0, b1, b2, b3, buf + (ni * 8 + (lane & 7) + ((lane >> 4) << 3)) * LDK + kk * 16 + ((lane >> 3) & 1) * 8);
+                mma16816(o[ni], a0, a1, a2, a3, b0, b1);
+                mma16816(o[ni + 1], a0, a1, a2, a3, b2, b3);
+            }
+        }
+        __syncthreads();
+        load_rows(a.at + hc * DC * DC, DC, DC);
+        uint32_t ua[DC / 16][4];
+#pragma unroll
+        for (int kk = 0; kk < DC / 16; kk++) {
+            ua[kk][0] = pack_half2(u[2 * kk][0], u[2 * kk][1]); ua[kk][1] = pack_half2(u[2 * kk][2], u[2 * kk][3]);
+            ua[kk][2] = pack_half2(u[2 * kk + 1][0], u[2 * kk + 1][1]); ua[kk][3] = pack_half2(u[2 * kk + 1][2], u[2 * kk + 1][3]);
+        }
+#pragma unroll
+        for (int kk = 0; kk < DC / 16; kk++) {
+#pragma unroll
+            for (int ni = 0; ni < DC / 8; ni += 2) {
+                uint32_t b0, b1, b2, b3;
+                ldmatrix_x4(b0, b1, b2, b3, buf + (ni * 8 + (lane & 7) + ((lane >> 4) << 3)) * LDC + kk * 16 + ((lane >> 3) & 1) * 8);
+                mma16816(o[ni], ua[kk][0], ua[kk][1], ua[kk][2], ua[kk][3], b0, b1);
+                mma16816(o[ni + 1], ua[kk][0], ua[kk][1], ua[kk][2], ua[kk][3], b2, b3);
+            }
+        }
+#pragma unroll
+        for (int ni = 0; ni < DC / 8; ni++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int m = c * DC + ni * 8 + c2 + (e & 1);
+                if (m < a.M) out[(size_t)m * VD + h * DV + dv0 + 8 * (e >> 1)] = o[ni][e];
+            }
+        __syncthreads();
+        // ---- S^T = gamma_C S^T + U^T K^ ----
+        load_rows(a.kh + hc * DK * DC, DK, DC);
+        const float gC = a.gam[hc];
+#pragma unroll
+        for (int j = 0; j < DK / 8; j++) { S[j][0] *= gC; S[j][1] *= gC; S[j][2] *= gC; S[j][3] *= gC; }
+#pragma unroll
+        for (int kk = 0; kk < DC / 16; kk++) {
+#pragma unroll
+            for (int ni = 0; ni < DK / 8; ni += 2) {
+                uint32_t b0, b1, b2, b3;
+                ldmatrix_x4(b0, b1, b2, b3, buf + (ni * 8 + (lane & 7) + ((lane >> 4) << 3)) * LDC + kk * 16 + ((lane >> 3) & 1) * 8);
+                mma16816(S[ni], ua[kk][0], ua[kk][1], ua[kk][2], ua[kk][3], b0, b1);
+                mma16816(S[ni + 1], ua[kk][0], ua[kk][1], ua[kk][2], ua[kk][3], b2, b3);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < DK / 8; j++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) Sg[(size_t)(8 * j + c2 + (e & 1)) * DV + dv0 + 8 * (e >> 1)] = S[j][e];
+}
+
+// gated RMSNorm of the delta-rule outputs: oh = rmsnorm(o) * w * silu(z), fp16. One warp per (token, value head).
+// grid (M, ceil(NV / 8)), block 256
+extern "C" __global__ void __launch_bounds__(256) dn_post(const float* __restrict__ o, const float* __restrict__ proj, int R, int CD, int NV, int DV,
+                                                          const float* __restrict__ nw, half* __restrict__ oh) {
+    const int m = blockIdx.x, h = blockIdx.y * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (h >= NV) return;
+    const float* orow = o + (size_t)m * NV * DV + h * DV;
+    float ss = 0.f;
+    for (int j = lane; j < DV; j += 32) ss += orow[j] * orow[j];
+    ss = warp_sum(ss);
+    const float sc = rsqrtf(ss / DV + EPS);
+    const float* z = proj + (size_t)m * R + CD + h * DV;
+    for (int j = lane; j < DV; j += 32) oh[(size_t)m * NV * DV + h * DV + j] = __float2half(orow[j] * sc * nw[j] * (z[j] / (1.f + __expf(-z[j]))));
+}
+
 // ---- Mixture of experts ----
 // Router: one CTA per token. logits = RMSNorm(x) (ffn norm) . W_r (fp32 [E][HID]); softmax or sigmoid scores;
 // top-k by score (+ optional selection bias); weights optionally renormalized and scaled.
