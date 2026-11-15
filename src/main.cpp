@@ -14,7 +14,7 @@ static void usage() {
     fprintf(stderr,
         "Tachyon %s - fast LLM inference server (CUDA + CPU)\n\n"
         "usage:\n"
-        "  tachyon convert <hf_model_dir> <out.tach> [-q q4|q8|f16] [--embed-quant q4|q8|f16]\n"
+        "  tachyon convert <hf_model_dir> <out.tach> [-q q4|q8|f16] [--embed-quant q4|q8|f16] [--head-quant q4|q8]\n"
         "                  [--calib text.txt]  (importance-weighted quantization from calibration text)\n"
         "                  [--imatrix file] [--tensor-quant wdown=q8,blk.0.=q8]\n"
         "  tachyon serve   -m model.tach [--host 127.0.0.1] [--port 8080] [options]\n"

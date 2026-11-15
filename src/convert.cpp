@@ -54,6 +54,7 @@ struct ConvertOptions {
     int threads = 0;
     int max_ctx = 0;
     std::vector<std::pair<std::string, QType>> overrides;  // substring -> qtype
+    QType head_type = QType::F32;                           // != F32: separate (untied) LM head in this format
     std::string imatrix;
 };
 
@@ -230,6 +231,7 @@ int convert_main(int argc, char** argv) {
         else if (a == "-o" || a == "--output") o.out_path = next();
         else if (a == "-q" || a == "--quant") { o.wtype = qtype_from_name(next()); o.embed_type = o.wtype == QType::Q3 ? QType::Q4 : o.wtype; }
         else if (a == "--embed-quant") o.embed_type = qtype_from_name(next());
+        else if (a == "--head-quant") o.head_type = qtype_from_name(next());
         else if (a == "-t" || a == "--threads") o.threads = atoi(next().c_str());
         else if (a == "--max-ctx") o.max_ctx = atoi(next().c_str());
         else if (a == "--imatrix") o.imatrix = next();
@@ -250,7 +252,7 @@ int convert_main(int argc, char** argv) {
         else die("unknown convert arg %s", a.c_str());
     }
     if (o.in_dir.empty() || o.out_path.empty())
-        die("usage: tachyon convert <hf_model_dir> <out.tach> [-q q4|q8|f16] [--embed-quant q4|q8|f16]");
+        die("usage: tachyon convert <hf_model_dir> <out.tach> [-q q4|q8|f16] [--embed-quant q4|q8|f16] [--head-quant q4|q8]");
     if (o.threads <= 0) o.threads = nthreads_default();
     double t0 = now_sec();
 
@@ -450,6 +452,7 @@ int convert_main(int argc, char** argv) {
         std::vector<uint8_t> data, scales;
         const float* imp = nullptr;
         auto it = imat.find(name);
+        if (it == imat.end() && name == "output") it = imat.find("tok_embd");  // tied model: head statistics live there
         std::vector<float> impv;
         if (it != imat.end() && (int64_t)it->second.size() == cols) {
             // regularize: importance = mean(x^2) + small fraction of its average
@@ -495,9 +498,13 @@ int convert_main(int argc, char** argv) {
     const int H = c.hidden;
     write_matrix("tok_embd", o.embed_type, V, H, simple(emb));
     write_vec("output_norm", first_of({P + "norm.weight", P + "embedding_norm.weight"}), norm_add);
-    if (!c.tied_embed) {
+    if (c.tied_embed && o.head_type != QType::F32) {
+        // untie: the head (read every token) gets its own, typically smaller, format; the lookup table keeps embed_type
+        write_matrix("output", o.head_type, V, H, simple(emb));
+        c.tied_embed = false;
+    } else if (!c.tied_embed) {
         const STTensor* lm = st.get("lm_head.weight");
-        if (lm) write_matrix("output", o.embed_type, lm->shape[0], H, simple(lm));
+        if (lm) write_matrix("output", o.head_type != QType::F32 ? o.head_type : o.embed_type, lm->shape[0], H, simple(lm));
         else c.tied_embed = true;
     }
     for (int l = 0; l < c.n_layers; l++) {

@@ -260,6 +260,13 @@ private:
     template <class... T>
     void launch(CUfunction f, dim3_ g, dim3_ b, unsigned smem, T... args) {
         void* p[] = {(void*)&args...};
+        if (!kskip_.empty()) {  // TACH_KBENCH_SKIP: drop kernels whose name contains one of the substrings (timing ablation)
+            if (knames_.empty()) for (auto& kv : funcs_) knames_[kv.second] = kv.first;
+            auto it = knames_.find(f);
+            const std::string n = it != knames_.end() ? it->second : std::string();
+            for (auto& k : kskip_) if (!n.empty() && n.find(k) != std::string::npos) { kskipped_++; return; }
+            klaunched_++;
+        }
         if (prof_) {
             CUevent e0, e1;
             cuEventCreate(&e0, 0); cuEventCreate(&e1, 0);
@@ -290,6 +297,9 @@ private:
         for (auto& x : v) fprintf(stderr, "  %8.3f ms %5.1f%%  %s\n", x.first, 100 * x.first / tot, x.second.c_str());
     }
     bool prof_ = getenv("TACH_PROFILE") != nullptr;
+    std::vector<std::string> kskip_;
+    std::map<CUfunction, std::string> knames_;
+    int kskipped_ = 0, klaunched_ = 0;
     int prof_count_ = 0;
     int prof_every_ = prof_ && atoi(getenv("TACH_PROFILE")) > 1 ? atoi(getenv("TACH_PROFILE")) : 50;   // TACH_PROFILE=N: report every N forwards
     std::vector<std::pair<CUfunction, std::pair<CUevent, CUevent>>> prof_events_;
@@ -299,18 +309,28 @@ private:
         std::vector<BatchToken> b(M);
         for (int i = 0; i < M; i++) b[i] = {100 + i, 0, pos + i, true};
         forward(b);
+        if (const char* sk = getenv("TACH_KBENCH_SKIP")) {   // ';'-separated substrings (kernel names contain commas)
+            std::string all = sk;
+            for (size_t st = 0; st <= all.size();) {
+                size_t e = all.find(';', st); if (e == std::string::npos) e = all.size();
+                if (e > st) kskip_.push_back(all.substr(st, e - st));
+                st = e + 1;
+            }
+        }
         CUgraph g; CUgraphExec ge;
         CU(cuStreamBeginCapture(stream_, CU_STREAM_CAPTURE_MODE_RELAXED));
         decode_pass(M);
         CU(cuStreamEndCapture(stream_, &g));
         CU(cuGraphInstantiate(&ge, g, 0));
-        for (int i = 0; i < 5; i++) cuGraphLaunch(ge, stream_);
+        if (!kskip_.empty()) fprintf(stderr, "[kbench] skipped %d kernels, kept %d\n", kskipped_, klaunched_);
+        for (int i = 0; i < 5; i++) CU(cuGraphLaunch(ge, stream_));
+        CU(cuStreamSynchronize(stream_));
         CUevent e0, e1; cuEventCreate(&e0, 0); cuEventCreate(&e1, 0);
         cuEventRecord(e0, stream_);
         const int R = 100;
-        for (int i = 0; i < R; i++) cuGraphLaunch(ge, stream_);
+        for (int i = 0; i < R; i++) CU(cuGraphLaunch(ge, stream_));
         cuEventRecord(e1, stream_);
-        cuEventSynchronize(e1);
+        CU(cuEventSynchronize(e1));
         float ms; cuEventElapsedTime(&ms, e0, e1);
         ms /= R;
         fprintf(stderr, "[kbench] M=%d pos=%d full decode step: %.3f ms (%.1f tok/s)\n", M, pos, ms, M * 1000.f / ms);
@@ -836,11 +856,18 @@ private:
                 gemv_tc(W, epi, mm, q, d, (CUdeviceptr)(y + (size_t)m0 * N * 4), bias);
                 continue;
             }
-            CUfunction f = F(gemv2_name(W.t, K, mm, pro, epi));
             const int smem = pro == 1 ? mm * K + mm * (K / 32) * 8 : 0;
+            CUfunction f = F(gemv2_name(W.t, K, mm, pro, epi));
             const int wmax = occupancy(f, smem) * 8 * n_sm_;
             const int rpw = (N + wmax - 1) / wmax;
             const int wtot = (N + rpw - 1) / rpw;
+            if (getenv("TACH_GEMV_LOG")) {
+                static std::set<std::pair<CUfunction, int>> seen;
+                if (seen.insert({f, N}).second) {
+                    int regs = 0; cuFuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, f);
+                    fprintf(stderr, "[gemv] q%d K=%d N=%d M=%d pro=%d epi=%d: regs %d occ %d blk/SM, rows/warp %d, grid %d\n", qt_code(W.t), K, N, mm, pro, epi, regs, occupancy(f, smem), rpw, (wtot + 7) / 8);
+                }
+            }
             launch(f, D3((wtot + 7) / 8), D3(256), smem, W.d, W.s, N, wtot,
                    (CUdeviceptr)(x ? (rows ? x : x + (size_t)m0 * K * 4) : 0), nw, (CUdeviceptr)(rows ? rows + (size_t)m0 * 4 : 0),
                    (CUdeviceptr)(xq ? xq + (size_t)m0 * K : 0), (CUdeviceptr)(xds ? xds + (size_t)m0 * (K / 32) * 8 : 0),
