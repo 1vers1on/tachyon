@@ -3,6 +3,7 @@
 #include "engine.h"
 #include "server.h"
 #include "quant.h"
+#include "safetensors.h"
 #include <thread>
 #include <algorithm>
 
@@ -131,7 +132,15 @@ int main(int argc, char** argv) {
         std::string out = rest[1];
         std::string tmp = out + ".q8tmp", imat = out + ".imatrix";
         {
-            std::vector<char*> a8 = {rest[0], (char*)tmp.c_str(), (char*)"-q", (char*)"q8"};
+            // calibration model: Q8 when it fits comfortably in VRAM, else plain Q4 (statistics barely change)
+            size_t ckpt = 0;
+            {
+                SafeTensors st; st.open_dir(rest[0]);
+                for (auto& n : st.names()) ckpt += st.get(n)->nbytes;
+            }
+            const char* cq = ckpt > (12ull << 30) ? "q4" : "q8";
+            logi("calibration model: %s (checkpoint %.1f GB)", cq, ckpt / 1e9);
+            std::vector<char*> a8 = {rest[0], (char*)tmp.c_str(), (char*)"-q", (char*)cq};
             convert_main((int)a8.size(), a8.data());
         }
         {

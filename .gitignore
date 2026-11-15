@@ -9,3 +9,6 @@
 *.imatrix
 # python venv used only for reference checks
 /.venv/
+/tachyon-dev
+/build_dev/
+/build_asan/

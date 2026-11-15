@@ -38,6 +38,7 @@ struct DLayer {
     DMat wqkv, wo, wgu, wdown, conv_in, conv_out, dn_in, dn_out, wgu_e, wdown_e;
     CUdeviceptr conv_w = 0, dn_conv = 0, dn_A = 0, dn_dt = 0, dn_norm = 0, router = 0, expert_bias = 0;
     CUdeviceptr kc = 0, vc = 0, ksc = 0, vsc = 0;   // KV cache (shared with kv_src for Gemma 4)
+    int kv_cap = 0;                                 // positions stored (ring of window + batch for sliding layers)
     CUdeviceptr st0 = 0, st1 = 0;                   // recurrent state (conv / delta net)
     DMat ple_gate, ple_out; CUdeviceptr ple_post_norm = 0;
     int in_rows() const { return c.is_attn() ? c.qkv_rows() : c.type == "conv" ? 3 * conv_in.cols : c.dn_in_rows(); }
@@ -220,7 +221,7 @@ public:
         if (src == dst || n <= 0) return;
         for (auto& L : layers_) {
             if (!L.c.is_attn() || L.c.kv_src >= 0) continue;
-            launch(f_kvcopy_, D3(L.c.n_kv_heads), D3(256), 0, L.kc, L.vc, src, dst, n, L.c.n_kv_heads, L.c.head_dim, opt.ctx, L.ksc, L.vsc);
+            launch(f_kvcopy_, D3(L.c.n_kv_heads), D3(256), 0, L.kc, L.vc, src, dst, std::min(n, L.kv_cap), L.c.n_kv_heads, L.c.head_dim, L.kv_cap, L.ksc, L.vsc);
         }
     }
 
@@ -407,16 +408,21 @@ private:
         cuMemGetInfo(&free_b, &total_b);
         const size_t kv_elt = opt.kv_int8 ? 1 : 2;
         size_t per_tok = 0, state_bytes = 0;
+        size_t ring_bytes = 0;  // sliding-window layers: fixed-size ring, independent of ctx
         for (auto& L : layers_) {
             const LayerCfg& lc = L.c;
-            if (lc.is_attn() && lc.kv_src < 0) per_tok += (size_t)lc.n_kv_heads * (lc.head_dim * kv_elt + (opt.kv_int8 ? 4 : 0)) * 2;
+            const size_t tokb = (size_t)lc.n_kv_heads * (lc.head_dim * kv_elt + (opt.kv_int8 ? 4 : 0)) * 2;
+            if (lc.is_attn() && lc.kv_src < 0) {
+                if (lc.window > 0) ring_bytes += tokb * (lc.window + opt.max_batch);
+                else per_tok += tokb;
+            }
             if (lc.type == "conv") state_bytes += (size_t)(lc.conv_k - 1) * c_.hidden * 4;
             if (lc.type == "deltanet") state_bytes += ((size_t)(lc.dn_conv - 1) * lc.dn_conv_dim() + (size_t)lc.dn_nv * lc.dn_dk * lc.dn_dv) * 4;
         }
         size_t act_bytes = 256ull << 20;
         size_t reserve = (512ull << 20) + opt.reserve_bytes;
         size_t avail = free_b > reserve + act_bytes ? free_b - reserve - act_bytes : 0;
-        const size_t st_total = state_bytes * opt.n_slots;
+        const size_t st_total = (state_bytes + ring_bytes) * opt.n_slots;
         avail = avail > st_total ? avail - st_total : 0;
         const size_t budget_tok = per_tok + opt.extra_kv_per_tok;
         if (budget_tok > 0) {
@@ -435,9 +441,10 @@ private:
             if (lc.is_attn()) {
                 if (lc.kv_src >= 0) {
                     const DLayer& S = layers_[lc.kv_src];
-                    L.kc = S.kc; L.vc = S.vc; L.ksc = S.ksc; L.vsc = S.vsc;
+                    L.kc = S.kc; L.vc = S.vc; L.ksc = S.ksc; L.vsc = S.vsc; L.kv_cap = S.kv_cap;
                 } else {
-                    size_t n = (size_t)opt.n_slots * lc.n_kv_heads * opt.ctx * lc.head_dim;
+                    L.kv_cap = lc.window > 0 ? std::min(opt.ctx, lc.window + opt.max_batch) : opt.ctx;
+                    size_t n = (size_t)opt.n_slots * lc.n_kv_heads * L.kv_cap * lc.head_dim;
                     L.kc = alloc(n * kv_elt); L.vc = alloc(n * kv_elt);
                     CU(cuMemsetD8Async(L.kc, 0, n * kv_elt, stream_));
                     CU(cuMemsetD8Async(L.vc, 0, n * kv_elt, stream_));
@@ -843,7 +850,7 @@ private:
         a.qout = qout; a.kc = L.kc; a.vc = L.vc; a.ksc = L.ksc; a.vsc = L.vsc;
         a.nrows = lc.qkv_rows(); a.nh = lc.n_heads; a.nkv = lc.n_kv_heads; a.qstride = lc.attn_gate ? 2 * lc.head_dim : lc.head_dim;
         a.qrows = lc.q_dim() * (lc.attn_gate ? 2 : 1); a.kvd = lc.kv_dim(); a.half = lc.rope_half;
-        a.qk_norm = lc.qk_norm == 1 ? 1 : 0; a.v_norm = lc.v_norm; a.k_eq_v = lc.k_eq_v; a.own_kv = lc.kv_src < 0; a.ctx = opt.ctx;
+        a.qk_norm = lc.qk_norm == 1 ? 1 : 0; a.v_norm = lc.v_norm; a.k_eq_v = lc.k_eq_v; a.own_kv = lc.kv_src < 0; a.ctx = L.kv_cap;
         const float scale = lc.attn_scale > 0 ? lc.attn_scale : 1.f / sqrtf((float)lc.head_dim);
         a.qscale = scale * sqrtf((float)lc.head_dim);  // attention kernels apply 1/sqrt(head_dim)
         (void)M;
@@ -862,7 +869,7 @@ private:
         a.part_o = part_o_; a.part_ml = part_ml_; a.counters = counters_;
         a.oq = oq; a.ods = ods; a.oh = oh;
         a.gate = lc.attn_gate ? proj_ : 0; a.ksc = L.ksc; a.vsc = L.vsc;
-        a.nh = lc.n_heads; a.nkv = lc.n_kv_heads; a.ctx = opt.ctx; a.window = lc.window;
+        a.nh = lc.n_heads; a.nkv = lc.n_kv_heads; a.ctx = L.kv_cap; a.window = lc.window;
         a.nrows = lc.qkv_rows(); a.qstride = lc.attn_gate ? 2 * lc.head_dim : lc.head_dim;
         return a;
     }
@@ -958,9 +965,9 @@ private:
         launch(f_route_, D3(M), D3(256), 0, x_, L.ffn_norm, L.router, lc.n_experts, K, lc.router == "sigmoid" ? 1 : 0,
                L.expert_bias, lc.norm_topk ? 1 : 0, lc.routed_scale, moe_ids_, moe_w_);
         launch(f_rms_q8_, D3(M), D3(256), 0, x_, L.ffn_norm, xq_, xds_);
-        launch(F(ind_name(L.wgu_e.t, H)), D3((2 * F_ + 7) / 8, P), D3(256), 0, L.wgu_e.d, L.wgu_e.s, 2 * F_, moe_ids_, K, xq_, xds_, proj_);
+        launch(F(ind_name(L.wgu_e.t, H)), D3((2 * F_ + 31) / 32, P), D3(256), 0, L.wgu_e.d, L.wgu_e.s, 2 * F_, moe_ids_, K, xq_, xds_, proj_);
         launch(f_actq_, D3(P), D3(256), 0, proj_, F_, fq_, fds_);
-        launch(F(ind_name(L.wdown_e.t, F_)), D3((H + 7) / 8, P), D3(256), 0, L.wdown_e.d, L.wdown_e.s, H, moe_ids_, 1, fq_, fds_, proj_);
+        launch(F(ind_name(L.wdown_e.t, F_)), D3((H + 31) / 32, P), D3(256), 0, L.wdown_e.d, L.wdown_e.s, H, moe_ids_, 1, fq_, fds_, proj_);
         launch(f_combine_, D3(M), D3(256), 0, proj_, moe_w_, K, tmp_);
         residual(M, tmp_, L.post_ffn_norm, lc.layer_scalar);
     }
@@ -1013,7 +1020,7 @@ private:
                     RopeArgs ra = rope_args(L, M, qh_);
                     launch(F(rope_name(lc.head_dim, 1)), D3(M, (lc.n_heads + lc.n_kv_heads + 3) / 4), D3(128), 0, ra);
                     launch(F(flash_name(lc.head_dim)), D3((M + 63) / 64, lc.n_heads), D3(128), 2 * 64 * (lc.head_dim + 8) * 2,
-                           qh_, L.kc, L.vc, hb_, M, p0, slot, lc.n_heads, lc.n_kv_heads, opt.ctx, lc.window,
+                           qh_, L.kc, L.vc, hb_, M, p0, slot, lc.n_heads, lc.n_kv_heads, L.kv_cap, lc.window,
                            (CUdeviceptr)(lc.attn_gate ? proj_ : 0), lc.qkv_rows(), lc.attn_gate ? 2 * lc.head_dim : lc.head_dim, L.ksc, L.vsc);
                 } else {
                     // large heads: decode-style attention for every prompt token (one split each), fp16 output

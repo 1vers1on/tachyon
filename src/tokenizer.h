@@ -33,6 +33,7 @@ public:
     bool thinking_model() const { return thinking_; }
     bool think_default() const { return think_default_; }
     const std::string& think_open_tag() const { return think_tag_open_; }
+    bool xml_tools() const { return tool_style_ == "xml"; }
     const std::string& think_close_tag() const { return think_tag_close_; }
     // generation prompt already opens a <think> block (model output starts inside reasoning)
     bool think_opens_in_prompt(bool enable_thinking) const { return thinking_ && think_open_ && enable_thinking; }
@@ -60,6 +61,7 @@ private:
     bool thinking_ = false;
     std::string chat_format_ = "chatml";
     std::string chat_prefix_;
+    std::string tool_style_ = "json";
     std::string think_tag_open_ = "<think>", think_tag_close_ = "</think>", think_system_token_;
     bool think_default_ = true, think_open_ = false, think_disable_block_ = true;
     bool spm_ = false;                 // SentencePiece-style BPE (Gemma)

@@ -140,6 +140,33 @@ std::string extract_tool_calls(const std::string& text, Json& calls) {
         std::string body = text.substr(a + 11, b == std::string::npos ? std::string::npos : b - a - 11);
         std::string err;
         Json j = Json::parse(body.substr(body.find_first_not_of(" \n\r\t") == std::string::npos ? 0 : body.find_first_not_of(" \n\r\t")), &err);
+        if (!err.empty()) {
+            // Qwen3.5 XML style: <function=NAME><parameter=K>\nV\n</parameter>...</function>
+            size_t f = body.find("<function=");
+            if (f != std::string::npos) {
+                size_t fe = body.find('>', f);
+                Json x = Json::object();
+                x.set("name", body.substr(f + 10, fe - f - 10));
+                Json args = Json::object();
+                size_t q = fe;
+                while ((q = body.find("<parameter=", q)) != std::string::npos) {
+                    size_t qe = body.find('>', q);
+                    std::string key = body.substr(q + 11, qe - q - 11);
+                    size_t ve = body.find("</parameter>", qe);
+                    std::string val = body.substr(qe + 1, ve == std::string::npos ? std::string::npos : ve - qe - 1);
+                    if (!val.empty() && val[0] == '\n') val.erase(0, 1);
+                    if (!val.empty() && val.back() == '\n') val.pop_back();
+                    std::string e2;
+                    Json pv = Json::parse(val, &e2);
+                    args.set(key, e2.empty() && !pv.is_str() ? pv : Json(val));
+                    if (ve == std::string::npos) break;
+                    q = ve;
+                }
+                x.set("arguments", args);
+                j = x;
+                err.clear();
+            }
+        }
         if (err.empty() && j.is_obj() && j.has("name")) {
             Json c = Json::object();
             static std::atomic<uint64_t> ctr{0};
@@ -349,8 +376,17 @@ private:
                         if (!firstc || !cm.content.empty()) cm.content += "\n";
                         firstc = false;
                         const Json& args = f["arguments"];
-                        cm.content += "<tool_call>\n{\"name\": \"" + f.get_str("name", "") + "\", \"arguments\": " +
-                                      (args.is_str() ? args.str : args.dump(-2)) + "}\n</tool_call>";
+                        if (e_.tok.xml_tools()) {
+                            std::string e2;
+                            Json av = args.is_str() ? Json::parse(args.str, &e2) : args;
+                            cm.content += "<tool_call>\n<function=" + f.get_str("name", "") + ">\n";
+                            for (auto& kv : av.obj)
+                                cm.content += "<parameter=" + kv.first + ">\n" + (kv.second.is_str() ? kv.second.str : kv.second.dump(-2)) + "\n</parameter>\n";
+                            cm.content += "</function>\n</tool_call>";
+                        } else {
+                            cm.content += "<tool_call>\n{\"name\": \"" + f.get_str("name", "") + "\", \"arguments\": " +
+                                          (args.is_str() ? args.str : args.dump(-2)) + "}\n</tool_call>";
+                        }
                     }
                 }
                 msgs.push_back(cm);

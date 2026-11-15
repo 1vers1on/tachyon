@@ -141,6 +141,9 @@ void Tokenizer::load(const ModelFile& mf) {
     think_tag_open_ = tj.get_str("think_tag_open", "<think>");
     think_tag_close_ = tj.get_str("think_tag_close", "</think>");
     think_system_token_ = tj.get_str("think_system_token", "");
+    tool_style_ = tj.get_str("tool_style", "");
+    if (tool_style_.empty())  // files converted before the flag existed: derive from the stored template
+        tool_style_ = tj.get_str("chat_template", "").find("<function=example_function_name>") != std::string::npos ? "xml" : "json";
     think_default_ = tj.get_bool("think_default", true);
     think_open_ = tj.get_bool("think_open", false);
     think_disable_block_ = tj.get_bool("think_disable_block", true);
@@ -423,7 +426,20 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
     int last_user = -1;
     for (int i = (int)msgs.size() - 1; i >= 0; i--) if (msgs[i].role == "user") { last_user = i; break; }
     size_t first = 0;
-    if (!tools.empty()) {
+    if (!tools.empty() && tool_style_ == "xml") {
+        // Qwen3.5 style: XML function calls, system prompt after the tool instructions
+        o += "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (auto& t : tools) o += "\n" + t;
+        o += "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
+             "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\n"
+             "This is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\n"
+             "Reminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within "
+             "<tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function "
+             "call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question "
+             "like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+        if (!msgs.empty() && msgs[0].role == "system") { o += "\n\n" + trim(msgs[0].content); first = 1; }
+        o += "<|im_end|>\n";
+    } else if (!tools.empty()) {
         o += "<|im_start|>system\n";
         if (!msgs.empty() && msgs[0].role == "system") { o += msgs[0].content + "\n\n"; first = 1; }
         o += "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"

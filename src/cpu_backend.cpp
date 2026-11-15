@@ -214,6 +214,7 @@ struct CLayer {
     QMat ple_gate, ple_out; const float* ple_post_norm = nullptr;
     std::vector<float> inv_freq;
     int kv = -1;          // index of the KV buffer used (own or shared)
+    int kv_cap = 0;       // positions stored (ring for sliding-window layers)
     int state = -1;       // index of the recurrent state buffer
 };
 
@@ -235,10 +236,11 @@ public:
             CLayer& L = layers_[l];
             const LayerCfg& lc = L.c;
             if (lc.is_attn()) {
-                if (lc.kv_src >= 0) { L.kv = layers_[lc.kv_src].kv; }
+                if (lc.kv_src >= 0) { L.kv = layers_[lc.kv_src].kv; L.kv_cap = layers_[lc.kv_src].kv_cap; }
                 else {
                     L.kv = (int)kc_.size();
-                    size_t n = (size_t)opt.n_slots * lc.n_kv_heads * opt.ctx * lc.head_dim;
+                    L.kv_cap = lc.window > 0 ? std::min(opt.ctx, lc.window + opt.max_batch) : opt.ctx;
+                    size_t n = (size_t)opt.n_slots * lc.n_kv_heads * L.kv_cap * lc.head_dim;
                     kc_.emplace_back(n, 0); vc_.emplace_back(n, 0);
                     kv_bytes += n * 4;
                 }
@@ -347,9 +349,10 @@ public:
         for (int l = 0; l < c_.n_layers; l++) {
             const CLayer& L = layers_[l];
             if (!L.c.is_attn() || L.c.kv_src >= 0) continue;
+            const int nn = std::min(n, L.kv_cap);
             for (int h = 0; h < L.c.n_kv_heads; h++) {
-                memcpy(kv_ptr(L, kc_, dst, h, 0), kv_ptr(L, kc_, src, h, 0), (size_t)n * L.c.head_dim * 2);
-                memcpy(kv_ptr(L, vc_, dst, h, 0), kv_ptr(L, vc_, src, h, 0), (size_t)n * L.c.head_dim * 2);
+                memcpy(kv_ptr(L, kc_, dst, h, 0), kv_ptr(L, kc_, src, h, 0), (size_t)nn * L.c.head_dim * 2);
+                memcpy(kv_ptr(L, vc_, dst, h, 0), kv_ptr(L, vc_, src, h, 0), (size_t)nn * L.c.head_dim * 2);
             }
         }
     }
@@ -357,7 +360,7 @@ public:
 private:
     uint16_t* kv_ptr(const CLayer& L, std::vector<std::vector<uint16_t>>& c, int slot, int h, int pos) {
         const LayerCfg& lc = L.c;
-        return c[L.kv].data() + (((size_t)slot * lc.n_kv_heads + h) * opt.ctx + pos) * lc.head_dim;
+        return c[L.kv].data() + (((size_t)slot * lc.n_kv_heads + h) * L.kv_cap + pos % L.kv_cap) * lc.head_dim;
     }
 
     void reset_state(int slot) {
@@ -475,7 +478,7 @@ private:
                 float mx = -INFINITY;
                 for (int t = t0; t <= pos; t++) {
                     float s = 0;
-                    const uint16_t* kr = kb + (size_t)t * hd;
+                    const uint16_t* kr = kb + (size_t)(t % L.kv_cap) * hd;
                     for (int i = 0; i < hd; i++) s += q[i] * h2f(kr[i]);
                     sc[t] = s;
                     mx = std::max(mx, s);
@@ -487,7 +490,7 @@ private:
                 for (int i = 0; i < hd; i++) o[i] = 0;
                 for (int t = t0; t <= pos; t++) {
                     float p = sc[t] * inv;
-                    const uint16_t* vr = vb + (size_t)t * hd;
+                    const uint16_t* vr = vb + (size_t)(t % L.kv_cap) * hd;
                     for (int i = 0; i < hd; i++) o[i] += p * h2f(vr[i]);
                 }
                 if (lc.attn_gate) {

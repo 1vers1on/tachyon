@@ -493,7 +493,7 @@ __global__ void __launch_bounds__(128) rope_t(const RopeArgs a) {
         for (int e = 0; e < E; e++) vv[e] *= sc;
     }
     const int slot = a.slot[m];
-    const size_t si = kv_sindex(slot, a.nkv, kvh, a.ctx, pos);
+    const size_t si = kv_sindex(slot, a.nkv, kvh, a.ctx, pos % a.ctx);  // ctx = ring capacity for sliding layers
     const size_t base = si * HD;
 #if KV8
     float ka = 0.f, va = 0.f;
@@ -589,9 +589,10 @@ __global__ void __launch_bounds__(128) flash_prefill(const half* __restrict__ Q,
             const bool ok = kv0 + r < n_kv;
             half2 hk[8], hv[8];
             if (ok) {
-                const uint4 rk = *(const uint4*)(kb + (size_t)(kv0 + r) * HD + col);
-                const uint4 rv = *(const uint4*)(vb + (size_t)(kv0 + r) * HD + col);
-                const float sk = ksb[kv0 + r], sv = vsb[kv0 + r];
+                const int pr = (kv0 + r) % ctx;
+                const uint4 rk = *(const uint4*)(kb + (size_t)pr * HD + col);
+                const uint4 rv = *(const uint4*)(vb + (size_t)pr * HD + col);
+                const float sk = ksb[pr], sv = vsb[pr];
                 const int8_t* bk = (const int8_t*)&rk;
                 const int8_t* bv = (const int8_t*)&rv;
 #pragma unroll
@@ -612,7 +613,7 @@ __global__ void __launch_bounds__(128) flash_prefill(const half* __restrict__ Q,
         for (int c = threadIdx.x; c < FKV * HD / 8; c += 128) {
             const int r = c / (HD / 8), col = (c % (HD / 8)) * 8;
             const bool ok = kv0 + r < n_kv;
-            const size_t off = (size_t)(ok ? kv0 + r : 0) * HD + col;
+            const size_t off = (size_t)(ok ? (kv0 + r) % ctx : 0) * HD + col;
             cp_async16(Ks + r * FLD + col, kb + off, ok);
             cp_async16(Vs + r * FLD + col, vb + off, ok);
         }
@@ -994,7 +995,7 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
         for (int t0 = start; t0 < end; t0 += ATILE) {
             const int p = t0 + tid;
             if (p < end) {
-                const uint4* kr = (const uint4*)(kb + (size_t)p * HD);
+                const uint4* kr = (const uint4*)(kb + (size_t)(p % a.ctx) * HD);
                 float sc_[GQA];
 #pragma unroll
                 for (int g = 0; g < GQA; g++) sc_[g] = 0.f;
@@ -1010,7 +1011,7 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
                         for (int g = 0; g < GQA; g++) sc_[g] += qs[g][c * 16 + j] * f;
                     }
                 }
-                const float ks = ksb[p];
+                const float ks = ksb[p % a.ctx];
 #pragma unroll
                 for (int g = 0; g < GQA; g++) sc_[g] *= ks;
 #else
@@ -1056,13 +1057,13 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
             for (int i = pg; i < nt; i += PG) {
                 float vv[8];
 #if KV8
-                const uint2 raw = *(const uint2*)(vb + (size_t)(t0 + i) * HD + dq * 8);
+                const uint2 raw = *(const uint2*)(vb + (size_t)((t0 + i) % a.ctx) * HD + dq * 8);
                 const int8_t* b8 = (const int8_t*)&raw;
-                const float vsc_i = vsb[t0 + i];
+                const float vsc_i = vsb[(t0 + i) % a.ctx];
 #pragma unroll
                 for (int j = 0; j < 8; j++) vv[j] = (float)b8[j];
 #else
-                const uint4 raw = *(const uint4*)(vb + (size_t)(t0 + i) * HD + dq * 8);
+                const uint4 raw = *(const uint4*)(vb + (size_t)((t0 + i) % a.ctx) * HD + dq * 8);
                 const half2* h = (const half2*)&raw;
                 const float vsc_i = 1.f;
 #pragma unroll
@@ -1572,35 +1573,54 @@ extern "C" __global__ void __launch_bounds__(256) moe_route(const float* __restr
         if (lane == 0) lg[e] = acc;
     }
     __syncthreads();
-    if (tid == 0) {
-        float p[256], score[256];
-        if (sigmoid_mode) {
-            for (int e = 0; e < E; e++) p[e] = 1.f / (1.f + __expf(-lg[e]));
-        } else {
-            float mx = -INFINITY, sum = 0;
-            for (int e = 0; e < E; e++) mx = fmaxf(mx, lg[e]);
-            for (int e = 0; e < E; e++) { p[e] = __expf(lg[e] - mx); sum += p[e]; }
-            for (int e = 0; e < E; e++) p[e] /= sum;
+    // warp 0: probabilities, then K rounds of warp-wide argmax (E <= 256: 8 experts per lane)
+    if (warp == 0) {
+        float pv[8], sv[8];
+        float mx = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 8; i++) { const int e = lane + 32 * i; pv[i] = e < E ? lg[e] : -INFINITY; mx = fmaxf(mx, pv[i]); }
+        mx = warp_max(mx);
+        float sum = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int e = lane + 32 * i;
+            if (e < E) pv[i] = sigmoid_mode ? 1.f / (1.f + __expf(-pv[i])) : __expf(pv[i] - mx);
+            else pv[i] = 0.f;
+            sum += pv[i];
         }
-        for (int e = 0; e < E; e++) score[e] = p[e] + (bias ? bias[e] : 0.f);
-        float tot = 0;
+        sum = warp_sum(sum);
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int e = lane + 32 * i;
+            if (!sigmoid_mode) pv[i] /= sum;
+            sv[i] = e < E ? pv[i] + (bias ? bias[e] : 0.f) : -INFINITY;
+        }
+        float tot = 0.f, selp[16];
         int sel[16];
         for (int k = 0; k < K; k++) {
-            int best = -1;
-            for (int e = 0; e < E; e++) {
-                bool used = false;
-                for (int q = 0; q < k; q++) used |= sel[q] == e;
-                if (!used && (best < 0 || score[e] > score[best])) best = e;
+            float bv = -INFINITY; int bi = 0x7fffffff; float bp = 0.f;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int e = lane + 32 * i;
+                if (sv[i] > bv) { bv = sv[i]; bi = e; bp = pv[i]; }
             }
-            sel[k] = best;
-            tot += p[best];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffff, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+                const float op = __shfl_xor_sync(0xffffffff, bp, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; bp = op; }
+            }
+            sel[k] = bi; selp[k] = bp; tot += bp;
+            if ((bi & 31) == lane) sv[bi >> 5] = -INFINITY;
         }
-        for (int k = 0; k < K; k++) {
-            float w = p[sel[k]];
-            if (norm_topk) w /= (tot + (sigmoid_mode ? 1e-6f : 0.f));
-            ids[m * K + k] = sel[k];
-            wts[m * K + k] = w * scale;
-        }
+        if (lane == 0)
+            for (int k = 0; k < K; k++) {
+                float w = selp[k];
+                if (norm_topk) w /= (tot + (sigmoid_mode ? 1e-6f : 0.f));
+                ids[m * K + k] = sel[k];
+                wts[m * K + k] = w * scale;
+            }
     }
 }
 
@@ -1609,16 +1629,24 @@ extern "C" __global__ void __launch_bounds__(256) moe_route(const float* __restr
 template <int QT, int K>
 __global__ void __launch_bounds__(256) gemv_ind(const uint8_t* __restrict__ W, const void* __restrict__ S, int N, const int* __restrict__ ids,
                                                 int act_div, const int8_t* __restrict__ xq, const float2* __restrict__ xds, float* __restrict__ y) {
+    constexpr int R = 4;  // rows per warp (more independent loads in flight)
     const int p = blockIdx.y;
-    const int row = blockIdx.x * 8 + threadIdx.x / 32;
+    const int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R;
     const int lane = threadIdx.x % 32;
-    if (row >= N) return;
+    if (row0 >= N) return;
     const int e = ids[p];
     const int arow = p / act_div;
-    float acc[1] = {0.f};
-    row_dot<QT, K, 1>(W, S, e * N + row, xq + (size_t)arow * K, xds + (size_t)arow * (K / 32), acc);
-    const float v = warp_sum(acc[0]);
-    if (lane == 0) y[(size_t)p * N + row] = v;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r] = 0.f;
+        if (row0 + r < N) row_dot<QT, K, 1>(W, S, e * N + row0 + r, xq + (size_t)arow * K, xds + (size_t)arow * (K / 32), &acc[r]);
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float v = warp_sum(acc[r]);
+        if (lane == 0 && row0 + r < N) y[(size_t)p * N + row0 + r] = v;
+    }
 }
 
 // gate/up pairs [P][2F] (interleaved rows) -> act(g)*u quantized to int8 [P][F]. grid P, block 256

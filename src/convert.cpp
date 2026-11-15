@@ -207,6 +207,7 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
         t.set("think_disable_block", false);
     }
     if (chat_template.find("<|think|>") != std::string::npos) t.set("think_system_token", "<|think|>");
+    if (chat_template.find("<function=example_function_name>") != std::string::npos) t.set("tool_style", "xml");
     // templates that emit the BOS token text themselves
     const bool emits_bos = chat_template.find("{{ bos_token") != std::string::npos || chat_template.find("{{- bos_token") != std::string::npos;
     if (emits_bos && !tc.get_bool("add_bos_token", false)) {

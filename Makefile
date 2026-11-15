@@ -7,7 +7,8 @@ CXXFLAGS ?= $(OPT) -std=gnu++23 -g -Wall -Wno-unused-function -Wno-sign-compare 
 INCS     := -I$(CUDA)/include -Isrc
 LDCUDA   := -L$(CUDA)/lib64 -L/usr/lib/wsl/lib -Wl,-rpath,$(CUDA)/lib64 -Wl,-rpath,/usr/lib/wsl/lib -lcuda -lnvrtc
 
-BUILD := build
+BUILD ?= build
+OUT ?= tachyon
 CORE_SRCS := src/json.cpp src/model_file.cpp src/safetensors.cpp src/quant.cpp src/convert.cpp src/tokenizer.cpp \
              src/cpu_backend.cpp src/cuda_backend.cpp src/sampler.cpp src/engine.cpp src/server.cpp src/main.cpp
 CORE_OBJS := $(CORE_SRCS:src/%.cpp=$(BUILD)/%.o)
@@ -18,8 +19,15 @@ $(BUILD)/%.o: src/%.cpp src/*.h src/kernels/*.cu
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) $(INCS) -MMD -c $< -o $@
 
+tachyon: $(OUT)
+
+ifneq ($(OUT),tachyon)
+$(OUT): $(CORE_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDCUDA)
+else
 tachyon: $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDCUDA)
+endif
 
 tachyon-client: $(BUILD)/client.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
