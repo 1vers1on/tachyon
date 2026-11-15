@@ -70,6 +70,7 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
     }
     slots_.resize(opt.backend.n_slots);
     logits_buf_.resize(be->vocab());
+    for (auto& l : mf.config.layers) if (l.n_experts) spec_min_accept_ = 0.2f;
 }
 
 void Engine::start() {
@@ -161,6 +162,7 @@ void Engine::admit() {
         s.dec = std::make_unique<StreamDecoder>(&tok);
         s.pending_text.clear();
         s.spec_k = opt.spec_draft;
+        s.acc_ema = 0.7f; s.spec_pause = 0;
         s.spec_miss = 0;
         r->n_prompt = (int)r->prompt.size();
         r->n_cached = keep;
@@ -356,6 +358,7 @@ bool Engine::step() {
         cap = std::min(cap, opt.backend.ctx - pos - 2);
         cap = std::min(cap, s.req->max_tokens - s.req->n_gen - 1);
         int k = std::min(s.spec_k, cap);
+        if (s.spec_pause > 0) { s.spec_pause--; k = 0; }
         if (k > 0) ngram_drafts[si] = draft_ngram(s, k, dbe ? 2 : 1);
         // the draft model only pays off when few streams are active (batching already fills the GPU otherwise)
         if (ngram_drafts[si].empty() && dbe && n_active <= 2 && std::min(s.dk, cap) > 0) need_model.push_back({si, std::min(s.dk, cap)});
@@ -438,6 +441,8 @@ bool Engine::step() {
             if (accepted == nd) s.dk = std::min(s.dk + 1, 7);
             else if (accepted * 2 < nd) s.dk = std::max(s.dk - 1, 1);
         } else if (nd > 0) {
+            s.acc_ema = 0.8f * s.acc_ema + 0.2f * accepted / nd;
+            if (s.acc_ema < spec_min_accept_) { s.spec_pause = 16; s.acc_ema = spec_min_accept_; }
             if (accepted == 0) { if (++s.spec_miss >= 4 && s.spec_k > 1) { s.spec_k--; s.spec_miss = 0; } }
             else { s.spec_miss = 0; if (accepted == nd && s.spec_k < 8 && s.spec_k < opt.spec_draft * 2) s.spec_k++; }
         }

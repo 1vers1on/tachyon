@@ -2244,6 +2244,78 @@ __global__ void __launch_bounds__(256) gemv_ind(const uint8_t* __restrict__ W, c
     }
 }
 
+// Grouped expert GEMV for decode batches: CTA (row tile, expert e) collects the (token, expert) pairs routed to e and
+// streams each weight row once for all of them (a token selects an expert at most once, so <= 16 pairs).
+// y[p][row] = W_e[row] . act[p / act_div]. grid (ceil(N/32), E), block 256 (8 warps x 4 rows)
+template <int QT, int K>
+__global__ void __launch_bounds__(256) gemv_grp(const uint8_t* __restrict__ W, const void* __restrict__ S, int N, const int* __restrict__ ids,
+                                                int P, int act_div, const int8_t* __restrict__ xq, const float2* __restrict__ xds,
+                                                float* __restrict__ y) {
+    constexpr int R = 4, MP = 16, NB = K / 32, IT = (NB + 31) / 32;
+    const int e = blockIdx.y;
+    __shared__ int plist[MP];
+    __shared__ int pcnt;
+    if (threadIdx.x < 32) {
+        int c = 0;
+        for (int p0 = 0; p0 < P; p0 += 32) {
+            const int p = p0 + threadIdx.x;
+            const bool hit = p < P && ids[p] == e;
+            const unsigned m = __ballot_sync(0xffffffff, hit);
+            if (hit) { const int slot = c + __popc(m & ((1u << threadIdx.x) - 1)); if (slot < MP) plist[slot] = p; }
+            c += __popc(m);
+        }
+        if (threadIdx.x == 0) pcnt = min(c, MP);
+    }
+    __syncthreads();
+    const int cnt = pcnt;
+    if (cnt == 0) return;
+    const int lane = threadIdx.x % 32;
+    const int row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R;
+    if (row0 >= N) return;
+    for (int r = 0; r < R; r++) {
+        const int row = row0 + r;
+        if (row >= N) break;
+        const size_t wr = (size_t)e * N + row;
+        float acc[MP];
+#pragma unroll
+        for (int j = 0; j < MP; j++) acc[j] = 0.f;
+#pragma unroll
+        for (int it = 0; it < IT; it++) {
+            const int b = it * 32 + lane;
+            if (NB % 32 != 0 && b >= NB) break;
+            uint4 w, w1; float sc, mn = 0.f;
+            if constexpr (QT == QT_Q4) {
+                w = ld_stream(W + wr * (K / 2) + b * 16);
+                const half2 sm = ((const half2*)S)[wr * (K / 64) + b / 2]; sc = __low2float(sm); mn = __high2float(sm);
+            } else if constexpr (QT == QT_Q3) {
+                const uint32_t* p3 = (const uint32_t*)(W + wr * (K * 3 / 8) + b * 12);
+                w.x = __ldg(p3); w.y = __ldg(p3 + 1); w.z = __ldg(p3 + 2);
+                const half2 sm = ((const half2*)S)[wr * (K / 64) + b / 2]; sc = __low2float(sm); mn = __high2float(sm);
+            } else {
+                w = ld_stream(W + wr * K + b * 32); w1 = ld_stream(W + wr * K + b * 32 + 16);
+                sc = __half2float(((const half*)S)[wr * NB + b]);
+            }
+#pragma unroll
+            for (int j = 0; j < MP; j++) {
+                if (j >= cnt) break;
+                const int arow = plist[j] / act_div;
+                const int4* xp = (const int4*)(xq + (size_t)arow * K + b * 32);
+                const int4 a0 = xp[0], a1 = xp[1];
+                const float2 d = xds[(size_t)arow * NB + b];
+                if constexpr (QT == QT_Q4) acc[j] += sc * d.x * (float)dot_q4_blk(w, a0, a1) + mn * d.y;
+                else if constexpr (QT == QT_Q3) acc[j] += sc * d.x * (float)dot_q3_blk(w.x, w.y, w.z, a0, a1) + mn * d.y;
+                else acc[j] += sc * d.x * (float)dot_q8_blk(w, w1, a0, a1);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < MP; j++) {
+            if (j >= cnt) break;
+            const float v = warp_sum(acc[j]);
+            if (lane == 0) y[(size_t)plist[j] * N + row] = v;
+        }
+    }
+}
+
 // gate/up pairs [P][2F] (interleaved rows) -> act(g)*u quantized to int8 [P][F]. grid P, block 256
 extern "C" __global__ void __launch_bounds__(256) act_quant(const float* __restrict__ gu, int F, int8_t* __restrict__ q, float2* __restrict__ ds) {
     const int p = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;

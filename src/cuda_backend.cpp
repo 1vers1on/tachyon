@@ -730,6 +730,7 @@ private:
     std::string tc_name(QType t, int K, int epi) { return "gemv_tc<" + I(qt_code(t)) + "," + I(K) + "," + I(epi) + ">"; }
     std::string gemm_name(QType t, int epi) { return "gemm<" + I(qt_code(t)) + "," + I(epi) + ">"; }
     std::string ind_name(QType t, int K) { return "gemv_ind<" + I(qt_code(t)) + "," + I(K) + ">"; }
+    std::string grp_name(QType t, int K) { return "gemv_grp<" + I(qt_code(t)) + "," + I(K) + ">"; }
     std::string rope_name(int hd, int f16) { return "rope_t<" + I(hd) + "," + I(f16) + ">"; }
     std::string attn_name(int hd, int g, int splits, int f16) { return "attn_decode<" + I(hd) + "," + I(g) + "," + I(splits) + "," + I(f16) + ">"; }
     // query heads per attention CTA: largest divisor of the GQA ratio that is <= 4
@@ -807,6 +808,8 @@ private:
             if (lc.n_experts) {
                 names.insert(ind_name(L.wgu_e.t, L.wgu_e.cols));
                 names.insert(ind_name(L.wdown_e.t, L.wdown_e.cols));
+                names.insert(grp_name(L.wgu_e.t, L.wgu_e.cols));
+                names.insert(grp_name(L.wdown_e.t, L.wdown_e.cols));
                 names.insert(gemm_name(L.wgu_e.t, 2));
                 names.insert(gemm_name(L.wdown_e.t, 0));
             } else if (lc.ffn) {
@@ -955,6 +958,7 @@ private:
         return epi == 2 ? W.rows % 64 == 0 : W.rows % 16 == 0;
     }
     bool no_mma_ = getenv("TACH_NO_MMA") != nullptr;
+    bool no_moe_grp_ = getenv("TACH_NO_MOE_GRP") != nullptr;   // decode MoE: per-pair GEMVs instead of grouped
     // debug: TACH_NO_FLASH_WIDE=1 runs wide heads through the scalar per-token attention (reference path)
     static bool no_flash_wide(int hd) { static const bool off = getenv("TACH_NO_FLASH_WIDE") != nullptr; return off && hd > 128; }
 
@@ -1315,9 +1319,15 @@ private:
         launch(f_route_, D3(M), D3(256), 0, x_, L.ffn_norm, L.router, lc.n_experts, K, lc.router == "sigmoid" ? 1 : 0,
                L.expert_bias, lc.norm_topk ? 1 : 0, lc.routed_scale, moe_ids_, moe_w_);
         launch(f_rms_q8_, D3(M), D3(256), 0, x_, L.ffn_norm, xq_, xds_);
-        launch(F(ind_name(L.wgu_e.t, H)), D3((2 * F_ + 31) / 32, P), D3(256), 0, L.wgu_e.d, L.wgu_e.s, 2 * F_, moe_ids_, K, xq_, xds_, proj_);
-        launch(f_actq_, D3(P), D3(256), 0, proj_, F_, fq_, fds_);
-        launch(F(ind_name(L.wdown_e.t, F_)), D3((H + 31) / 32, P), D3(256), 0, L.wdown_e.d, L.wdown_e.s, H, moe_ids_, 1, fq_, fds_, proj_);
+        if (M > 1 && !no_moe_grp_) {   // several tokens: stream each used expert once for all its tokens
+            launch(F(grp_name(L.wgu_e.t, H)), D3((2 * F_ + 31) / 32, lc.n_experts), D3(256), 0, L.wgu_e.d, L.wgu_e.s, 2 * F_, moe_ids_, P, K, xq_, xds_, proj_);
+            launch(f_actq_, D3(P), D3(256), 0, proj_, F_, fq_, fds_);
+            launch(F(grp_name(L.wdown_e.t, F_)), D3((H + 31) / 32, lc.n_experts), D3(256), 0, L.wdown_e.d, L.wdown_e.s, H, moe_ids_, P, 1, fq_, fds_, proj_);
+        } else {
+            launch(F(ind_name(L.wgu_e.t, H)), D3((2 * F_ + 31) / 32, P), D3(256), 0, L.wgu_e.d, L.wgu_e.s, 2 * F_, moe_ids_, K, xq_, xds_, proj_);
+            launch(f_actq_, D3(P), D3(256), 0, proj_, F_, fq_, fds_);
+            launch(F(ind_name(L.wdown_e.t, F_)), D3((H + 31) / 32, P), D3(256), 0, L.wdown_e.d, L.wdown_e.s, H, moe_ids_, 1, fq_, fds_, proj_);
+        }
         launch(f_combine_, D3(M), D3(256), 0, proj_, moe_w_, K, tmp_);
         residual(M, tmp_, L.post_ffn_norm, lc.layer_scalar);
     }

@@ -83,6 +83,8 @@ private:
         std::vector<int> dcache;  // tokens whose KV is valid in the draft model's slot
         int dk = 0;               // current draft-model depth
         int dsaved = -1;          // stateful draft model: dcache length at its last state backup
+        float acc_ema = 0.5f;     // n-gram draft acceptance (moving average)
+        int spec_pause = 0;       // decode steps left without n-gram drafts (low acceptance on costly models)
         int spec_miss = 0;
         double last_used = 0;
     };
@@ -101,4 +103,5 @@ private:
     std::thread th_;
     bool running_ = false;
     std::vector<float> logits_buf_;
+    float spec_min_accept_ = 0.f;  // MoE: extra tokens are expensive, pause n-gram drafting below this acceptance
 };
