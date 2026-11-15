@@ -315,6 +315,14 @@ public:
             } else {
                 residual_add(M, L.post_ffn_norm, L.c.layer_scalar);
             }
+            if (getenv("TACH_DUMP_X")) {  // debug: residual after each layer -> $TACH_DUMP_X.<layer> (fp32 [M][H]); tools/hf_compare.py
+                float m0 = 0, m1 = 0;
+                for (int i = 0; i < H; i++) m0 = std::max(m0, fabsf(x_[i]));
+                for (size_t i = H; i < (size_t)M * H; i++) m1 = std::max(m1, fabsf(x_[i]));
+                fprintf(stderr, "[dump] layer %d out: row0 %.1f rest %.1f\n", l, m0, m1);
+                std::string fn = std::string(getenv("TACH_DUMP_X")) + "." + std::to_string(l);
+                if (FILE* f = fopen(fn.c_str(), "wb")) { fwrite(x_.data(), 4, (size_t)M * H, f); fclose(f); }
+            }
         }
         // final norm + lm head, only for rows that want logits
         std::vector<int> rows;

@@ -51,9 +51,9 @@ private:
     std::unordered_map<std::string, int> tok2id_;
     std::unordered_map<uint64_t, std::pair<int, int>> merges_;  // (a<<32|b) -> (rank, merged)
     int byte_tok_[256];
-    struct Special { std::string s; int id; };
+    struct Special { std::string s; int id; bool special = true; };
     std::vector<Special> specials_;  // sorted by length desc
-    bool special_first_[256] = {};   // first bytes of added tokens (fast skip)
+    std::vector<int> by_first_[256]; // indices into specials_ by first byte (length desc)
     std::string pretok_ = "qwen2";
     std::vector<int> eos_;
     int bos_ = -1;

@@ -919,6 +919,7 @@ private:
         const int H = c_.hidden, D = c_.ple_dim, NL = c_.n_layers, W = NL * D;
         if (prefill) {
             launch(f_tof16_, D3(256), D3(256), 0, x_, ha_, (size_t)M * H);
+            if (g_imatrix) imat_acc("ple_proj", ha_, M, H);
             gemm(ple_proj_, ha_, M, ple_tmp_, 0, 0);
         } else {
             launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
@@ -932,9 +933,12 @@ private:
         const int H = c_.hidden, D = c_.ple_dim, W = c_.n_layers * D;
         if (prefill) {
             launch(f_tof16_, D3(256), D3(256), 0, x_, ha_, (size_t)M * H);
+            const std::string bp = "blk." + std::to_string(l) + ".";
+            if (g_imatrix) imat_acc(bp + "ple_gate", ha_, M, H);
             gemm(L.ple_gate, ha_, M, proj_, 0, 0);
             launch(f_plemul_, D3(M), D3(D), 0, proj_, ple_buf_, l, D, W);
             launch(f_tof16_, D3(64), D3(256), 0, proj_, hb_, (size_t)M * D);
+            if (g_imatrix) imat_acc(bp + "ple_out", hb_, M, D);
             gemm(L.ple_out, hb_, M, tmp_, 0, 0);
         } else {
             launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
@@ -1073,6 +1077,7 @@ private:
                 if (g_imatrix) imat_acc(bp + "wo", hb_, M, qd);
                 gemm(L.wo, hb_, M, dadd ? x_ : tmp_, 0, dadd ? 1 : 0);
             } else if (lc.type == "conv") {
+                if (g_imatrix) imat_acc(bp + "conv_in", ha_, M, H);
                 gemm(L.conv_in, ha_, M, proj_, 0, 0);
                 if (conv_par_ok(lc)) {
                     const CUdeviceptr st = L.st0 + (size_t)slot * (lc.conv_k - 1) * H * 4;
@@ -1083,9 +1088,11 @@ private:
                            pos_ptr(), slot_ptr(), M, tmp_);
                 }
                 launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * H);
+                if (g_imatrix) imat_acc(bp + "conv_out", hb_, M, H);
                 gemm(L.conv_out, hb_, M, dadd ? x_ : tmp_, 0, dadd ? 1 : 0);
             } else {
                 const int R = lc.dn_in_rows(), CD = lc.dn_conv_dim(), VD = lc.dn_val_dim();
+                if (g_imatrix) imat_acc(bp + "dn_in", ha_, M, H);
                 gemm(L.dn_in, ha_, M, proj_, 0, 0);
                 if (dn_chunk_ok(lc)) {
                     const int NV = lc.dn_nv, DK = lc.dn_dk, DV = lc.dn_dv, nch = (M + DN_CHUNK - 1) / DN_CHUNK;
@@ -1103,6 +1110,7 @@ private:
                            L.dn_norm, L.st1, pos_ptr(), slot_ptr(), M, tmp_);
                     launch(f_tof16_, D3(256), D3(256), 0, tmp_, hb_, (size_t)M * VD);
                 }
+                if (g_imatrix) imat_acc(bp + "dn_out", hb_, M, VD);
                 gemm(L.dn_out, hb_, M, dadd ? x_ : tmp_, 0, dadd ? 1 : 0);
             }
             if (!dadd) residual(M, tmp_, L.post_attn_norm, 1.f);
@@ -1111,7 +1119,7 @@ private:
             const float fscalar = c_.ple_dim ? 1.f : lc.layer_scalar;
             launch(f_rms_f16_, D3(M), D3(256), 0, x_, L.ffn_norm, ha_);
             if (lc.n_experts) {
-                moe_prefill(L, M);
+                moe_prefill(L, M, bp);
             } else if (lc.ffn) {
                 if (g_imatrix) imat_acc(bp + "wgu", ha_, M, H);
                 gemm(L.wgu, ha_, M, 0, hb_, 2);
@@ -1129,7 +1137,7 @@ private:
     }
 
     // MoE prefill: route on the GPU, group (token, expert) pairs by expert on the host, run one GEMM per expert.
-    void moe_prefill(const DLayer& L, int M) {
+    void moe_prefill(const DLayer& L, int M, const std::string& bp) {
         const LayerCfg& lc = L.c;
         const int H = c_.hidden, F_ = lc.expert_ffn, K = lc.top_k, E = lc.n_experts;
         launch(f_route_, D3(M), D3(256), 0, x_, L.ffn_norm, L.router, E, K, lc.router == "sigmoid" ? 1 : 0,
@@ -1158,6 +1166,7 @@ private:
         const size_t gu_bytes = (size_t)off * F_ * 2;
         CUdeviceptr act = ha_ + 0;  // reuse ha_ after gather: [pairs][F] fp16 (ha_ is sized for pairs x max K)
         (void)gu_bytes;
+        if (g_imatrix) imat_acc(bp + "wgu_e", hb_, off, H);   // all routed (token, expert) rows; experts share columns
         for (int e = 0; e < E; e++) {
             const int n = spans[e].second;
             if (!n) continue;
@@ -1170,6 +1179,7 @@ private:
             const int o = spans[e].first;
             gemm(L.wdown_e, act + (size_t)o * F_ * 2, n, proj_ + (size_t)o * H * 4, 0, 0, 0, e * H, H);
         }
+        if (g_imatrix) imat_acc(bp + "wdown_e", act, off, F_);
         launch(f_scatter_, D3(off), D3(256), 0, proj_, moe_rows_, moe_rw_, H, tmp_);
         residual(M, tmp_, L.post_ffn_norm, lc.layer_scalar);
     }

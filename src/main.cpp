@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
         // perplexity over a text file: independent windows of `ctx_win` tokens, scored in chunks of 64
         auto ids = e.tok.encode(a.prompt, false);
         // models that expect <bos> (Gemma) get it at position 0 of every window (replacing that token)
-        const int bos = e.tok.add_bos() ? e.tok.bos() : -1;
+        const int bos = e.tok.add_bos() && !getenv("TACH_PPL_NOBOS") ? e.tok.bos() : -1;
         if (bos >= 0 && !ids.empty() && ids[0] == bos) ids.erase(ids.begin());
         int win = std::min(a.prompt_len > 0 ? a.prompt_len : 512, e.opt.backend.ctx);
         int V = e.be->vocab();
@@ -305,6 +305,7 @@ int main(int argc, char** argv) {
                     double se = 0;
                     for (float v : lg) se += exp(v - mx);
                     nll += -(lg[ids[st + p + 1]] - mx - log(se));
+                    if (getenv("TACH_PPL_DUMP")) fprintf(stderr, "[nll] w%d p%d tok%d %.4f\n", nwin, p, ids[st + p + 1], -(lg[ids[st + p + 1]] - mx - log(se)));
                     cnt++;
                 }
             }

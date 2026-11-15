@@ -128,9 +128,9 @@ void Tokenizer::load(const ModelFile& mf) {
         uint64_t key = ((uint64_t)(uint32_t)m[3 * i] << 32) | (uint32_t)m[3 * i + 1];
         merges_.emplace(key, std::make_pair((int)i, (int)m[3 * i + 2]));
     }
-    for (auto& s : tj["specials"].arr) specials_.push_back({s.get_str("content", ""), (int)s.get_int("id", -1)});
-    std::sort(specials_.begin(), specials_.end(), [](const Special& a, const Special& b) { return a.s.size() > b.s.size(); });
-    for (auto& sp : specials_) if (!sp.s.empty()) special_first_[(unsigned char)sp.s[0]] = true;
+    for (auto& s : tj["specials"].arr) specials_.push_back({s.get_str("content", ""), (int)s.get_int("id", -1), s.get_bool("special", true)});
+    std::stable_sort(specials_.begin(), specials_.end(), [](const Special& a, const Special& b) { return a.s.size() > b.s.size(); });
+    for (size_t i = 0; i < specials_.size(); i++) if (!specials_[i].s.empty()) by_first_[(unsigned char)specials_[i].s[0]].push_back((int)i);
     pretok_ = tj.get_str("pretokenizer", "qwen2");
     for (auto& e : tj["eos"].arr) eos_.push_back((int)e.as_int());
     bos_ = (int)tj.get_int("bos", -1);
@@ -147,6 +147,16 @@ void Tokenizer::load(const ModelFile& mf) {
     think_default_ = tj.get_bool("think_default", true);
     think_open_ = tj.get_bool("think_open", false);
     think_disable_block_ = tj.get_bool("think_disable_block", true);
+    // Templates that write the BOS text themselves (Gemma 4, Llama 3) were converted with add_bos = false and the
+    // BOS as a chat prefix, which left raw prompts (completions, perplexity) without it. Treat the model as
+    // BOS-prefixed everywhere instead: encode() adds it, the chat renderer no longer writes it.
+    // Only for genuine start tokens: OLMoE's "bos" is an unrelated added token that HF never prepends to raw text.
+    auto is_start_tok = [](const std::string& t) {
+        return t.find("bos") != std::string::npos || t.find("start") != std::string::npos || t.find("begin") != std::string::npos;
+    };
+    if (!add_bos_ && bos_ >= 0 && !chat_prefix_.empty() && is_start_tok(chat_prefix_))
+        for (auto& sp : specials_)
+            if (sp.id == bos_ && sp.s == chat_prefix_) { add_bos_ = true; chat_prefix_.clear(); break; }
 }
 
 bool Tokenizer::is_eos(int id) const {
@@ -316,22 +326,23 @@ void Tokenizer::encode_plain(const std::string& text, std::vector<int>& out) con
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text, bool parse_special) const {
+    // Added tokens are split out before BPE, longest first (like HF). Without parse_special only the
+    // non-special ones match (e.g. Gemma's "\n" and whitespace-run tokens), never control tokens.
     std::vector<int> out;
     if (add_bos_ && bos_ >= 0) out.push_back(bos_);
-    if (!parse_special || specials_.empty()) { encode_plain(text, out); return out; }
+    if (specials_.empty()) { encode_plain(text, out); return out; }
     size_t start = 0, i = 0;
     while (i < text.size()) {
         bool matched = false;
-        if (special_first_[(unsigned char)text[i]]) {
-            for (auto& sp : specials_) {
-                if (!sp.s.empty() && text.compare(i, sp.s.size(), sp.s) == 0) {
-                    encode_plain(text.substr(start, i - start), out);
-                    out.push_back(sp.id);
-                    i += sp.s.size();
-                    start = i;
-                    matched = true;
-                    break;
-                }
+        for (int si : by_first_[(unsigned char)text[i]]) {
+            const Special& sp = specials_[si];
+            if ((parse_special || !sp.special) && text.compare(i, sp.s.size(), sp.s) == 0) {
+                encode_plain(text.substr(start, i - start), out);
+                out.push_back(sp.id);
+                i += sp.s.size();
+                start = i;
+                matched = true;
+                break;
             }
         }
         if (!matched) i++;
@@ -370,7 +381,7 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
                                    const std::vector<std::string>& tools) const {
     std::string o = chat_prefix_;
     if (chat_format_ == "llama3") {
-        o += "<|begin_of_text|>";
+        if (!add_bos_) o += "<|begin_of_text|>";
         for (auto& m : msgs) o += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n" + m.content + "<|eot_id|>";
         if (add_gen) o += "<|start_header_id|>assistant<|end_header_id|>\n\n";
         return o;

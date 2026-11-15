@@ -2,7 +2,7 @@
 """HF transformers reference perplexity, matching `tachyon ppl` (independent windows, positions win/4..win-2
 scored, <bos> at position 0 of every window when the tokenizer adds one).
 usage: .venv/bin/python tools/hf_ppl.py <hf_dir> [-n windows] [--win 512] [--dtype float32|bfloat16] [--no-bos | --bos]"""
-import sys, math, argparse, torch
+import os, sys, math, argparse, torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 ap = argparse.ArgumentParser()
 ap.add_argument("model"); ap.add_argument("-n", type=int, default=2); ap.add_argument("--win", type=int, default=512)
@@ -24,4 +24,5 @@ for w in range(a.n):
     tgt = ids[w * a.win:(w + 1) * a.win]
     for p in range(a.win // 4, a.win - 1):
         nll -= lp[p, tgt[p + 1]].item(); cnt += 1
+        if os.environ.get('DUMP'): print(f'[nll] w{w} p{p} tok{tgt[p+1]} {-lp[p, tgt[p+1]].item():.4f}')
 print(f"hf perplexity: {math.exp(nll / cnt):.4f} over {cnt} tokens (bos={bos}, dtype={a.dtype})")
