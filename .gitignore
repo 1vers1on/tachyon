@@ -72,3 +72,6 @@ vgcore.*
 perf.data*
 *.nsys-rep
 *.ncu-rep
+
+# ---- agent handoff notes (local only) ----
+/TACHYON.md
