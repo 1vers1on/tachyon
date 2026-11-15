@@ -1,6 +1,7 @@
 #include "tokenizer.h"
 #include "unicode_tables.h"
 #include <algorithm>
+#include <ctime>
 
 static bool in_ranges(const uint32_t (*r)[2], int n, uint32_t cp) {
     int lo = 0, hi = n - 1;
@@ -147,6 +148,16 @@ void Tokenizer::load(const ModelFile& mf) {
     think_default_ = tj.get_bool("think_default", true);
     think_open_ = tj.get_bool("think_open", false);
     think_disable_block_ = tj.get_bool("think_disable_block", true);
+    // chat formats added later: detect from the stored template (files converted before keep working)
+    if (chat_format_ == "raw" || chat_format_ == "tulu") {
+        const std::string ct = tj.get_str("chat_template", "");
+        if (ct.find("<|start_of_role|>") != std::string::npos) { chat_format_ = "granite"; thinking_ = false; }
+        else if (ct.find("<|end|>") != std::string::npos && ct.find("<|assistant|>") != std::string::npos) chat_format_ = "phi";
+        else if (ct.find("｜User｜") != std::string::npos) {
+            chat_format_ = "deepseek"; thinking_ = true; think_open_ = true; think_default_ = true;
+        }
+        else if (ct.find("[INST]") != std::string::npos) chat_format_ = "mistral";
+    }
     // Templates that write the BOS text themselves (Gemma 4, Llama 3) were converted with add_bos = false and the
     // BOS as a chat prefix, which left raw prompts (completions, perplexity) without it. Treat the model as
     // BOS-prefixed everywhere instead: encode() adds it, the chat renderer no longer writes it.
@@ -421,6 +432,54 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
             o += so + role + "\n" + (i == i0 ? sys : std::string()) + trim(content) + eo;
         }
         if (add_gen) o += so + "model\n";
+        return o;
+    }
+    auto strip_reasoning = [&](const std::string& c) {
+        size_t p = c.find("</think>");
+        return p == std::string::npos ? c : trim(c.substr(p + 8));
+    };
+    if (chat_format_ == "granite") {
+        size_t i0 = 0;
+        if (!msgs.empty() && msgs[0].role == "system") { o += "<|start_of_role|>system<|end_of_role|>" + msgs[0].content + "<|end_of_text|>\n"; i0 = 1; }
+        else {   // the template's default system prompt
+            char date[64]; time_t t = time(nullptr); struct tm tmv; localtime_r(&t, &tmv);
+            strftime(date, sizeof date, "%B %d, %Y", &tmv);
+            o += std::string("<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024.\nToday's Date: ") + date +
+                 ".\nYou are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n";
+        }
+        for (size_t i = i0; i < msgs.size(); i++) o += "<|start_of_role|>" + msgs[i].role + "<|end_of_role|>" + msgs[i].content + "<|end_of_text|>\n";
+        if (add_gen) o += "<|start_of_role|>assistant<|end_of_role|>";
+        return o;
+    }
+    if (chat_format_ == "phi") {
+        for (auto& m : msgs) o += "<|" + m.role + "|>" + m.content + "<|end|>";
+        if (add_gen) o += "<|assistant|>";
+        return o;
+    }
+    if (chat_format_ == "deepseek") {
+        // DeepSeek-R1 distills: system text first, reasoning dropped from history, generation opens <think>
+        const std::string U = "<｜User｜>", A = "<｜Assistant｜>";
+        const std::string eos = eos_.empty() ? std::string() : token_bytes(eos_[0]);
+        for (auto& m : msgs) if (m.role == "system") o += m.content;
+        for (auto& m : msgs) {
+            if (m.role == "user") o += U + m.content;
+            else if (m.role == "assistant") o += A + strip_reasoning(m.content) + eos;
+        }
+        if (add_gen) o += A + "<think>\n";
+        return o;
+    }
+    if (chat_format_ == "mistral") {
+        // Mistral v0.3: [INST] user[/INST] answer</s>; the system prompt is prepended to the last user turn
+        std::string sys;
+        for (auto& m : msgs) if (m.role == "system") sys = m.content;
+        int last_user = -1;
+        for (int i = (int)msgs.size() - 1; i >= 0; i--) if (msgs[i].role == "user") { last_user = i; break; }
+        const std::string eos = eos_.empty() ? std::string() : token_bytes(eos_[0]);
+        for (int i = 0; i < (int)msgs.size(); i++) {
+            const auto& m = msgs[i];
+            if (m.role == "user") o += "[INST] " + (i == last_user && !sys.empty() ? sys + "\n\n" : std::string()) + m.content + "[/INST]";
+            else if (m.role == "assistant") o += " " + m.content + eos;
+        }
         return o;
     }
     if (chat_format_ == "tulu") {
