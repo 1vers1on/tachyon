@@ -1,0 +1,11 @@
+# build outputs
+/build/
+/tachyon
+/tachyon-client
+# converted models / imatrix files (large, regenerable)
+/models/
+*.tach
+*.tach.partial
+*.imatrix
+# python venv used only for reference checks
+/.venv/
