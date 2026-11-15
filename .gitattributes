@@ -1,0 +1,25 @@
+# Normalize line endings: text files are stored and checked out with LF (also on Windows checkouts,
+# so the #embed-ed kernel source and shell scripts behave the same everywhere).
+* text=auto eol=lf
+
+# source
+*.cpp text diff=cpp
+*.h   text diff=cpp
+*.cu  text diff=cpp linguist-language=Cuda
+*.py  text diff=python
+*.sh  text eol=lf
+Makefile text eol=lf
+*.md  text diff=markdown
+
+# data (calibration / evaluation text, embedded into the binary at build time)
+data/** text -diff linguist-vendored
+
+# binaries: never touch line endings, never diff
+*.tach        binary
+*.imatrix     binary
+*.safetensors binary
+*.gguf        binary
+*.bin         binary
+*.png         binary
+*.jpg         binary
+*.cubin       binary

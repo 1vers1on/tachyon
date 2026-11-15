@@ -1,14 +1,74 @@
-# build outputs
+# ---- build outputs ----
 /build/
+/build_*/
 /tachyon
 /tachyon-client
-# converted models / imatrix files (large, regenerable)
+/tachyon-dev
+*.o
+*.d
+*.a
+*.so
+*.cubin
+*.ptx
+
+# ---- models, weights, conversion intermediates (large, regenerable) ----
 /models/
 *.tach
 *.tach.partial
+*.q8tmp
 *.imatrix
-# python venv used only for reference checks
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.part
+
+# ---- runner store / logs (normally in ~/.tachyon, but keep stray local ones out) ----
+/.tachyon/
+*.log
+
+# ---- python (reference tools) ----
 /.venv/
-/tachyon-dev
-/build_dev/
-/build_asan/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# ---- editors / IDEs ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+.cache/
+compile_commands.json
+.clangd/
+.claude/settings.local.json
+
+# ---- OS files ----
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+# Windows (also files copied into WSL from Windows)
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*:Zone.Identifier
+*.lnk
+# Linux
+.directory
+.Trash-*
+.nfs*
+
+# ---- debugging / profiling ----
+core
+core.*
+vgcore.*
+perf.data*
+*.nsys-rep
+*.ncu-rep
