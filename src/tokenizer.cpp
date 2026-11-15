@@ -158,6 +158,15 @@ void Tokenizer::load(const ModelFile& mf) {
         }
         else if (ct.find("[INST]") != std::string::npos) chat_format_ = "mistral";
     }
+    {
+        const std::string ct = tj.get_str("chat_template", "");
+        if (chat_format_ == "chatml")
+            tool_format_ = tool_style_ == "xml" ? ToolFormat::QwenXml
+                         : ct.find("<|tool_call_start|>") != std::string::npos ? ToolFormat::Lfm2 : ToolFormat::Hermes;
+        else if (chat_format_ == "gemma4") tool_format_ = ToolFormat::Gemma4;
+        else if (chat_format_ == "mistral" && token_id("[TOOL_CALLS]") >= 0) tool_format_ = ToolFormat::Mistral;
+        else tool_format_ = ToolFormat::Generic;
+    }
     // Templates that write the BOS text themselves (Gemma 4, Llama 3) were converted with add_bos = false and the
     // BOS as a chat prefix, which left raw prompts (completions, perplexity) without it. Treat the model as
     // BOS-prefixed everywhere instead: encode() adds it, the chat renderer no longer writes it.
@@ -388,39 +397,277 @@ static std::string strip_nl(const std::string& s) {
     return s.substr(a, b - a);
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// Chat templates. Each format mirrors its HF Jinja template (hard-coded; no Jinja engine), including tool calling.
+
+static std::string trim_ws(const std::string& x) {
+    size_t a = x.find_first_not_of(" \t\n\r"), b = x.find_last_not_of(" \t\n\r");
+    return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
+}
+static const Json& tool_fn(const Json& t) { return t.has("function") ? t["function"] : t; }
+static Json call_args(const ToolCall& c) {
+    std::string err;
+    Json a = Json::parse(c.arguments.empty() ? "{}" : c.arguments, &err);
+    return err.empty() && a.is_obj() ? a : Json::object();
+}
+// Python str() of a JSON scalar (what Jinja's `| string` prints)
+static std::string py_str(const Json& v) {
+    if (v.is_str()) return v.str;
+    if (v.is_bool()) return v.b ? "True" : "False";
+    if (v.is_null()) return "None";
+    return v.dump();
+}
+static std::vector<std::pair<std::string, const Json*>> dictsort(const Json& o) {
+    std::vector<std::pair<std::string, const Json*>> v;
+    for (auto& kv : o.obj) v.push_back({kv.first, &kv.second});
+    std::stable_sort(v.begin(), v.end(), [](auto& a, auto& b) { return strcasecmp(a.first.c_str(), b.first.c_str()) < 0; });
+    return v;
+}
+
+static const char* kHermesTools =
+    "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+static const char* kHermesToolsEnd =
+    "\n</tools>\n\nFor each function call, return a json object with function name and arguments within "
+    "<tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+
+std::string Tokenizer::tool_call_prefix(const std::string& name) const {
+    switch (tool_format_) {
+        case ToolFormat::QwenXml: return "<tool_call>\n<function=" + (name.empty() ? std::string() : name + ">\n");
+        case ToolFormat::Lfm2: return "<|tool_call_start|>[" + (name.empty() ? std::string() : name + "(");
+        case ToolFormat::Gemma4: return "<|tool_call>call:" + (name.empty() ? std::string() : name + "{");
+        case ToolFormat::Mistral: return "[TOOL_CALLS] [" + (name.empty() ? std::string() : "{\"name\": \"" + name + "\", \"arguments\": ");
+        default: return "<tool_call>\n" + (name.empty() ? std::string() : "{\"name\": \"" + name + "\", \"arguments\": ");
+    }
+}
+
+// Models without a native tool format: describe the tools in the system prompt (Hermes style, which most
+// instruction-tuned models follow), write earlier calls as <tool_call> blocks and results as user turns.
+std::string Tokenizer::render_generic_tools(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,
+                                            const std::vector<Json>& tools) const {
+    std::vector<ChatMessage> out;
+    std::string tblock;
+    if (!tools.empty()) {
+        tblock = kHermesTools;
+        for (auto& t : tools) tblock += "\n" + t.dump(-2);
+        tblock += kHermesToolsEnd;
+    }
+    size_t i0 = 0;
+    if (!tblock.empty()) {
+        ChatMessage sys;
+        sys.role = "system";
+        if (!msgs.empty() && msgs[0].role == "system") { sys.content = msgs[0].content + "\n\n"; i0 = 1; }
+        sys.content += tblock;
+        out.push_back(sys);
+    }
+    for (size_t i = i0; i < msgs.size(); i++) {
+        const ChatMessage& m = msgs[i];
+        if (m.role == "tool") {
+            std::string r = "<tool_response>\n" + m.content + "\n</tool_response>";
+            if (i > i0 && msgs[i - 1].role == "tool" && !out.empty()) out.back().content += "\n" + r;
+            else { ChatMessage u; u.role = "user"; u.content = r; out.push_back(u); }
+            continue;
+        }
+        ChatMessage c = m;
+        c.tool_calls.clear();
+        for (auto& tc : m.tool_calls) {
+            if (!c.content.empty()) c.content += "\n";
+            c.content += "<tool_call>\n{\"name\": \"" + tc.name + "\", \"arguments\": " + call_args(tc).dump(-2) + "}\n</tool_call>";
+        }
+        out.push_back(c);
+    }
+    return render_chat(out, add_gen, enable_thinking, {});
+}
+
+// --- Gemma 4: declarations and arguments in its own notation, strings delimited by <|"|> ---
+static const char* kQ = "<|\"|>";
+static std::string g4_arg(const Json& v, bool escape_keys = true) {
+    if (v.is_null()) return "null";
+    if (v.is_str()) return kQ + v.str + kQ;
+    if (v.is_bool()) return v.b ? "true" : "false";
+    if (v.is_obj()) {
+        std::string o = "{";
+        bool first = true;
+        for (auto& kv : dictsort(v)) {
+            if (!first) o += ",";
+            first = false;
+            o += escape_keys ? kQ + kv.first + kQ : kv.first;
+            o += ":" + g4_arg(*kv.second, escape_keys);
+        }
+        return o + "}";
+    }
+    if (v.is_arr()) {
+        std::string o = "[";
+        for (size_t i = 0; i < v.arr.size(); i++) o += (i ? "," : "") + g4_arg(v.arr[i], escape_keys);
+        return o + "]";
+    }
+    return v.dump();
+}
+static std::string upper(std::string s) { for (auto& c : s) c = toupper((unsigned char)c); return s; }
+static std::string g4_type(const Json& t) {
+    if (t.is_str()) return upper(t.str);
+    if (t.is_arr()) for (auto& x : t.arr) if (x.is_str() && x.str != "null") return upper(x.str);
+    return "";
+}
+static std::string g4_required(const Json& req) {
+    std::string o = "required:[";
+    for (size_t i = 0; i < req.arr.size(); i++) o += (i ? "," : "") + std::string(kQ) + req.arr[i].as_str() + kQ;
+    return o + "]";
+}
+static std::string g4_params(const Json& props, bool filter_keys = false) {
+    static const char* std_keys[] = {"description", "type", "properties", "required", "nullable"};
+    std::string o;
+    bool first = true;
+    for (auto& kv : dictsort(props)) {
+        if (filter_keys && std::find_if(std::begin(std_keys), std::end(std_keys), [&](const char* k) { return kv.first == k; }) != std::end(std_keys)) continue;
+        const Json& v = kv.second->is_obj() ? *kv.second : Json::object();
+        if (!first) o += ",";
+        first = false;
+        o += kv.first + ":{";
+        bool comma = false;
+        auto sep = [&]() { if (comma) o += ","; comma = true; };
+        if (!v.get_str("description", "").empty()) { o += "description:" + std::string(kQ) + v.get_str("description", "") + kQ; comma = true; }
+        const std::string T = g4_type(v["type"]);
+        if (T == "STRING") {
+            if (v["enum"].size()) { sep(); o += "enum:" + g4_arg(v["enum"]); }
+        } else if (T == "ARRAY") {
+            const Json& items = v["items"];
+            if (items.is_obj() && items.size()) {
+                sep();
+                o += "items:{";
+                bool f2 = true;
+                for (auto& ik : dictsort(items)) {
+                    if (ik.second->is_null()) continue;
+                    if (!f2) o += ",";
+                    f2 = false;
+                    if (ik.first == "properties") o += "properties:{" + (ik.second->is_obj() ? g4_params(*ik.second) : std::string()) + "}";
+                    else if (ik.first == "required") o += g4_required(*ik.second);
+                    else if (ik.first == "type") o += "type:" + g4_arg(Json(g4_type(*ik.second)));
+                    else o += ik.first + ":" + g4_arg(*ik.second);
+                }
+                o += "}";
+            }
+        }
+        if (v.get_bool("nullable", false)) { sep(); o += "nullable:true"; }
+        if (T == "OBJECT") {
+            if (v["properties"].is_obj()) { sep(); o += "properties:{" + g4_params(v["properties"]) + "}"; }
+            else { sep(); o += "properties:{" + g4_params(v, true) + "}"; }
+            if (v["required"].size()) { sep(); o += g4_required(v["required"]); }
+        }
+        sep();
+        o += "type:" + std::string(kQ) + T + kQ + "}";
+    }
+    return o;
+}
+static std::string g4_declaration(const Json& tool) {
+    const Json& f = tool_fn(tool);
+    std::string o = "declaration:" + f.get_str("name", "") + "{description:" + kQ + f.get_str("description", "") + kQ;
+    const Json& p = f["parameters"];
+    if (p.is_obj() && p.size()) {
+        o += ",parameters:{";
+        if (p["properties"].is_obj() && p["properties"].size()) o += "properties:{" + g4_params(p["properties"]) + "},";
+        if (p["required"].size()) o += g4_required(p["required"]) + ",";
+        o += "type:" + std::string(kQ) + (p.has("type") ? g4_type(p["type"]) : std::string("OBJECT")) + kQ + "}";
+    }
+    return o + "}";
+}
+
+std::string Tokenizer::render_gemma4(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,
+                                     const std::vector<Json>& tools) const {
+    std::string o = chat_prefix_;
+    const bool think = enable_thinking && !think_system_token_.empty();
+    const bool has_sys = !msgs.empty() && (msgs[0].role == "system" || msgs[0].role == "developer");
+    std::string prev_type;
+    size_t i0 = 0;
+    if (think || !tools.empty() || has_sys) {
+        o += "<|turn>system\n";
+        if (think) { o += think_system_token_ + "\n"; prev_type = "think"; }
+        if (has_sys) { o += trim_ws(msgs[0].content); i0 = 1; }
+        for (auto& t : tools) o += "<|tool>" + g4_declaration(t) + "<tool|>";
+        if (!tools.empty()) prev_type = "tool";
+        o += "<turn|>\n";
+    }
+    int last_user = -1;
+    for (size_t i = i0; i < msgs.size(); i++) if (msgs[i].role == "user") last_user = (int)i;
+    std::string prev_non_tool;
+    auto strip_thinking = [&](const std::string& t) {   // drop <|channel>...<channel|> blocks
+        std::string r;
+        size_t p = 0;
+        while (true) {
+            size_t a = t.find("<|channel>", p);
+            if (a == std::string::npos) { r += t.substr(p); break; }
+            r += t.substr(p, a - p);
+            size_t b = t.find("<channel|>", a);
+            if (b == std::string::npos) break;
+            p = b + 10;
+        }
+        return trim_ws(r);
+    };
+    for (size_t i = i0; i < msgs.size(); i++) {
+        const ChatMessage& m = msgs[i];
+        if (m.role == "tool") continue;
+        prev_type.clear();
+        const std::string role = m.role == "assistant" ? "model" : m.role;
+        if (!(role == "model" && prev_non_tool == "assistant")) o += "<|turn>" + role + "\n";
+        if (!m.reasoning.empty() && (int)i > last_user) o += "<|channel>thought\n" + m.reasoning + "\n<channel|>";
+        for (auto& tc : m.tool_calls) {
+            o += "<|tool_call>call:" + tc.name + "{";
+            bool first = true;
+            for (auto& kv : dictsort(call_args(tc))) {
+                if (!first) o += ",";
+                first = false;
+                o += kv.first + ":" + g4_arg(*kv.second, false);
+            }
+            o += "}<tool_call|>";
+            prev_type = "tool_call";
+        }
+        bool tr_out = false;
+        if (!m.tool_calls.empty())
+            for (size_t k = i + 1; k < msgs.size() && msgs[k].role == "tool"; k++) {
+                std::string name = msgs[k].name.empty() ? "unknown" : msgs[k].name;
+                for (auto& tc : m.tool_calls) if (!tc.id.empty() && tc.id == msgs[k].tool_call_id) name = tc.name;
+                o += "<|tool_response>response:" + name + "{value:" + g4_arg(Json(msgs[k].content), false) + "}<tool_response|>";
+                tr_out = true;
+                prev_type = "tool_response";
+            }
+        const std::string content = role == "model" ? strip_thinking(m.content) : trim_ws(m.content);
+        o += content;
+        std::string next_role;
+        for (size_t j = i + 1; j < msgs.size(); j++) if (msgs[j].role != "tool") { next_role = msgs[j].role; break; }
+        const bool continues = role == "model" && next_role == "assistant" && (m.tool_calls.empty() || tr_out);
+        if (prev_type == "tool_call" && !tr_out) o += "<|tool_response>";
+        else if (continues) {}
+        else if (!(tr_out && content.empty() && next_role.empty())) o += "<turn|>\n";
+        prev_non_tool = m.role;
+    }
+    if (add_gen) {
+        if (prev_type != "tool_response" && prev_type != "tool_call") o += "<|turn>model\n";
+        else if (prev_type == "tool_response" && think) o += think_tag_open_;
+    }
+    return o;
+}
+
 std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,
-                                   const std::vector<std::string>& tools) const {
+                                   const std::vector<Json>& tools) const {
+    if (tool_format_ == ToolFormat::Generic) {
+        bool tooly = !tools.empty();
+        for (auto& m : msgs) tooly |= m.role == "tool" || !m.tool_calls.empty();
+        if (tooly) return render_generic_tools(msgs, add_gen, enable_thinking, tools);
+    }
+    if (chat_format_ == "gemma4") return render_gemma4(msgs, add_gen, enable_thinking, tools);
     std::string o = chat_prefix_;
     if (chat_format_ == "llama3") {
         if (!add_bos_) o += "<|begin_of_text|>";
-        for (auto& m : msgs) o += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n" + m.content + "<|eot_id|>";
+        for (auto& m : msgs) o += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n" + trim_ws(m.content) + "<|eot_id|>";
         if (add_gen) o += "<|start_header_id|>assistant<|end_header_id|>\n\n";
         return o;
     }
-    auto trim = [](const std::string& x) {
-        size_t a = x.find_first_not_of(" \t\n\r"), b = x.find_last_not_of(" \t\n\r");
-        return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
-    };
-    if (chat_format_ == "gemma" || chat_format_ == "gemma4") {
-        // Gemma: the system prompt is prepended to the first user turn; assistant role is "model"
-        const bool g4 = chat_format_ == "gemma4";
-        const std::string so = g4 ? "<|turn>" : "<start_of_turn>", eo = g4 ? "<turn|>\n" : "<end_of_turn>\n";
+    if (chat_format_ == "gemma") {
+        // Gemma 3: the system prompt is prepended to the first user turn; assistant role is "model"
         std::string sys;
         size_t i0 = 0;
-        const bool has_sys = !msgs.empty() && msgs[0].role == "system";
-        if (g4) {
-            const bool think = enable_thinking && !think_system_token_.empty();
-            if (think || has_sys) {
-                o += so + "system\n";
-                if (think) o += think_system_token_ + "\n";
-                if (has_sys) o += trim(msgs[0].content);
-                o += eo;
-            }
-            if (has_sys) i0 = 1;
-        } else if (has_sys) {
-            sys = msgs[0].content + "\n\n";
-            i0 = 1;
-        }
+        if (!msgs.empty() && msgs[0].role == "system") { sys = msgs[0].content + "\n\n"; i0 = 1; }
         for (size_t i = i0; i < msgs.size(); i++) {
             const auto& m = msgs[i];
             std::string role = m.role == "assistant" ? "model" : m.role;
@@ -429,14 +676,14 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
                 size_t p = content.find(think_tag_close_);
                 if (p != std::string::npos) content = content.substr(p + think_tag_close_.size());
             }
-            o += so + role + "\n" + (i == i0 ? sys : std::string()) + trim(content) + eo;
+            o += "<start_of_turn>" + role + "\n" + (i == i0 ? sys : std::string()) + trim_ws(content) + "<end_of_turn>\n";
         }
-        if (add_gen) o += so + "model\n";
+        if (add_gen) o += "<start_of_turn>model\n";
         return o;
     }
     auto strip_reasoning = [&](const std::string& c) {
         size_t p = c.find("</think>");
-        return p == std::string::npos ? c : trim(c.substr(p + 8));
+        return p == std::string::npos ? c : trim_ws(c.substr(p + 8));
     };
     if (chat_format_ == "granite") {
         size_t i0 = 0;
@@ -469,16 +716,52 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
         return o;
     }
     if (chat_format_ == "mistral") {
-        // Mistral v0.3: [INST] user[/INST] answer</s>; the system prompt is prepended to the last user turn
+        // Mistral v0.3: [INST] user[/INST] answer</s>; the system prompt is prepended to the last user turn;
+        // tools are listed right before the last user turn, calls / results use the v3 tool tokens
         std::string sys;
         for (auto& m : msgs) if (m.role == "system") sys = m.content;
         int last_user = -1;
         for (int i = (int)msgs.size() - 1; i >= 0; i--) if (msgs[i].role == "user") { last_user = i; break; }
         const std::string eos = eos_.empty() ? std::string() : token_bytes(eos_[0]);
+        auto id9 = [](const std::string& id) {   // Mistral tool call ids are 9 alphanumerics
+            static const char* al = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            bool ok = id.size() == 9;
+            for (char c : id) ok &= isalnum((unsigned char)c) != 0;
+            if (ok) return id;
+            uint64_t h = fnv1a64(id.data(), id.size());
+            std::string r;
+            for (int k = 0; k < 9; k++) { r += al[h % 62]; h /= 62; }
+            return r;
+        };
         for (int i = 0; i < (int)msgs.size(); i++) {
             const auto& m = msgs[i];
-            if (m.role == "user") o += "[INST] " + (i == last_user && !sys.empty() ? sys + "\n\n" : std::string()) + m.content + "[/INST]";
-            else if (m.role == "assistant") o += " " + m.content + eos;
+            if (m.role == "user") {
+                if (!tools.empty() && i == last_user) {
+                    o += "[AVAILABLE_TOOLS] [";
+                    for (size_t k = 0; k < tools.size(); k++) {
+                        Json f = Json::object();
+                        for (auto& kv : tool_fn(tools[k]).obj) if (kv.first != "return") f.set(kv.first, kv.second);
+                        Json w = Json::object(); w.set("type", "function"); w.set("function", f);
+                        o += w.dump(-2) + (k + 1 < tools.size() ? ", " : "]");
+                    }
+                    o += "[/AVAILABLE_TOOLS]";
+                }
+                o += "[INST] " + (i == last_user && !sys.empty() ? sys + "\n\n" : std::string()) + m.content + "[/INST]";
+            } else if (m.role == "assistant" && !m.tool_calls.empty()) {
+                o += "[TOOL_CALLS] [";
+                for (size_t k = 0; k < m.tool_calls.size(); k++) {
+                    Json f = Json::object();
+                    f.set("name", m.tool_calls[k].name);
+                    f.set("arguments", call_args(m.tool_calls[k]));
+                    std::string d = f.dump(-2);
+                    d.pop_back();
+                    o += d + ", \"id\": \"" + id9(m.tool_calls[k].id) + "\"}" + (k + 1 < m.tool_calls.size() ? ", " : "]" + eos);
+                }
+            } else if (m.role == "assistant") {
+                o += " " + trim_ws(m.content) + eos;
+            } else if (m.role == "tool") {
+                o += "[TOOL_RESULTS] {\"content\": " + m.content + ", \"call_id\": \"" + id9(m.tool_call_id) + "\"}[/TOOL_RESULTS]";
+            }
         }
         return o;
     }
@@ -492,14 +775,69 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
         for (auto& m : msgs) o += m.content + "\n";
         return o;
     }
-    // ChatML (Qwen / LFM2 family). Mirrors the Qwen3 template: reasoning of earlier turns is dropped.
+    if (tool_format_ == ToolFormat::Lfm2) {
+        // LFM2 / LFM2.5: tools as a JSON list in the system prompt, Python-style calls, reasoning kept for the last turn
+        std::string sys;
+        size_t i0 = 0;
+        if (!msgs.empty() && msgs[0].role == "system") { sys = msgs[0].content; i0 = 1; }
+        if (!tools.empty()) {
+            sys += (sys.empty() ? "" : "\n") + std::string("List of tools: [");
+            for (size_t k = 0; k < tools.size(); k++) sys += (k ? ", " : "") + tools[k].dump(-2);
+            sys += "]";
+        }
+        if (!sys.empty()) o += "<|im_start|>system\n" + sys + "<|im_end|>\n";
+        int last_asst = -1;
+        for (size_t i = i0; i < msgs.size(); i++) if (msgs[i].role == "assistant") last_asst = (int)i;
+        for (size_t i = i0; i < msgs.size(); i++) {
+            const auto& m = msgs[i];
+            o += "<|im_start|>" + m.role + "\n";
+            if (m.role == "assistant") {
+                const bool keep = (int)i == last_asst;
+                if (!m.reasoning.empty() && keep) o += "<think>" + m.reasoning + "</think>";
+                std::string content = m.content;
+                size_t p = content.rfind("</think>");
+                if (!keep && p != std::string::npos) content = trim_ws(content.substr(p + 8));
+                o += content;
+                if (!m.tool_calls.empty()) {
+                    o += "<|tool_call_start|>[";
+                    for (size_t k = 0; k < m.tool_calls.size(); k++) {
+                        o += (k ? ", " : "") + m.tool_calls[k].name + "(";
+                        bool first = true;
+                        for (auto& kv : call_args(m.tool_calls[k]).obj) {
+                            o += (first ? "" : ", ") + kv.first + "=";
+                            first = false;
+                            const Json& v = kv.second;
+                            if (v.is_str()) {
+                                std::string q = "'";
+                                for (char c : v.str) {
+                                    if (c == '\\') q += "\\\\"; else if (c == '\'') q += "\\'"; else if (c == '\n') q += "\\n";
+                                    else if (c == '\r') q += "\\r"; else q += c;
+                                }
+                                o += q + "'";
+                            } else if (v.is_obj() || v.is_arr()) o += v.dump(-2);
+                            else o += py_str(v);
+                        }
+                        o += ")";
+                    }
+                    o += "]<|tool_call_end|>";
+                }
+                o += "<|im_end|>\n";
+            } else {
+                o += m.content + "<|im_end|>\n";
+            }
+        }
+        if (add_gen) o += "<|im_start|>assistant\n";
+        return o;
+    }
+    // ChatML (Qwen family). Mirrors the Qwen3 / Qwen3.5 templates: reasoning of earlier turns is dropped.
+    const bool xml = tool_format_ == ToolFormat::QwenXml;
     int last_user = -1;
     for (int i = (int)msgs.size() - 1; i >= 0; i--) if (msgs[i].role == "user") { last_user = i; break; }
     size_t first = 0;
-    if (!tools.empty() && tool_style_ == "xml") {
+    if (!tools.empty() && xml) {
         // Qwen3.5 style: XML function calls, system prompt after the tool instructions
         o += "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>";
-        for (auto& t : tools) o += "\n" + t;
+        for (auto& t : tools) o += "\n" + t.dump(-2);
         o += "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
              "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\n"
              "This is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\n"
@@ -507,28 +845,25 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
              "<tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function "
              "call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question "
              "like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
-        if (!msgs.empty() && msgs[0].role == "system") { o += "\n\n" + trim(msgs[0].content); first = 1; }
+        if (!msgs.empty() && msgs[0].role == "system") { o += "\n\n" + trim_ws(msgs[0].content); first = 1; }
         o += "<|im_end|>\n";
     } else if (!tools.empty()) {
         o += "<|im_start|>system\n";
         if (!msgs.empty() && msgs[0].role == "system") { o += msgs[0].content + "\n\n"; first = 1; }
-        o += "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
-             "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
-        for (auto& t : tools) o += "\n" + t;
-        o += "\n</tools>\n\nFor each function call, return a json object with function name and arguments within "
-             "<tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
-             "</tool_call><|im_end|>\n";
+        o += kHermesTools;
+        for (auto& t : tools) o += "\n" + t.dump(-2);
+        o += std::string(kHermesToolsEnd) + "<|im_end|>\n";
     }
     for (size_t i = first; i < msgs.size(); i++) {
         const auto& m = msgs[i];
         if (m.role == "tool") {
             if (i == 0 || msgs[i - 1].role != "tool") o += "<|im_start|>user";
-            o += "\n<tool_response>\n" + m.content + "\n</tool_response>";
+            o += "\n<tool_response>\n" + (xml ? trim_ws(m.content) : m.content) + "\n</tool_response>";
             if (i + 1 == msgs.size() || msgs[i + 1].role != "tool") o += "<|im_end|>\n";
             continue;
         }
-        std::string content = m.content;
-        if (m.role == "assistant" && thinking_) {
+        std::string content = xml ? trim_ws(m.content) : m.content;
+        if (m.role == "assistant") {
             std::string reasoning = m.reasoning;
             size_t p = content.find("</think>");
             if (p != std::string::npos) {
@@ -539,8 +874,24 @@ std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool ad
                 size_t a = 0; while (a < content.size() && content[a] == '\n') a++;
                 content = content.substr(a);
             }
-            if ((int)i > last_user && !reasoning.empty())
-                content = "<think>\n" + strip_nl(reasoning) + "\n</think>\n\n" + content;
+            if (thinking_ && (int)i > last_user) {
+                if (xml) content = "<think>\n" + trim_ws(reasoning) + "\n</think>\n\n" + content;
+                else if (!reasoning.empty() || i + 1 == msgs.size()) content = "<think>\n" + strip_nl(reasoning) + "\n</think>\n\n" + content;
+            }
+            for (size_t k = 0; k < m.tool_calls.size(); k++) {
+                const ToolCall& tc = m.tool_calls[k];
+                if (xml) {
+                    content += k > 0 ? "\n" : (trim_ws(m.content).empty() ? "" : "\n\n");
+                    content += "<tool_call>\n<function=" + tc.name + ">\n";
+                    for (auto& kv : call_args(tc).obj)
+                        content += "<parameter=" + kv.first + ">\n" + (kv.second.is_obj() || kv.second.is_arr() ? kv.second.dump(-2) : py_str(kv.second)) + "\n</parameter>\n";
+                    content += "</function>\n</tool_call>";
+                } else {
+                    if (k > 0 || !m.content.empty()) content += "\n";
+                    std::string args = trim_ws(tc.arguments);
+                    content += "<tool_call>\n{\"name\": \"" + tc.name + "\", \"arguments\": " + (args.empty() ? "{}" : args) + "}\n</tool_call>";
+                }
+            }
         }
         o += "<|im_start|>" + m.role + "\n" + content + "<|im_end|>\n";
     }

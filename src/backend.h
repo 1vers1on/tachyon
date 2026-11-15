@@ -22,7 +22,9 @@ struct BackendOptions {
     size_t extra_kv_per_tok = 0;   // additional KV bytes per token per slot to budget (draft model KV)
     int vocab_limit = 0;   // >0: only compute logits for token ids < vocab_limit (draft models)
     int cpu_moe = -1;
-    bool state_rollback = false;  // stateful models: keep per-row state snapshots in decode batches + a per-slot backup      // CUDA: MoE layers whose experts run on the CPU from system RAM (-1 = auto: what does not fit)
+    bool state_rollback = false;  // stateful models: keep per-row state snapshots in decode batches + a per-slot backup
+    bool state_backup = false;    // stateful models: per-slot state backup only (prompt checkpoints for the prefix cache)
+    int min_ctx = 0;              // when the KV cache must shrink: use fewer slots before going below this context
 };
 
 class Backend {
@@ -49,6 +51,7 @@ public:
     virtual void state_restore_row(int slot, int row) {}
     virtual void state_save(int slot) {}      // per-slot backup of the recurrent state
     virtual void state_restore(int slot) {}
+    virtual bool supports_state_backup() const { return false; }
     BackendOptions opt;
 };
 

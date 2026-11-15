@@ -39,8 +39,13 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
     }
     // stateful models can speculate when the backend keeps per-row state snapshots (CUDA)
     opt.backend.state_rollback = mf.config.stateful && dev == "cuda" && (opt.spec_draft != 0 || !opt.draft_model.empty());
+    // and keep a per-slot state backup at the end of each conversation prefix (multi-turn / agent loops)
+    opt.backend.state_backup = mf.config.stateful && dev == "cuda";
     be->init(mf, opt.backend);
+    ckpt_ = mf.config.stateful && be->supports_state_backup() && !getenv("TACH_NO_CKPT");
     opt.backend.state_rollback = false;
+    opt.backend.state_backup = false;
+    opt.backend.min_ctx = 0;
     opt.backend.reserve_bytes = 0;
     opt.backend.extra_kv_per_tok = 0;
     opt.backend.ctx = be->opt.ctx;          // the backend may have shrunk the context to fit memory
@@ -69,8 +74,24 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
         dbe.reset();
     }
     slots_.resize(opt.backend.n_slots);
+    // sliding-window layers keep a ring of window + max_batch positions: a cached prefix stays usable only while
+    // the tokens cached after it have not wrapped around into the window before it
+    for (auto& l : mf.config.layers)
+        if (l.is_attn() && l.window > 0) {
+            const int cap = std::min(opt.backend.ctx, l.window + be->opt.max_batch);
+            if (cap < opt.backend.ctx) ring_slack_ = std::min(ring_slack_, cap - l.window);
+        }
     logits_buf_.resize(be->vocab());
     for (auto& l : mf.config.layers) if (l.n_experts) spec_min_accept_ = 0.2f;
+}
+
+Engine::Stats Engine::stats() {
+    Stats st;
+    st.slots = (int)slots_.size();
+    st.active = n_active_.load();
+    std::lock_guard<std::mutex> lk(mu_);
+    st.queued = (int)queue_.size();
+    return st;
 }
 
 void Engine::start() {
@@ -135,6 +156,7 @@ void Engine::admit() {
         if (best < 0) break;
         Slot& s = slots_[best];
         s.req = r;
+        n_active_++;
         queue_.pop_front();
         if ((int)r->prompt.size() + 1 > opt.backend.ctx) {
             r->error = "prompt (" + std::to_string(r->prompt.size()) + " tokens) exceeds context size " + std::to_string(opt.backend.ctx);
@@ -144,8 +166,15 @@ void Engine::admit() {
         if (r->prompt.empty()) r->prompt.push_back(tok.bos() >= 0 ? tok.bos() : 0);
         // keep at least one prompt token to evaluate so we get logits
         int keep = std::min(best_lcp, (int)r->prompt.size() - 1);
-        // recurrent state only describes the whole cached sequence: reuse all of it or nothing
-        if (mf.config.stateful && keep != (int)s.cache.size()) keep = 0;
+        // ring buffers (sliding window): the tokens cached after the prefix may have overwritten the window before it
+        if ((int)s.cache.size() - keep > ring_slack_) keep = 0;
+        // recurrent state describes the whole cached sequence: reuse all of it, resume from the prompt checkpoint
+        // (state saved after the conversation prefix of the previous request), or start over
+        if (mf.config.stateful && keep != (int)s.cache.size()) {
+            if (ckpt_ && s.ckpt_len > 0 && keep >= s.ckpt_len) { be->state_restore(best); keep = s.ckpt_len; }
+            else keep = 0;
+        }
+        if (keep < s.ckpt_len) s.ckpt_len = 0;
         s.cache.resize(keep);
         if ((int)s.dcache.size() > keep) s.dcache.resize(keep);
         {
@@ -184,6 +213,7 @@ void Engine::finish(Slot& s, const std::string& reason) {
     r->t_done = now_sec();
     if (r->t_first == 0) r->t_first = r->t_done;
     s.req.reset();
+    n_active_--;
     s.generating = false;
     s.last_used = now_sec();
     {
@@ -210,6 +240,7 @@ bool Engine::emit_token(Slot& s, int t) {
         size_t p = s.pending_text.find(st);
         if (p != std::string::npos) {
             std::string out = s.pending_text.substr(0, p);
+            r.stop_hit = st;
             r.text += out;
             if (r.on_text && !out.empty()) r.on_text(out);
             s.pending_text.clear();
@@ -317,6 +348,8 @@ bool Engine::step() {
         if (r.cancel) { finish(s, "cancelled"); continue; }
         int n_total = (int)r.prompt.size();
         int n = std::min(opt.prefill_chunk, n_total - s.n_prompt_done);
+        const bool ckpt_here = ckpt_ && r.checkpoint > s.n_prompt_done && r.checkpoint < n_total;
+        if (ckpt_here) n = std::min(n, r.checkpoint - s.n_prompt_done);   // end a chunk exactly at the checkpoint
         std::vector<BatchToken> b(n);
         for (int i = 0; i < n; i++) {
             int p = s.n_prompt_done + i;
@@ -325,6 +358,7 @@ bool Engine::step() {
         be->forward(b);
         for (int i = 0; i < n; i++) s.cache.push_back(r.prompt[s.n_prompt_done + i]);
         s.n_prompt_done += n;
+        if (ckpt_here && s.n_prompt_done == r.checkpoint) { be->state_save(si); s.ckpt_len = r.checkpoint; }
         if (s.n_prompt_done == n_total) {
             int t;
             if (s.sampler.params.greedy() && !s.sampler.params.has_penalties()) be->argmax_all(&t);

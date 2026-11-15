@@ -9,6 +9,11 @@
 
 int g_log_level = 1;
 int convert_main(int argc, char** argv);
+bool runner_is_command(const std::string& cmd);
+int runner_main(const std::string& cmd, int argc, char** argv);
+int runner_serve(int argc, char** argv);
+int runner_run(int argc, char** argv);
+void runner_usage();
 
 static void usage() {
     fprintf(stderr,
@@ -23,7 +28,7 @@ static void usage() {
         "  tachyon tokenize -m model.tach -p \"text\"\n\n"
         "options:\n"
         "  --device auto|cuda|cpu   backend (default auto)\n"
-        "  -c, --ctx N              context length per slot (default 8192)\n"
+        "  -c, --ctx N              context length per slot (default 8192; serve: 32768, fewer slots if VRAM is short)\n"
         "  --slots N                concurrent sequences / KV slots (default 4 on GPU, 1 on CPU)\n"
         "  -t, --threads N          CPU threads (default: physical cores)\n"
         "  --spec N                 n-gram speculative draft tokens (default 4 on GPU, 0 on CPU; 0 = off)\n"
@@ -33,14 +38,18 @@ static void usage() {
         "  --prefill-chunk N        prompt tokens per forward (default 512; 2048 for MoE models larger than VRAM)\n"
         "  --no-graphs              disable CUDA graphs\n"
         "  --temp T --top-k K --top-p P --min-p P --seed S   sampling (run/bench)\n"
-        "  -v / -q                  verbose / quiet logging\n", TACH_VERSION);
+        "  --api-key KEY            serve: require this key (Bearer or x-api-key; also TACHYON_API_KEY)\n"
+        "  --alias NAME             serve: model id reported by the API\n"
+        "  -v / -q                  verbose / quiet logging\n\n", TACH_VERSION);
+    runner_usage();
 }
 
 struct Args {
     std::string model, prompt, host = "127.0.0.1", device = "auto", out;
-    int port = 8080, n = 256, ctx = 8192, slots = -1, threads = 0, spec = -1, prompt_len = 512;
+    int port = 8080, n = 256, ctx = 8192, min_ctx = 0, slots = -1, threads = 0, spec = -1, prompt_len = 512;
     bool chat = false, kv8 = false, graphs = true, no_think = false, think = false;
-    std::string draft;
+    std::string draft, api_key, alias;
+    bool ctx_set = false;
     int draft_k = 4, draft_vocab = 0, cpu_moe = -1, prefill_chunk = 0;
     SamplingParams sp;
     bool temp_set = false;
@@ -59,7 +68,9 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "-o" || s == "--output") a.out = next();
         else if (s == "--port") a.port = atoi(next().c_str());
         else if (s == "-n" || s == "--n-predict") a.n = atoi(next().c_str());
-        else if (s == "-c" || s == "--ctx") a.ctx = atoi(next().c_str());
+        else if (s == "-c" || s == "--ctx") { a.ctx = atoi(next().c_str()); a.ctx_set = true; }
+        else if (s == "--api-key") a.api_key = next();
+        else if (s == "--alias") a.alias = next();
         else if (s == "--slots") a.slots = atoi(next().c_str());
         else if (s == "-t" || s == "--threads") a.threads = atoi(next().c_str());
         else if (s == "--spec") a.spec = atoi(next().c_str());
@@ -94,6 +105,7 @@ static void load_engine(Engine& e, const Args& a) {
     EngineOptions o;
     o.device = a.device;
     o.backend.ctx = a.ctx;
+    o.backend.min_ctx = a.min_ctx;
     o.backend.threads = a.threads;
     o.backend.kv_int8 = a.kv8;
     o.backend.use_graphs = a.graphs;
@@ -117,13 +129,61 @@ static void print_stats(const GenRequest& r) {
     fprintf(stderr, " | finish=%s\n", r.finish_reason.c_str());
 }
 
+// HF checkpoint -> .tach with importance-weighted quantization: a temporary Q8 (or Q4 for big checkpoints) model
+// runs on the calibration text to collect per-channel activation statistics, then the real conversion uses them.
+int convert_calibrated(const std::string& hf_dir, const std::string& out, const std::vector<std::string>& extra,
+                       const std::string& calib_text, const std::string& device, int calib_windows) {
+    std::string tmp = out + ".q8tmp", imat = out + ".imatrix";
+    {
+        // calibration model: Q8 when it fits comfortably in VRAM, else plain Q4 (statistics barely change)
+        size_t ckpt = 0;
+        {
+            SafeTensors st; st.open_dir(hf_dir);
+            for (auto& n : st.names()) ckpt += st.get(n)->nbytes;
+        }
+        const char* cq = ckpt > (12ull << 30) ? "q4" : "q8";
+        logi("calibration model: %s (checkpoint %.1f GB)", cq, ckpt / 1e9);
+        std::vector<char*> a8 = {(char*)hf_dir.c_str(), (char*)tmp.c_str(), (char*)"-q", (char*)cq};
+        int rc = convert_main((int)a8.size(), a8.data());
+        if (rc != 0) return rc;
+    }
+    {
+        static IMatrix im;
+        im.acc.clear();
+        g_imatrix = &im;
+        Engine e;
+        EngineOptions o;
+        o.device = device;
+        o.backend.ctx = 1024; o.backend.n_slots = 1;
+        e.load(tmp, o);
+        auto ids = e.tok.encode(calib_text, false);
+        int win = 512, nwin = 0;
+        for (size_t st = 0; st + win <= ids.size() && nwin < calib_windows; st += win, nwin++)
+            for (int c = 0; c < win; c += 128) {
+                std::vector<BatchToken> b(128);
+                for (int i = 0; i < 128; i++) b[i] = {ids[st + c + i], 0, c + i, i == 127};
+                e.be->forward(b);
+            }
+        e.be->imat_flush();
+        im.save(imat);
+        g_imatrix = nullptr;
+        logi("importance matrix from %d x %d calibration tokens -> %s", nwin, win, imat.c_str());
+    }
+    remove(tmp.c_str());
+    std::vector<char*> a4 = {(char*)hf_dir.c_str(), (char*)out.c_str()};
+    for (auto& x : extra) a4.push_back((char*)x.c_str());
+    a4.push_back((char*)"--imatrix");
+    a4.push_back((char*)imat.c_str());
+    return convert_main((int)a4.size(), a4.data());
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
     std::string cmd = argv[1];
     if (cmd == "-h" || cmd == "--help" || cmd == "help") { usage(); return 0; }
     if (cmd == "convert") {
         // --calib <text>: build a temporary Q8 model, collect an importance matrix on it, then convert with it.
-        std::vector<char*> rest;
+        std::vector<std::string> rest;
         std::string calib, device = "auto";
         int calib_windows = 40;
         for (int i = 2; i < argc; i++) {
@@ -133,51 +193,30 @@ int main(int argc, char** argv) {
             else if (s == "--device" && i + 1 < argc) device = argv[++i];
             else rest.push_back(argv[i]);
         }
-        if (calib.empty()) return convert_main((int)rest.size(), rest.data());
+        if (calib.empty()) {
+            std::vector<char*> av;
+            for (auto& r : rest) av.push_back((char*)r.c_str());
+            return convert_main((int)av.size(), av.data());
+        }
         if (rest.size() < 2) die("usage: tachyon convert <hf_dir> <out.tach> --calib <text file> [...]");
-        std::string out = rest[1];
-        std::string tmp = out + ".q8tmp", imat = out + ".imatrix";
-        {
-            // calibration model: Q8 when it fits comfortably in VRAM, else plain Q4 (statistics barely change)
-            size_t ckpt = 0;
-            {
-                SafeTensors st; st.open_dir(rest[0]);
-                for (auto& n : st.names()) ckpt += st.get(n)->nbytes;
-            }
-            const char* cq = ckpt > (12ull << 30) ? "q4" : "q8";
-            logi("calibration model: %s (checkpoint %.1f GB)", cq, ckpt / 1e9);
-            std::vector<char*> a8 = {rest[0], (char*)tmp.c_str(), (char*)"-q", (char*)cq};
-            convert_main((int)a8.size(), a8.data());
-        }
-        {
-            static IMatrix im;
-            g_imatrix = &im;
-            Engine e;
-            EngineOptions o;
-            o.device = device;
-            o.backend.ctx = 1024; o.backend.n_slots = 1;
-            e.load(tmp, o);
-            auto ids = e.tok.encode(read_file(calib), false);
-            int win = 512, nwin = 0;
-            for (size_t st = 0; st + win <= ids.size() && nwin < calib_windows; st += win, nwin++)
-                for (int c = 0; c < win; c += 128) {
-                    std::vector<BatchToken> b(128);
-                    for (int i = 0; i < 128; i++) b[i] = {ids[st + c + i], 0, c + i, i == 127};
-                    e.be->forward(b);
-                }
-            e.be->imat_flush();
-            im.save(imat);
-            g_imatrix = nullptr;
-            logi("importance matrix from %d x %d calibration tokens -> %s", nwin, win, imat.c_str());
-        }
-        remove(tmp.c_str());
-        std::vector<char*> a4 = rest;
-        a4.push_back((char*)"--imatrix");
-        a4.push_back((char*)imat.c_str());
-        return convert_main((int)a4.size(), a4.data());
+        std::vector<std::string> extra(rest.begin() + 2, rest.end());
+        return convert_calibrated(rest[0], rest[1], extra, read_file(calib), device, calib_windows);
+    }
+    if (runner_is_command(cmd)) return runner_main(cmd, argc - 2, argv + 2);
+    if (cmd == "run" && argc > 2 && argv[2][0] != '-') return runner_run(argc - 2, argv + 2);   // tachyon run <model>
+    if (cmd == "serve") {
+        bool has_model = false;
+        for (int i = 2; i < argc; i++) has_model |= !strcmp(argv[i], "-m") || !strcmp(argv[i], "--model");
+        if (!has_model) return runner_serve(argc - 2, argv + 2);   // model manager
     }
     if (cmd == "selftest") { void cpu_selftest(); cpu_selftest(); return 0; }
     Args a = parse_args(argc - 2, argv + 2);
+    if (cmd == "serve") {
+        // agent workloads need long contexts more than many parallel slots: default to 32k (capped by the model)
+        // and drop slots before going below 16k (or below an explicit -c)
+        if (!a.ctx_set) a.ctx = 32768;
+        a.min_ctx = a.ctx_set ? a.ctx : 16384;
+    }
     if (cmd == "tokenize") {
         ModelFile mf; mf.open(a.model);
         Tokenizer t; t.load(mf);
@@ -321,7 +360,12 @@ int main(int argc, char** argv) {
     }
     if (cmd == "serve") {
         e.start();
-        return server_main(e, a.host, a.port);
+        ServerOptions so;
+        so.host = a.host;
+        so.port = a.port;
+        so.api_key = a.api_key.empty() && getenv("TACHYON_API_KEY") ? getenv("TACHYON_API_KEY") : a.api_key;
+        so.alias = a.alias;
+        return server_main(e, so);
     }
     usage();
     return 1;

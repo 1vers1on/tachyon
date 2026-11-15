@@ -260,9 +260,10 @@ public:
             }
         }
     }
+    bool supports_state_backup() const override { return opt.state_rollback || opt.state_backup; }
     void state_copy(int slot, bool save) {
         bind();
-        if (!opt.state_rollback) return;
+        if (!opt.state_rollback && !opt.state_backup) return;
         for (auto& L : layers_) {
             const LayerCfg& lc = L.c;
             auto cp = [&](CUdeviceptr live, CUdeviceptr bak, size_t per) {
@@ -554,7 +555,7 @@ private:
                 if (lc.window > 0) ring_bytes += tokb * (lc.window + opt.max_batch);
                 else per_tok += tokb;
             }
-            const size_t rb = opt.state_rollback ? 2 : 1;   // backup per slot (+ row snapshots, below)
+            const size_t rb = opt.state_rollback || opt.state_backup ? 2 : 1;   // backup per slot (+ row snapshots, below)
             if (lc.type == "conv") {
                 state_bytes += rb * (size_t)(lc.conv_k - 1) * c_.hidden * 4;
                 if (opt.state_rollback) snap_bytes += SNAP_ROWS * (size_t)(lc.conv_k - 1) * c_.hidden * 4;
@@ -573,6 +574,16 @@ private:
         const size_t budget_tok = per_tok + opt.extra_kv_per_tok;
         if (budget_tok > 0) {
             size_t want = budget_tok * opt.ctx * opt.n_slots;
+            if (want > avail && opt.min_ctx > 0 && opt.n_slots > 1) {
+                // fewer slots before a context below min_ctx (long agent sessions need context more than parallelism)
+                int ns = (int)std::max<size_t>(1, avail / (budget_tok * (size_t)std::min(opt.ctx, opt.min_ctx)));
+                if (ns < opt.n_slots) {
+                    logi("cuda: using %d slot%s instead of %d to keep >= %d tokens of context per slot", ns, ns > 1 ? "s" : "", opt.n_slots,
+                         std::min(opt.ctx, opt.min_ctx));
+                    opt.n_slots = ns;
+                    want = budget_tok * opt.ctx * opt.n_slots;
+                }
+            }
             if (want > avail) {
                 int ctx2 = (int)(avail / (budget_tok * opt.n_slots)) / 256 * 256;
                 if (ctx2 < 512) { opt.n_slots = 1; ctx2 = (int)(avail / budget_tok) / 256 * 256; }
@@ -627,20 +638,16 @@ private:
                 size_t n = (size_t)opt.n_slots * (lc.conv_k - 1) * c_.hidden * 4;
                 L.st0 = alloc(n);
                 CU(cuMemsetD8Async(L.st0, 0, n, stream_));
-                if (opt.state_rollback) {
-                    const size_t per = (size_t)(lc.conv_k - 1) * c_.hidden * 4;
-                    L.snap0 = alloc(SNAP_ROWS * per); L.bak0 = alloc(opt.n_slots * per);
-                }
+                if (opt.state_rollback) L.snap0 = alloc(SNAP_ROWS * (n / opt.n_slots));
+                if (opt.state_rollback || opt.state_backup) L.bak0 = alloc(n);
             } else {
                 size_t n0 = (size_t)opt.n_slots * (lc.dn_conv - 1) * lc.dn_conv_dim() * 4;
                 size_t n1 = (size_t)opt.n_slots * lc.dn_nv * lc.dn_dk * lc.dn_dv * 4;
                 L.st0 = alloc(n0); L.st1 = alloc(n1);
                 CU(cuMemsetD8Async(L.st0, 0, n0, stream_));
                 CU(cuMemsetD8Async(L.st1, 0, n1, stream_));
-                if (opt.state_rollback) {
-                    L.snap0 = alloc(SNAP_ROWS * (n0 / opt.n_slots)); L.snap1 = alloc(SNAP_ROWS * (n1 / opt.n_slots));
-                    L.bak0 = alloc(n0); L.bak1 = alloc(n1);
-                }
+                if (opt.state_rollback) { L.snap0 = alloc(SNAP_ROWS * (n0 / opt.n_slots)); L.snap1 = alloc(SNAP_ROWS * (n1 / opt.n_slots)); }
+                if (opt.state_rollback || opt.state_backup) { L.bak0 = alloc(n0); L.bak1 = alloc(n1); }
             }
         }
         logi("cuda: KV cache %.2f GB (%d slots x %d ctx, %s)%s", per_tok * opt.ctx * opt.n_slots / 1e9, opt.n_slots, opt.ctx,

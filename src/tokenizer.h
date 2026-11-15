@@ -6,10 +6,27 @@
 #include <unordered_map>
 #include <mutex>
 
+struct ToolCall {
+    std::string id, name;
+    std::string arguments;  // JSON object text
+};
+
 struct ChatMessage {
     std::string role;
     std::string content;
     std::string reasoning;  // optional reasoning_content
+    std::vector<ToolCall> tool_calls;   // assistant turns
+    std::string tool_call_id, name;     // role "tool": the call this result answers
+};
+
+// How a model writes tool calls (picked from the chat format / stored template)
+enum class ToolFormat {
+    Hermes,    // Qwen3 / Qwen2.5: <tool_call>{"name": .., "arguments": ..}</tool_call>
+    QwenXml,   // Qwen3.5: <tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>
+    Lfm2,      // LFM2 / LFM2.5: <|tool_call_start|>[name(k='v', n=1)]<|tool_call_end|>
+    Gemma4,    // <|tool_call>call:NAME{k:<|"|>v<|"|>}<tool_call|>
+    Mistral,   // [TOOL_CALLS] [{"name": .., "arguments": ..}]
+    Generic,   // models without a native format: Hermes-style instructions in the system prompt
 };
 
 class Tokenizer {
@@ -27,9 +44,13 @@ public:
     const std::vector<int>& eos_ids() const { return eos_; }
 
     // chat
-    // tools: function definitions already serialized as JSON (one string per tool)
+    // tools: OpenAI-style definitions {"type": "function", "function": {name, description, parameters}}
     std::string render_chat(const std::vector<ChatMessage>& msgs, bool add_generation_prompt, bool enable_thinking,
-                            const std::vector<std::string>& tools = {}) const;
+                            const std::vector<Json>& tools = {}) const;
+    ToolFormat tool_format() const { return tool_format_; }
+    // text that opens a tool call in the model's format (forced tool_choice prefills the prompt with it);
+    // with a name, also the start of that function's call
+    std::string tool_call_prefix(const std::string& name = "") const;
     bool thinking_model() const { return thinking_; }
     bool think_default() const { return think_default_; }
     const std::string& think_open_tag() const { return think_tag_open_; }
@@ -62,6 +83,11 @@ private:
     std::string chat_format_ = "chatml";
     std::string chat_prefix_;
     std::string tool_style_ = "json";
+    ToolFormat tool_format_ = ToolFormat::Hermes;
+    std::string render_generic_tools(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,
+                                     const std::vector<Json>& tools) const;
+    std::string render_gemma4(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,
+                              const std::vector<Json>& tools) const;
     std::string think_tag_open_ = "<think>", think_tag_close_ = "</think>", think_system_token_;
     bool think_default_ = true, think_open_ = false, think_disable_block_ = true;
     bool spm_ = false;                 // SentencePiece-style BPE (Gemma)

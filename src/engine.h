@@ -18,12 +18,16 @@ struct GenRequest {
     int max_tokens = 512;
     std::vector<std::string> stop;
     bool ignore_eos = false;
+    // prompt tokens [0, checkpoint) are a reusable conversation prefix (all messages, without the generation
+    // prompt): stateful models save their recurrent state there so the next turn can resume from it
+    int checkpoint = 0;
     // Called on the engine thread with each new chunk of text. Return false to cancel.
     std::function<bool(const std::string& delta)> on_text;
 
     // ---- results (valid after done) ----
     std::string text;
     std::string finish_reason;  // stop | length | cancelled | error
+    std::string stop_hit;       // the stop string that ended generation (finish_reason "stop")
     std::string error;
     int n_prompt = 0, n_cached = 0, n_gen = 0;
     int n_draft = 0, n_draft_accepted = 0;
@@ -58,6 +62,8 @@ public:
     void submit(std::shared_ptr<GenRequest> r);
     // run one request synchronously (no background thread needed)
     void run_sync(std::shared_ptr<GenRequest> r);
+    struct Stats { int slots = 0, active = 0, queued = 0; };
+    Stats stats();
 
     Tokenizer tok;
     ModelFile mf;
@@ -86,6 +92,7 @@ private:
         float acc_ema = 0.5f;     // n-gram draft acceptance (moving average)
         int spec_pause = 0;       // decode steps left without n-gram drafts (low acceptance on costly models)
         int spec_miss = 0;
+        int ckpt_len = 0;         // stateful models: the backend's state backup holds the state after cache[0, ckpt_len)
         double last_used = 0;
     };
     void loop();
@@ -103,5 +110,8 @@ private:
     std::thread th_;
     bool running_ = false;
     std::vector<float> logits_buf_;
-    float spec_min_accept_ = 0.f;  // MoE: extra tokens are expensive, pause n-gram drafting below this acceptance
+    float spec_min_accept_ = 0.f;
+    int ring_slack_ = 1 << 30;     // sliding-window rings: max tokens a reused prefix may be followed by in the cache
+    std::atomic<int> n_active_{0};
+    bool ckpt_ = false;            // stateful model with a per-slot state backup: prompt checkpoints enabled  // MoE: extra tokens are expensive, pause n-gram drafting below this acceptance
 };
