@@ -18,7 +18,7 @@
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-struct Url { std::string host = "127.0.0.1", port = "8080", base; };
+struct Url { std::string host = "127.0.0.1", port = "28657", base; };
 static Url parse_url(std::string u) {
     Url r;
     if (u.rfind("http://", 0) == 0) u = u.substr(7);
@@ -187,7 +187,7 @@ static void usage() {
         "       tachyon-client -p \"question\"             one-shot\n"
         "       tachyon-client --bench N [-c 4]           load test: N requests, c concurrent\n\n"
         "options:\n"
-        "  --url URL          server (default http://127.0.0.1:8080)\n"
+        "  --url URL          server (default http://127.0.0.1:28657)\n"
         "  -m, --model NAME   model name to send\n"
         "  -s, --system TEXT  system prompt\n"
         "  -n, --max-tokens N (default 1024)\n"
@@ -199,7 +199,7 @@ static void usage() {
 
 int main(int argc, char** argv) {
     Opts o;
-    o.url = parse_url("http://127.0.0.1:8080");
+    o.url = parse_url("http://127.0.0.1:28657");
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", a.c_str()); exit(1); } return argv[++i]; };

@@ -58,7 +58,7 @@ starts are instant.
 ```bash
 ./tachyon run qwen3:8b                     # download, convert (Q4 + imatrix), start the server, open a chat
 ./tachyon run qwen3.5:9b "explain RoPE"    # one-shot prompt
-./tachyon serve                            # model server on 127.0.0.1:8080; loads models on demand
+./tachyon serve                            # model server on 127.0.0.1:28657; loads models on demand
 ./tachyon catalog                          # models available by name
 ./tachyon list | ps | show M | stop M | rm M
 ```
@@ -69,18 +69,18 @@ Hugging Face cache (`$HF_HOME/hub`) is reused when it has the model. Gated repos
 
 ### Use it from an agent
 
-OpenAI-compatible clients use `http://127.0.0.1:8080/v1`. Anthropic-compatible clients use
-`http://127.0.0.1:8080`. For example, Claude Code:
+OpenAI-compatible clients use `http://127.0.0.1:28657/v1`. Anthropic-compatible clients use
+`http://127.0.0.1:28657`. For example, Claude Code:
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=local \
+ANTHROPIC_BASE_URL=http://127.0.0.1:28657 ANTHROPIC_AUTH_TOKEN=local \
 ANTHROPIC_MODEL=qwen3.5:9b ANTHROPIC_SMALL_FAST_MODEL=qwen3.5:9b claude
 ```
 
 Or with curl:
 
 ```bash
-curl localhost:8080/v1/chat/completions \
+curl localhost:28657/v1/chat/completions \
   -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"hi"}]}'
 ```
 
@@ -91,7 +91,7 @@ curl localhost:8080/v1/chat/completions \
 # --calib enables importance-weighted 4-bit quantization (recommended).
 ./tachyon convert ~/hf/Qwen3-1.7B models/qwen3-1.7b-q4.tach --calib data/calib.txt
 
-./tachyon serve -m models/qwen3-1.7b-q4.tach --port 8080
+./tachyon serve -m models/qwen3-1.7b-q4.tach --port 28657
 
 ./tachyon-client                     # interactive streaming chat
 ./tachyon-client -p "Explain RoPE"   # one-shot
@@ -195,8 +195,8 @@ data/           calibration text (wikitext-2 train) and evaluation text (wikitex
 
 ```bash
 tools/regress.sh                          # perplexity regression across models, both CUDA paths
-python tools/api_test.py 8080 qwen3:1.7b  # OpenAI + Anthropic SDK tests (pip install openai anthropic)
-python tools/tool_test.py 8080 MODEL...   # tool-call round trip and prefix reuse per model
+python tools/api_test.py 28657 qwen3:1.7b  # OpenAI + Anthropic SDK tests (pip install openai anthropic)
+python tools/tool_test.py 28657 MODEL...   # tool-call round trip and prefix reuse per model
 ```
 
 `tools/hf_ppl.py` and `tools/hf_compare.py` produce Hugging Face transformers reference outputs. They

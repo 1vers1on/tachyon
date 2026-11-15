@@ -3,7 +3,7 @@
 //
 //   tachyon pull qwen3:8b            download from Hugging Face, convert (Q4 + importance matrix), register
 //   tachyon run qwen3:8b ["prompt"]  chat (starts the background server and pulls the model when needed)
-//   tachyon serve                    model manager on :8080 (OpenAI + Anthropic APIs, any local model by name)
+//   tachyon serve                    model manager on :28657 (OpenAI + Anthropic APIs, any local model by name)
 //   tachyon list | ps | rm | stop | show | import | catalog
 #include "common.h"
 #include "json.h"
@@ -489,7 +489,7 @@ int do_pull(const std::string& ref_str, bool keep_download, const std::string& d
 
 // ------------------------------------------------------------------------------------------------ manager server
 
-struct Endpoint { std::string host = "127.0.0.1"; int port = 8080; };
+struct Endpoint { std::string host = "127.0.0.1"; int port = 28657; };
 Endpoint endpoint() {
     Endpoint e;
     const char* h = getenv("TACHYON_HOST");
@@ -1199,7 +1199,7 @@ void runner_usage() {
     fprintf(stderr,
         "model runner (ollama-style):\n"
         "  tachyon run <model> [prompt]   chat with a model (pulls it and starts the background server when needed)\n"
-        "  tachyon serve                  model server on $TACHYON_HOST (default 127.0.0.1:8080): any local model by name,\n"
+        "  tachyon serve                  model server on $TACHYON_HOST (default 127.0.0.1:28657): any local model by name,\n"
         "                                 loaded on demand  [--keep-alive SECS] [--max-loaded N] [--default-model NAME]\n"
         "                                 [--runner-args \"--kv8 ...\"] [--api-key KEY] [--no-auto-pull]\n"
         "  tachyon pull <model>           download from Hugging Face + convert (Q4 + importance matrix)\n"

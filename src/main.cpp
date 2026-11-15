@@ -22,7 +22,7 @@ static void usage() {
         "  tachyon convert <hf_model_dir> <out.tach> [-q q4|q8|f16] [--embed-quant q4|q8|f16] [--head-quant q4|q8]\n"
         "                  [--calib text.txt]  (importance-weighted quantization from calibration text)\n"
         "                  [--imatrix file] [--tensor-quant wdown=q8,blk.0.=q8]\n"
-        "  tachyon serve   -m model.tach [--host 127.0.0.1] [--port 8080] [options]\n"
+        "  tachyon serve   -m model.tach [--host 127.0.0.1] [--port 28657] [options]\n"
         "  tachyon run     -m model.tach -p \"prompt\" [--chat] [-n 256] [options]\n"
         "  tachyon bench   -m model.tach [-n 256] [--prompt-len 512] [options]\n"
         "  tachyon tokenize -m model.tach -p \"text\"\n\n"
@@ -46,7 +46,7 @@ static void usage() {
 
 struct Args {
     std::string model, prompt, host = "127.0.0.1", device = "auto", out;
-    int port = 8080, n = 256, ctx = 8192, min_ctx = 0, slots = -1, threads = 0, spec = -1, prompt_len = 512;
+    int port = 28657, n = 256, ctx = 8192, min_ctx = 0, slots = -1, threads = 0, spec = -1, prompt_len = 512;
     bool chat = false, kv8 = false, graphs = true, no_think = false, think = false;
     std::string draft, api_key, alias;
     bool ctx_set = false;

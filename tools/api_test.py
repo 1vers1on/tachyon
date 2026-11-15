@@ -3,7 +3,7 @@
 import json, sys, time, socket, urllib.request
 import openai, anthropic
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8091
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 28657
 MODEL = sys.argv[2] if len(sys.argv) > 2 else "test"
 BASE = f"http://127.0.0.1:{PORT}"
 oc = openai.OpenAI(base_url=BASE + "/v1", api_key="x", timeout=300)
