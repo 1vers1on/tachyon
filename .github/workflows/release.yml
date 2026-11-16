@@ -56,10 +56,9 @@ jobs:
         env:
           DISTRO: ${{ matrix.distro }}
         run: |
+          tar -xzf dist/tachyon-linux-x86_64.tar.gz -C dist
           docker run --rm -v "$PWD/dist:/release:ro" "$DISTRO" sh -ec '
-            cd /tmp
-            tar -xzf /release/tachyon-linux-x86_64.tar.gz
-            cd tachyon-*
+            cd /release/tachyon-*
             bin/tachyon --version
             TACHYON_CPU=scalar bin/tachyon selftest
             bin/tachyon catalog
