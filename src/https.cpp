@@ -1,6 +1,8 @@
 // Tachyon - HTTP(S) GET client with TLS from a runtime-loaded libssl
 #include "https.h"
 #include "http.h"
+#include "http_response.h"
+#include "common.h"
 #include <dlfcn.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -134,8 +136,6 @@ struct Stream {
     bool open(const Url& u, double timeout, std::string& err) {
         fd = http_connect(u.host, u.port, timeout);
         if (fd < 0) { err = "cannot connect to " + u.host + ":" + std::to_string(u.port); return false; }
-        timeval tv{(time_t)timeout, 0};
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         if (!u.tls) return true;
         lib = ssl_lib();
         if (!lib) { err = g_ssl.error; return false; }
@@ -221,57 +221,39 @@ HttpGetResult http_get(const std::string& url0, const HttpGetOptions& opt,
         if (first.tls && !u.tls) { res.error = "refusing redirect from HTTPS to plain HTTP (" + u.host + ")"; return res; }
         Stream s;
         if (!s.open(u, opt.timeout_s, res.error)) return res;
-        std::string req = "GET " + u.path + " HTTP/1.1\r\nHost: " + u.host + "\r\nUser-Agent: tachyon/0.1\r\n"
+        std::string req = "GET " + u.path + " HTTP/1.1\r\nHost: " + u.host +
+                          ((u.tls && u.port == 443) || (!u.tls && u.port == 80) ? "" : ":" + std::to_string(u.port)) +
+                          "\r\nUser-Agent: tachyon/" TACH_VERSION "\r\n"
                           "Accept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n";
-        if (!opt.auth.empty() && u.host == first.host && u.tls == first.tls) req += "Authorization: " + opt.auth + "\r\n";
+        if (!opt.auth.empty() && u.host == first.host && u.port == first.port && u.tls == first.tls) req += "Authorization: " + opt.auth + "\r\n";
         if (opt.range_from > 0) req += "Range: bytes=" + std::to_string(opt.range_from) + "-\r\n";
         req += "\r\n";
         if (!s.write_all(req)) { res.error = "send to " + u.host + " failed"; return res; }
-        size_t he;
-        while ((he = s.buf.find("\r\n\r\n")) == std::string::npos) {
-            if (s.buf.size() > (1 << 20)) { res.error = "response header too large"; return res; }
-            if (s.fill() <= 0) { res.error = "connection to " + u.host + " closed before the response header"; return res; }
-        }
-        std::string head = s.buf.substr(0, he + 2);
-        s.buf.erase(0, he + 4);
-        res.status = 0;
-        sscanf(head.c_str(), "HTTP/%*s %d", &res.status);
+        std::string head;
+        bool chunked;
+        do {
+            size_t he;
+            while ((he = s.buf.find("\r\n\r\n")) == std::string::npos) {
+                if (s.buf.size() > (1 << 20)) { res.error = "response header too large"; return res; }
+                if (s.fill() <= 0) { res.error = "connection to " + u.host + " closed before the response header"; return res; }
+            }
+            if (he > (1 << 20)) { res.error = "response header too large"; return res; }
+            head = s.buf.substr(0, he + 4);
+            s.buf.erase(0, he + 4);
+            if (!http_response_head(head, res.status, chunked, res.content_length) || res.status == 101) {
+                res.error = "invalid HTTP response header"; return res;
+            }
+        } while (res.status < 200);
         if (res.status >= 300 && res.status < 400 && res.status != 304) {
             std::string loc = header_value(head, "location");
             if (loc.empty()) { res.error = "redirect without Location"; return res; }
             url = resolve_location(u, loc);
             continue;
         }
-        bool chunked = lower(header_value(head, "transfer-encoding")).find("chunked") != std::string::npos;
-        std::string cl = header_value(head, "content-length");
-        res.content_length = !chunked && !cl.empty() ? strtoll(cl.c_str(), nullptr, 10) : -1;
         if (on_head) on_head(res);
-        auto emit = [&](const char* p, size_t n) { return n == 0 || on_data(p, n); };
-        if (chunked) {
-            for (;;) {
-                size_t le;
-                while ((le = s.buf.find("\r\n")) == std::string::npos)
-                    if (s.fill() <= 0) { res.error = "connection closed mid-response"; return res; }
-                size_t n = strtoull(s.buf.c_str(), nullptr, 16);
-                s.buf.erase(0, le + 2);
-                if (n == 0) break;
-                while (s.buf.size() < n + 2)
-                    if (s.fill() <= 0) { res.error = "connection closed mid-response"; return res; }
-                if (!emit(s.buf.data(), n)) { res.error = "aborted"; return res; }
-                s.buf.erase(0, n + 2);
-            }
-        } else {
-            int64_t left = res.content_length;
-            for (;;) {
-                size_t n = left >= 0 ? (size_t)std::min<int64_t>(left, (int64_t)s.buf.size()) : s.buf.size();
-                if (!emit(s.buf.data(), n)) { res.error = "aborted"; return res; }
-                s.buf.erase(0, n);
-                if (left >= 0 && (left -= (int64_t)n) == 0) break;
-                int r = s.fill();
-                if (r == 0 && left < 0) break;   // body delimited by connection close
-                if (r <= 0) { res.error = r == 0 ? "connection closed mid-response" : "read from " + u.host + " failed or timed out"; return res; }
-            }
-        }
+        if (res.status != 204 && res.status != 304)
+            res.error = http_response_body(s.buf, chunked, res.content_length,
+                [&]() { return s.fill(); }, [&](const char* p, size_t n) { return !on_data || on_data(p, n); });
         return res;
     }
     res.error = "too many redirects";

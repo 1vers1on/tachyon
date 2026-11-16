@@ -112,6 +112,7 @@ public:
     }
 
     void init(const ModelFile& mf, const BackendOptions& o) override {
+        mf.validate_inference();
         opt = o;
         c_ = mf.config;
         CU(dcu.cuDeviceGet(&dev_, o.device));

@@ -294,13 +294,21 @@ std::map<std::string, std::vector<float>> IMatrix::load(const std::string& path)
     if (s.size() < 8 || s.compare(0, 4, "TIMX") != 0) die("bad imatrix file %s", path.c_str());
     std::map<std::string, std::vector<float>> r;
     size_t p = 4;
-    uint32_t n; memcpy(&n, &s[p], 4); p += 4;
+    auto take_u32 = [&]() {
+        if (s.size() - p < 4) die("truncated imatrix file %s", path.c_str());
+        uint32_t value; memcpy(&value, s.data() + p, 4); p += 4;
+        return value;
+    };
+    uint32_t n = take_u32();
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t nl; memcpy(&nl, &s[p], 4); p += 4;
+        uint32_t nl = take_u32();
+        if (nl > s.size() - p) die("truncated imatrix file %s", path.c_str());
         std::string name = s.substr(p, nl); p += nl;
-        uint32_t k; memcpy(&k, &s[p], 4); p += 4;
+        uint32_t k = take_u32();
+        if (k > (s.size() - p) / sizeof(float)) die("truncated imatrix file %s", path.c_str());
         std::vector<float> v(k);
-        memcpy(v.data(), &s[p], 4 * k); p += 4 * k;
+        if (k) memcpy(v.data(), s.data() + p, sizeof(float) * k);
+        p += sizeof(float) * k;
         r[name] = v;
     }
     return r;

@@ -132,10 +132,10 @@ ModelRef parse_ref(std::string s) {
         return r;
     }
     std::string base = s;
+    if (ends_with(base, ":latest")) base.resize(base.size() - 7);
     if (base.find(':') == std::string::npos) {
         for (auto& c : kCatalog) if (c.is_default && std::string(c.name).rfind(base + ":", 0) == 0) { base = c.name; break; }
     }
-    if (ends_with(base, ":latest")) base = base.substr(0, base.size() - 7);
     for (auto& c : kCatalog)
         if (base == c.name) {
             r.repo = c.repo;
@@ -281,6 +281,7 @@ int run_prog(const std::vector<std::string>& argv, const std::string& log) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, nullptr);
         int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) _exit(127);
         dup2(fd, 1); dup2(fd, 2); close(fd);
@@ -541,6 +542,12 @@ int do_pull(const std::string& ref_str, bool keep_download, const std::string& d
 // ------------------------------------------------------------------------------------------------ manager server
 
 struct Endpoint { std::string host = "127.0.0.1"; int port = 28657; };
+int manager_call(const Endpoint& ep, const std::string& method, const std::string& path, const std::string& body,
+                 const std::function<bool(const std::string&)>& on_data, std::string* err, double timeout = 0) {
+    std::string headers;
+    if (const char* key = getenv("TACHYON_API_KEY")) headers = std::string("Authorization: Bearer ") + key + "\r\n";
+    return http_call(ep.host, ep.port, method, path, body, on_data, err, timeout, headers);
+}
 Endpoint endpoint() {
     Endpoint e;
     const char* h = getenv("TACHYON_HOST");
@@ -557,7 +564,7 @@ Endpoint endpoint() {
 }
 
 int free_port() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -736,6 +743,7 @@ private:
         for (auto& x : o_.runner_args) a.push_back(x);
         pid_t pid = fork();
         if (pid == 0) {
+            sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, nullptr);
             prctl(PR_SET_PDEATHSIG, SIGTERM);   // runners die with the manager
             int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
@@ -1007,6 +1015,8 @@ private:
             }
             return reply(c, r, 200, Json::object());
         }
+        if (r.path == "/api/pull" && r.method != "POST") return error(c, r, 405, "use POST for /api/pull");
+        if (r.path == "/api/delete" && r.method != "DELETE") return error(c, r, 405, "use DELETE for /api/delete");
         if (r.path == "/api/pull") {
             if (name.empty()) return error(c, r, 400, "model is required");
             const bool stream = body.get_bool("stream", true);
@@ -1076,7 +1086,7 @@ private:
 
 int manager_main(const ManagerOptions& o) {
     signal(SIGPIPE, SIG_IGN);
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     sockaddr_in addr{};
@@ -1086,10 +1096,15 @@ int manager_main(const ManagerOptions& o) {
     if (bind(fd, (sockaddr*)&addr, sizeof addr) < 0) die("cannot bind %s:%d (%s)", o.ep.host.c_str(), o.ep.port, strerror(errno));
     if (listen(fd, 128) < 0) die("listen failed");
     static Manager* mgr = new Manager(o);
-    struct sigaction sa{};
-    sa.sa_handler = [](int) { mgr->stop_all(); _exit(0); };
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
+    // Cleanup takes locks and waits for children, so it must run outside an asynchronous signal handler.
+    // Block before starting threads; forked children restore their signal mask before exec.
+    sigset_t signals;
+    sigemptyset(&signals); sigaddset(&signals, SIGINT); sigaddset(&signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+    std::thread([signals]() mutable {
+        int signal;
+        if (sigwait(&signals, &signal) == 0) { mgr->stop_all(); _exit(0); }
+    }).detach();
     std::thread([] { mgr->reaper(); }).detach();
     auto local = list_local();
     logi("Tachyon %s model server on http://%s:%d  (%zu local models in %s)", TACH_VERSION, o.ep.host.c_str(), o.ep.port, local.size(), models_dir().c_str());
@@ -1098,7 +1113,7 @@ int manager_main(const ManagerOptions& o) {
     while (true) {
         sockaddr_in cli{};
         socklen_t cl = sizeof cli;
-        int c = accept(fd, (sockaddr*)&cli, &cl);
+        int c = accept4(fd, (sockaddr*)&cli, &cl, SOCK_CLOEXEC);
         if (c < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {   // transient: keep serving
@@ -1120,7 +1135,7 @@ int manager_main(const ManagerOptions& o) {
 
 bool manager_up(const Endpoint& ep, bool* is_manager = nullptr) {
     std::string body;
-    int st = http_call(ep.host, ep.port, "GET", "/health", "", [&](const std::string& d) { body += d; return true; }, nullptr, 2);
+    int st = manager_call(ep, "GET", "/health", "", [&](const std::string& d) { body += d; return true; }, nullptr, 2);
     if (st != 200) return false;
     if (is_manager) *is_manager = Json::parse(body).get_bool("manager", false);
     return true;
@@ -1181,7 +1196,7 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
     body.set("stream_options", so);
     if (o.think >= 0) { Json kw = Json::object(); kw.set("enable_thinking", o.think == 1); body.set("chat_template_kwargs", kw); }
     std::string line_buf, content, reasoning, err_msg, raw;
-    bool in_reasoning = false, got_any = false;
+    bool in_reasoning = false, got_done = false;
     Json usage, timings;
     const bool tty = isatty(1);
     std::atomic<bool> first{false};
@@ -1200,7 +1215,7 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
         if (!first.exchange(true) && spinner.joinable()) { spinner.join(); fprintf(stderr, "\r  \r"); fflush(stderr); }
     };
     std::string err;
-    int st = http_call(ep.host, ep.port, "POST", "/v1/chat/completions", body.dump(), [&](const std::string& d) {
+    int st = manager_call(ep, "POST", "/v1/chat/completions", body.dump(), [&](const std::string& d) {
         raw += d;
         line_buf += d;
         size_t p;
@@ -1210,7 +1225,7 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.rfind("data: ", 0) != 0) continue;
             std::string payload = line.substr(6);
-            if (payload == "[DONE]") return true;
+            if (payload == "[DONE]") { got_done = true; return true; }
             Json j = Json::parse(payload);
             if (j.has("error")) { err_msg = j["error"].get_str("message", "?"); return false; }
             if (j["usage"].is_obj()) usage = j["usage"];
@@ -1221,7 +1236,6 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
             std::string c = delta.get_str("content", "");
             if (r.empty() && c.empty()) continue;
             stop_spinner();
-            got_any = true;
             reasoning += r;
             content += c;
             if (!r.empty() && o.show_thinking) {
@@ -1240,13 +1254,14 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
     if (in_reasoning && tty) printf("\033[0m");
     printf("\n");
     fflush(stdout);
-    if (st < 0) { loge("%s", err.c_str()); return false; }
+    if (st < 0) { loge("%s", err_msg.empty() ? err.c_str() : err_msg.c_str()); return false; }
     if (st != 200) {
         Json j = Json::parse(raw);
         loge("%s", j["error"].get_str("message", raw).c_str());
         return false;
     }
     if (!err_msg.empty()) { loge("%s", err_msg.c_str()); return false; }
+    if (!got_done) { loge("incomplete generation stream"); return false; }
     if (o.verbose && usage.is_obj())
         fprintf(stderr, "%s[%lld prompt tokens (%lld cached) | %lld generated | prompt %.0f tok/s | generation %.1f tok/s]%s\n", isatty(2) ? "\033[36m" : "",
                 (long long)usage.get_int("prompt_tokens", 0), (long long)usage["prompt_tokens_details"].get_int("cached_tokens", 0),
@@ -1257,7 +1272,7 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
     a.set("content", content);
     if (!reasoning.empty()) a.set("reasoning_content", reasoning);
     history.push(a);
-    return got_any || true;
+    return true;
 }
 
 int run_cli(int argc, char** argv) {
@@ -1458,7 +1473,7 @@ int runner_main(const std::string& cmd, int argc, char** argv) {
             if (!find_local(argv[i], m) || m.manifest.empty()) { loge("model '%s' not found", argv[i]); rc = 1; continue; }
             if (manager_up(ep)) {   // unload first
                 Json b = Json::object(); b.set("model", m.name);
-                http_call(ep.host, ep.port, "POST", "/api/stop", b.dump(), nullptr, nullptr, 10);
+                manager_call(ep, "POST", "/api/stop", b.dump(), nullptr, nullptr, 10);
             }
             Manager::remove_model(m);
             printf("deleted '%s'\n", m.name.c_str());
@@ -1467,7 +1482,7 @@ int runner_main(const std::string& cmd, int argc, char** argv) {
     }
     if (cmd == "ps") {
         std::string body;
-        if (http_call(ep.host, ep.port, "GET", "/api/ps", "", [&](const std::string& d) { body += d; return true; }, nullptr, 5) != 200) {
+        if (manager_call(ep, "GET", "/api/ps", "", [&](const std::string& d) { body += d; return true; }, nullptr, 5) != 200) {
             loge("tachyon server is not running (start: tachyon serve)");
             return 1;
         }
@@ -1485,7 +1500,7 @@ int runner_main(const std::string& cmd, int argc, char** argv) {
         Json b = Json::object();
         b.set("model", argv[0]);
         std::string body;
-        int st = http_call(ep.host, ep.port, "POST", "/api/stop", b.dump(), [&](const std::string& d) { body += d; return true; }, nullptr, 30);
+        int st = manager_call(ep, "POST", "/api/stop", b.dump(), [&](const std::string& d) { body += d; return true; }, nullptr, 30);
         if (st != 200) { loge("%s", st < 0 ? "tachyon server is not running" : Json::parse(body)["error"].get_str("message", body).c_str()); return 1; }
         return 0;
     }

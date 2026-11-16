@@ -1,4 +1,5 @@
 #include "http.h"
+#include "http_response.h"
 #include "common.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -205,10 +206,28 @@ int http_connect(const std::string& host, int port, double timeout_s) {
     std::string h = host == "localhost" || host.empty() || host == "0.0.0.0" ? "127.0.0.1" : host;
     if (getaddrinfo(h.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return -1;
     int fd = -1;
+    const double deadline = now_sec() + timeout_s;
     for (addrinfo* p = res; p; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        fd = socket(p->ai_family, p->ai_socktype | SOCK_CLOEXEC, p->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (timeout_s > 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+        if (rc < 0 && timeout_s > 0 && errno == EINPROGRESS) {
+            for (;;) {
+                double left = deadline - now_sec();
+                if (left <= 0) break;
+                pollfd pending{fd, POLLOUT, 0};
+                int ready = poll(&pending, 1, (int)std::clamp(left * 1000, 1.0, (double)INT32_MAX));
+                if (ready < 0 && errno == EINTR) continue;
+                int error = 0;
+                socklen_t n = sizeof error;
+                if (ready > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &n) == 0 && !error) rc = 0;
+                break;
+            }
+        }
+        if (timeout_s > 0) fcntl(fd, F_SETFL, flags);
+        if (rc == 0) break;
         close(fd);
         fd = -1;
     }
@@ -219,6 +238,7 @@ int http_connect(const std::string& host, int port, double timeout_s) {
     if (timeout_s > 0) {
         timeval tv{(time_t)timeout_s, (suseconds_t)((timeout_s - (time_t)timeout_s) * 1e6)};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     }
     return fd;
 }
@@ -228,6 +248,7 @@ struct Reader {
     int fd;
     std::string buf;
     Conn* watch = nullptr;   // relay: give up when this client disconnects while upstream is still working
+    bool failed = false;
     bool fill() {
         char tmp[65536];
         while (watch) {
@@ -242,14 +263,17 @@ struct Reader {
         while (true) {
             ssize_t n = recv(fd, tmp, sizeof tmp, 0);
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) return false;
+            if (n <= 0) { failed = n < 0; return false; }
             buf.append(tmp, n);
             return true;
         }
     }
     bool head(std::string& h) {
         size_t he;
-        while ((he = buf.find("\r\n\r\n")) == std::string::npos) if (!fill()) return false;
+        while ((he = buf.find("\r\n\r\n")) == std::string::npos) {
+            if (buf.size() > (1 << 20) || !fill()) return false;
+        }
+        if (he > (1 << 20)) return false;
         h = buf.substr(0, he + 4);
         buf.erase(0, he + 4);
         return true;
@@ -275,6 +299,7 @@ bool send_all(int fd, const std::string& s) {
 int http_call(const std::string& host, int port, const std::string& method, const std::string& path, const std::string& body,
               const std::function<bool(const std::string&)>& on_data, std::string* err, double timeout_s,
               const std::string& extra_headers) {
+    if (err) err->clear();
     int fd = http_connect(host, port, timeout_s);
     if (fd < 0) { if (err) *err = "cannot connect to " + host + ":" + std::to_string(port); return -1; }
     std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n" + extra_headers;
@@ -283,36 +308,22 @@ int http_call(const std::string& host, int port, const std::string& method, cons
     if (!send_all(fd, req)) { close(fd); if (err) *err = "send failed"; return -1; }
     Reader rd{fd, {}};
     std::string head;
-    if (!rd.head(head)) { close(fd); if (err) *err = "connection closed"; return -1; }
     int status = 0;
-    sscanf(head.c_str(), "HTTP/%*s %d", &status);
-    std::string lh = lower(head);
-    bool chunked = lh.find("transfer-encoding: chunked") != std::string::npos;
-    long clen = header_num(lh, "content-length:");
-    bool go = true;
-    if (chunked) {
-        while (go) {
-            size_t le;
-            while ((le = rd.buf.find("\r\n")) == std::string::npos) if (!rd.fill()) { go = false; break; }
-            if (!go) break;
-            long n = strtol(rd.buf.substr(0, le).c_str(), nullptr, 16);
-            rd.buf.erase(0, le + 2);
-            if (n == 0) break;
-            while ((long)rd.buf.size() < n + 2) if (!rd.fill()) { go = false; break; }
-            if (!go) break;
-            if (on_data && !on_data(rd.buf.substr(0, n))) go = false;
-            rd.buf.erase(0, n + 2);
+    bool chunked;
+    int64_t clen;
+    do {
+        if (!rd.head(head) || !http_response_head(head, status, chunked, clen)) {
+            close(fd); if (err) *err = "invalid or incomplete HTTP response header"; return -1;
         }
-    } else {
-        long got = 0;
-        if (!rd.buf.empty()) { got += rd.buf.size(); if (on_data) go = on_data(rd.buf); rd.buf.clear(); }
-        while (go && (clen < 0 || got < clen) && rd.fill()) {
-            got += rd.buf.size();
-            if (on_data) go = on_data(rd.buf);
-            rd.buf.clear();
-        }
+    } while (status < 200 && status != 101);
+    std::string error;
+    if (method != "HEAD" && status != 204 && status != 304) {
+        error = http_response_body(rd.buf, chunked, clen,
+            [&]() { return rd.fill() ? 1 : rd.failed ? -1 : 0; },
+            [&](const char* p, size_t n) { return !on_data || on_data(std::string(p, n)); });
     }
     close(fd);
+    if (!error.empty()) { if (err) *err = error; return -1; }
     return status;
 }
 

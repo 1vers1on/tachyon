@@ -1,4 +1,5 @@
 #include "tokenizer.h"
+#include "file_validation.h"
 #include "unicode_tables.h"
 #include <algorithm>
 #include <ctime>
@@ -82,12 +83,24 @@ size_t utf8_valid_prefix(const std::string& s) {
 
 void Tokenizer::load(const ModelFile& mf) {
     const Json& tj = mf.header()["tokenizer"];
-    int nv = (int)tj.get_int("n_vocab", 0);
+    size_t count = file_size_value(tj["n_vocab"], "tokenizer vocabulary size");
+    if (!count || count > INT32_MAX) die("invalid tokenizer vocabulary size");
+    int nv = (int)count;
     const BlobInfo* vd = mf.blob("tok.vocab_data");
     const BlobInfo* vo = mf.blob("tok.vocab_off");
     const BlobInfo* ty = mf.blob("tok.type");
     const BlobInfo* mg = mf.blob("tok.merges");
-    const uint32_t* offs = (const uint32_t*)vo->data;
+    if (vo->size != (count + 1) * sizeof(uint32_t) || ty->size != count || mg->size % 12)
+        die("invalid tokenizer blob sizes");
+    std::vector<uint32_t> offs(count + 1);
+    memcpy(offs.data(), vo->data, vo->size);
+    if (offs[0] != 0 || offs[count] != vd->size) die("invalid tokenizer vocabulary offsets");
+    for (size_t i = 0; i < count; i++)
+        if (offs[i] > offs[i + 1] || offs[i + 1] > vd->size || ty->data[i] > 2)
+            die("invalid tokenizer vocabulary offsets or token type");
+    // A Tokenizer can be reloaded, including with a different model.
+    tok2id_.clear(); merges_.clear(); specials_.clear(); eos_.clear(); dec_.clear();
+    for (auto& ids : by_first_) ids.clear();
     vocab_.resize(nv);
     ttype_.assign(ty->data, ty->data + nv);
     spm_ = tj.get_str("type", "") == "bpe_spm";
@@ -122,19 +135,29 @@ void Tokenizer::load(const ModelFile& mf) {
             byte_tok_[b] = it == tok2id_.end() ? -1 : it->second;
         }
     }
-    const int32_t* m = (const int32_t*)mg->data;
     int64_t nm = mg->size / 12;
     merges_.reserve(nm * 2);
     for (int64_t i = 0; i < nm; i++) {
-        uint64_t key = ((uint64_t)(uint32_t)m[3 * i] << 32) | (uint32_t)m[3 * i + 1];
-        merges_.emplace(key, std::make_pair((int)i, (int)m[3 * i + 2]));
+        int32_t m[3]; memcpy(m, mg->data + 12 * i, sizeof m);
+        for (int id : m) if (id < 0 || id >= nv) die("invalid tokenizer merge token id");
+        uint64_t key = ((uint64_t)(uint32_t)m[0] << 32) | (uint32_t)m[1];
+        merges_.emplace(key, std::make_pair((int)i, (int)m[2]));
     }
-    for (auto& s : tj["specials"].arr) specials_.push_back({s.get_str("content", ""), (int)s.get_int("id", -1), s.get_bool("special", true)});
+    auto token_id_value = [&](const Json& value, bool allow_none = false) {
+        if (allow_none && value.is_num() && value.num == -1) return -1;
+        size_t id = file_size_value(value, "tokenizer token id");
+        if (id >= count) die("invalid tokenizer token id");
+        return (int)id;
+    };
+    for (auto& s : tj["specials"].arr) {
+        if (!s["content"].is_str() || s["content"].str.empty()) die("invalid tokenizer special token");
+        specials_.push_back({s["content"].str, token_id_value(s["id"]), s.get_bool("special", true)});
+    }
     std::stable_sort(specials_.begin(), specials_.end(), [](const Special& a, const Special& b) { return a.s.size() > b.s.size(); });
     for (size_t i = 0; i < specials_.size(); i++) if (!specials_[i].s.empty()) by_first_[(unsigned char)specials_[i].s[0]].push_back((int)i);
     pretok_ = tj.get_str("pretokenizer", "qwen2");
-    for (auto& e : tj["eos"].arr) eos_.push_back((int)e.as_int());
-    bos_ = (int)tj.get_int("bos", -1);
+    for (auto& e : tj["eos"].arr) eos_.push_back(token_id_value(e));
+    bos_ = tj.has("bos") ? token_id_value(tj["bos"], true) : -1;
     add_bos_ = tj.get_bool("add_bos", false);
     thinking_ = tj.get_bool("thinking", false);
     chat_format_ = tj.get_str("chat_format", "chatml");

@@ -9,6 +9,12 @@ int main(int argc, char** argv) {
     if (argc != 2) return 2;
     ModelFile mf; mf.open(argv[1]);
     Tokenizer tok; tok.load(mf);
+    tok.load(mf);  // reloading must discard previous token and merge mappings
+    for (const char* invalid : {"+1", ".1", "01", "1.", "1e+", "[1,]", "\"raw\nnewline\""}) {
+        std::string error;
+        Json::parse(invalid, &error);
+        assert(!error.empty());
+    }
     const std::string replacement = "\xef\xbf\xbd";
     for (const auto& [bytes, expected] : std::vector<std::pair<std::string, std::string>>{
         {"hello", "hello"}, {"\xe2\x82\xac", "\xe2\x82\xac"}, {"\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80"},

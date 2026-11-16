@@ -31,10 +31,10 @@ tachyon: $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDCUDA)
 endif
 
-tachyon-client: $(BUILD)/client.o $(BUILD)/json.o
+tachyon-client: $(BUILD)/client.o $(BUILD)/json.o $(BUILD)/http.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-$(BUILD)/file-probe: tests/file_probe.cpp $(BUILD)/model_file.o $(BUILD)/safetensors.o $(BUILD)/json.o
+$(BUILD)/file-probe: tests/file_probe.cpp $(BUILD)/model_file.o $(BUILD)/safetensors.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
 $(BUILD)/kernel-test: tests/kernel_test.cpp $(BUILD)/cpu_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
@@ -46,12 +46,17 @@ $(BUILD)/quant-test: tests/quant_test.cpp $(BUILD)/quant.o
 $(BUILD)/text-test: tests/text_test.cpp $(BUILD)/tokenizer.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/sampler.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
-test: tachyon $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/quant-test $(BUILD)/text-test
+$(BUILD)/http-probe: tests/http_probe.cpp $(BUILD)/http.o $(BUILD)/https.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
+
+test: tachyon tachyon-client $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/quant-test $(BUILD)/text-test $(BUILD)/http-probe
 	python3 tests/file_test.py $(BUILD)/file-probe
 	$(BUILD)/kernel-test
 	$(BUILD)/quant-test
-	python3 tests/server_test.py ./tachyon $(BUILD)/text-test
-	python3 tests/settings_test.py ./tachyon
+	python3 tests/server_test.py $(abspath $(OUT)) $(BUILD)/text-test
+	python3 tests/settings_test.py $(abspath $(OUT))
+	python3 tests/http_test.py $(BUILD)/http-probe ./tachyon-client
+	python3 tests/release_test.py $(abspath $(OUT)) $(abspath tachyon-client)
 
 $(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/cuda_api.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
@@ -70,7 +75,7 @@ test-cuda: $(BUILD)/cuda-sampling-test
 # Optional reference tests: needs torch, transformers, numpy and safetensors (no downloads).
 PYTHON ?= python3
 test-models: tachyon $(BUILD)/inference-probe
-	$(PYTHON) tests/model_test.py ./tachyon $(BUILD)/inference-probe
+	$(PYTHON) tests/model_test.py $(abspath $(OUT)) $(BUILD)/inference-probe
 
 clean:
 	rm -rf $(BUILD) tachyon tachyon-client

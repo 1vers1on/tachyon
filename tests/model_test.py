@@ -139,4 +139,14 @@ with tempfile.TemporaryDirectory(prefix="tachyon-models-") as tmp:
             for actual in outputs[1:]:
                 np.testing.assert_allclose(outputs[0], actual, atol=0.008 if device == "cuda" else 2e-6,
                                            rtol=0.02 if device == "cuda" else 2e-5)
+    # Invalid tokenizer indices must fail before indexing converter buffers.
+    token_path = folder / 'tokenizer.json'
+    original = json.loads(token_path.read_text())
+    for invalid in (-1, 2**32, 1.5):
+        tokenizer = json.loads(json.dumps(original))
+        tokenizer['model']['vocab']['A'] = invalid
+        token_path.write_text(json.dumps(tokenizer))
+        p = subprocess.run([binary, 'convert', str(folder), str(root / 'invalid.tach'), '-q', 'q8'],
+                           capture_output=True, text=True, timeout=15)
+        assert p.returncode == 1 and 'invalid tokenizer token id' in p.stderr, (invalid, p.returncode, p.stderr)
 print("model conversion and inference: all checks passed")

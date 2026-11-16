@@ -189,6 +189,7 @@ int main(int argc, char** argv) {
     log_init_from_env();
     if (argc < 2) { usage(); return 1; }
     std::string cmd = argv[1];
+    if (cmd == "--version") { printf("%s\n", TACH_VERSION); return 0; }
     if (cmd == "-h" || cmd == "--help" || cmd == "help") { usage(); return 0; }
     if (cmd == "convert") {
         // --calib <text>: build a temporary Q8 model, collect an importance matrix on it, then convert with it.
@@ -220,6 +221,8 @@ int main(int argc, char** argv) {
     }
     if (cmd == "selftest") { void cpu_selftest(); cpu_selftest(); return 0; }
     Args a = parse_args(argc - 2, argv + 2);
+    if (cmd == "bench" && a.prompt_len <= 0) die("--prompt-len must be positive for bench");
+    if (cmd == "compare" && a.n <= 0) die("compare requires a positive chunk size (-n)");
     if (cmd == "serve") {
         // agent workloads need long contexts more than many parallel slots: default to 32k (capped by the model)
         // and drop slots before going below 16k (or below an explicit -c)
@@ -242,6 +245,7 @@ int main(int argc, char** argv) {
         BackendOptions bo; bo.n_slots = a.slots > 0 ? a.slots : 1; bo.ctx = a.ctx; bo.max_batch = 512;
         bool cpu2 = getenv("TACH_COMPARE_CPU2") != nullptr;  // second backend = CPU with float activations
         std::unique_ptr<Backend> cpu(create_cpu_backend()), gpu(cpu2 ? create_cpu_backend() : create_cuda_backend());
+        if (!gpu) die("CUDA backend unavailable: %s", cuda_backend_error().c_str());
         cpu->init(mf, bo);
         if (cpu2) setenv("TACH_DEBUG_DEQUANT", "1", 1);
         gpu->init(mf, bo);
@@ -288,6 +292,7 @@ int main(int argc, char** argv) {
         configure_request(*r);
         r->on_text = [](const std::string& d) { fwrite(d.data(), 1, d.size(), stdout); fflush(stdout); return true; };
         e.run_sync(r);
+        if (!r->error.empty()) { loge("%s", r->error.c_str()); return 1; }
         printf("\n");
         print_stats(*r);
         return 0;
@@ -305,6 +310,7 @@ int main(int argc, char** argv) {
             configure_request(*r);
             r->ignore_eos = true;
             e.run_sync(r);
+            if (!r->error.empty()) { loge("%s", r->error.c_str()); return 1; }
             if (rep == 1 || g_log_level >= 2) print_stats(*r);
         }
         return 0;

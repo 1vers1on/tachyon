@@ -4,8 +4,11 @@
 Engine::~Engine() { stop(); }
 
 void Engine::load(const std::string& path, const EngineOptions& o) {
+    if (o.device != "auto" && o.device != "cpu" && o.device != "cuda")
+        die("invalid device '%s': expected auto, cpu or cuda", o.device.c_str());
     opt = o;
     mf.open(path);
+    mf.validate_inference();
     tok.load(mf);
     model_name = mf.config.name;
     gen_defaults = mf.header()["generation"];
@@ -247,21 +250,24 @@ bool Engine::emit_token(Slot& s, int t) {
     s.pending_text += piece;
     // stop strings
     size_t hold = 0;
+    size_t stop_pos = std::string::npos;
+    const std::string* stop_hit = nullptr;
     for (auto& st : r.stop) {
         if (st.empty()) continue;
         size_t p = s.pending_text.find(st);
-        if (p != std::string::npos) {
-            std::string out = s.pending_text.substr(0, p);
-            r.stop_hit = st;
-            r.text += out;
-            if (r.on_text && !out.empty()) r.on_text(out);
-            s.pending_text.clear();
-            finish(s, "stop_string");
-            return false;
-        }
+        if (p < stop_pos) { stop_pos = p; stop_hit = &st; }
         // hold back a suffix that could be the start of a stop string
         for (size_t k = std::min(st.size() - 1, s.pending_text.size()); k > 0; k--)
             if (s.pending_text.compare(s.pending_text.size() - k, k, st, 0, k) == 0) { hold = std::max(hold, k); break; }
+    }
+    if (stop_hit) {
+        std::string out = s.pending_text.substr(0, stop_pos);
+        r.stop_hit = *stop_hit;
+        r.text += out;
+        if (r.on_text && !out.empty()) r.on_text(out);
+        s.pending_text.clear();
+        finish(s, "stop_string");
+        return false;
     }
     if (s.pending_text.size() > hold) {
         std::string out = s.pending_text.substr(0, s.pending_text.size() - hold);
@@ -461,7 +467,9 @@ bool Engine::step() {
             else if (have_cands) {
                 auto& c = cands[row];
                 if (s.sampler.params.greedy()) {
-                    t = std::max_element(c.begin(), c.end())->second;
+                    t = std::max_element(c.begin(), c.end(), [](const auto& a, const auto& b) {
+                        return a.first != b.first ? a.first < b.first : a.second > b.second;
+                    })->second;
                 } else {
                     t = i < nd ? s.sampler.sample_cands_with_draft(c, rr.draft[i]) : s.sampler.sample_cands(c);
                 }
@@ -471,6 +479,7 @@ bool Engine::step() {
                 t = i < nd ? s.sampler.sample_with_draft(logits_buf_.data(), be->vocab(), rr.draft[i])
                            : s.sampler.sample(logits_buf_.data(), be->vocab());
             }
+            if (i < nd && t == rr.draft[i]) req->n_draft_accepted++;
             bool ok = emit_token(s, t);
             if (!ok) break;
             if (i < nd && t == rr.draft[i]) {
@@ -481,7 +490,6 @@ bool Engine::step() {
             s.last = t;
             break;
         }
-        req->n_draft_accepted += accepted;
         // recurrent state: undo the rows of rejected drafts (state after the last kept row = row first + accepted)
         if (mf.config.stateful && accepted < nd) be->state_restore_row(rr.slot, rr.first + accepted);
         // adapt speculation depth

@@ -5,6 +5,7 @@
 #include "model_file.h"
 #include "quant.h"
 #include "threadpool.h"
+#include "file_validation.h"
 #include <thread>
 #include <unordered_map>
 #include <algorithm>
@@ -91,8 +92,13 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     for (int b = 0; b < 256; b++) inv[cpmap[b]] = b;
 
     int n_vocab = vocab_size;
-    for (auto& kv : model["vocab"].obj) n_vocab = std::max(n_vocab, (int)kv.second.as_int() + 1);
-    for (auto& a : tj["added_tokens"].arr) n_vocab = std::max(n_vocab, (int)a.get_int("id", 0) + 1);
+    auto include_id = [&](const Json& value) {
+        size_t id = file_size_value(value, "tokenizer token id");
+        if (id >= INT32_MAX) die("invalid tokenizer token id");
+        n_vocab = std::max(n_vocab, (int)id + 1);
+    };
+    for (auto& kv : model["vocab"].obj) include_id(kv.second);
+    for (auto& a : tj["added_tokens"].arr) include_id(a["id"]);
 
     std::vector<std::string> tokens(n_vocab);
     std::vector<uint8_t> ttype(n_vocab, 0);  // 0=normal 1=special/added 2=unused
@@ -293,6 +299,9 @@ int convert_main(int argc, char** argv) {
     c.head_dim = (int)hc.get_int("head_dim", c.hidden / std::max(1, c.n_heads));
     c.ffn = (int)hc.get_int("intermediate_size", 0);
     c.vocab = (int)hc.get_int("vocab_size", 0);
+    if (c.hidden <= 0 || c.vocab <= 0 || c.n_layers <= 0 || c.n_heads <= 0 || c.n_kv_heads <= 0 ||
+        c.head_dim <= 0 || c.n_heads % c.n_kv_heads || c.ffn < 0)
+        die("invalid checkpoint model dimensions");
     c.rms_eps = (float)hc.get_num("rms_norm_eps", hc.get_num("norm_eps", 1e-6));
     // rope theta: legacy field or rope_parameters
     const Json& rp = hc["rope_parameters"];

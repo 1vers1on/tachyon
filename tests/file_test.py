@@ -65,6 +65,15 @@ with tempfile.TemporaryDirectory(prefix="tachyon-files-") as tmp:
         tach(model, h)
         check("tach", model, message="duplicate")
 
+    imatrix = root / "weights.imatrix"
+    imatrix.write_bytes(b'TIMX' + struct.pack('<I', 0))
+    check('imatrix', imatrix, valid=True)
+    for raw in (b'TIMX' + struct.pack('<I', 1),
+                b'TIMX' + struct.pack('<II', 1, 2**32 - 1),
+                b'TIMX' + struct.pack('<II', 1, 1) + b'w' + struct.pack('<I', 2**30)):
+        imatrix.write_bytes(raw)
+        check('imatrix', imatrix, message='truncated imatrix')
+
     sf = root / "model.safetensors"
 
     def safe(meta, payload=b"\0" * 16):

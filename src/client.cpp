@@ -1,5 +1,7 @@
 // tachyon-client: CLI test client for any OpenAI-compatible server (streaming chat REPL, one-shot, load test)
 #include "json.h"
+#include "http.h"
+
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
@@ -15,6 +17,8 @@
 #include <chrono>
 #include <iostream>
 #include <functional>
+
+int g_log_level = 0;
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -36,63 +40,11 @@ static Url parse_url(std::string u) {
 // Minimal HTTP/1.1 client. on_data receives decoded body bytes as they arrive (chunked or length-delimited).
 static int http_request(const Url& url, const std::string& method, const std::string& path, const std::string& body,
                         const std::function<bool(const std::string&)>& on_data, std::string* err) {
-    addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &res) != 0) { if (err) *err = "cannot resolve " + url.host; return -1; }
-    int fd = -1;
-    for (addrinfo* p = res; p; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
-    }
-    freeaddrinfo(res);
-    if (fd < 0) { if (err) *err = "cannot connect to " + url.host + ":" + url.port; return -1; }
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    std::string req = method + " " + url.base + path + " HTTP/1.1\r\nHost: " + url.host + "\r\nConnection: close\r\n";
+    std::string headers;
     const char* key = getenv("OPENAI_API_KEY");
-    if (key && *key) req += std::string("Authorization: Bearer ") + key + "\r\n";
-    if (!body.empty()) req += "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
-    req += "\r\n" + body;
-    if (send(fd, req.data(), req.size(), MSG_NOSIGNAL) != (ssize_t)req.size()) { close(fd); if (err) *err = "send failed"; return -1; }
-    std::string buf;
-    char tmp[16384];
-    auto fill = [&]() { ssize_t n = recv(fd, tmp, sizeof tmp, 0); if (n <= 0) return false; buf.append(tmp, n); return true; };
-    size_t he;
-    while ((he = buf.find("\r\n\r\n")) == std::string::npos) if (!fill()) { close(fd); if (err) *err = "connection closed"; return -1; }
-    std::string head = buf.substr(0, he);
-    buf.erase(0, he + 4);
-    int status = 0;
-    sscanf(head.c_str(), "HTTP/%*s %d", &status);
-    std::string lower = head;
-    for (auto& ch : lower) ch = tolower(ch);
-    bool chunked = lower.find("transfer-encoding: chunked") != std::string::npos;
-    long clen = -1;
-    size_t cp = lower.find("content-length:");
-    if (cp != std::string::npos) clen = atol(lower.c_str() + cp + 15);
-    bool go = true;
-    if (chunked) {
-        while (go) {
-            size_t le;
-            while ((le = buf.find("\r\n")) == std::string::npos) if (!fill()) { go = false; break; }
-            if (!go) break;
-            long n = strtol(buf.substr(0, le).c_str(), nullptr, 16);
-            buf.erase(0, le + 2);
-            if (n == 0) break;
-            while ((long)buf.size() < n + 2) if (!fill()) { go = false; break; }
-            if (!go) break;
-            if (!on_data(buf.substr(0, n))) go = false;
-            buf.erase(0, n + 2);
-        }
-    } else {
-        long got = 0;
-        if (!buf.empty()) { got += buf.size(); go = on_data(buf); buf.clear(); }
-        while (go && (clen < 0 || got < clen) && fill()) { got += buf.size(); go = on_data(buf); buf.clear(); }
-    }
-    close(fd);
-    return status;
+    if (!key || !*key) key = getenv("TACHYON_API_KEY");
+    if (key && *key) headers = std::string("Authorization: Bearer ") + key + "\r\n";
+    return http_call(url.host, atoi(url.port.c_str()), method, url.base + path, body, on_data, err, 0, headers);
 }
 
 struct Opts {
@@ -119,7 +71,7 @@ static bool chat_stream(const Opts& o, const Json& messages, StreamResult& res, 
     if (o.top_p >= 0) body.set("top_p", o.top_p);
     if (!o.think) { Json kw = Json::object(); kw.set("enable_thinking", false); body.set("chat_template_kwargs", kw); }
     std::string line_buf;
-    bool in_reasoning = false;
+    bool in_reasoning = false, stream_error = false, stream_done = false;
     double t0 = now();
     std::string err;
     int st = http_request(o.url, "POST", "/v1/chat/completions", body.dump(), [&](const std::string& d) {
@@ -131,9 +83,9 @@ static bool chat_stream(const Opts& o, const Json& messages, StreamResult& res, 
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.rfind("data: ", 0) != 0) continue;
             std::string payload = line.substr(6);
-            if (payload == "[DONE]") return true;
+            if (payload == "[DONE]") { stream_done = true; return true; }
             Json j = Json::parse(payload);
-            if (j.has("error")) { fprintf(stderr, "\nserver error: %s\n", j["error"].get_str("message", "?").c_str()); return false; }
+            if (j.has("error")) { stream_error = true; fprintf(stderr, "\nserver error: %s\n", j["error"].get_str("message", "?").c_str()); return false; }
             if (j.has("usage") && j["usage"].is_obj()) res.usage = j["usage"];
             if (j.has("timings")) res.timings = j["timings"];
             if (!j["choices"].is_arr() || j["choices"].arr.empty()) continue;
@@ -165,6 +117,8 @@ static bool chat_stream(const Opts& o, const Json& messages, StreamResult& res, 
     if (print) fflush(stdout);
     if (st < 0) { fprintf(stderr, "error: %s\n", err.c_str()); return false; }
     if (st != 200) { fprintf(stderr, "HTTP %d\n", st); return false; }
+    if (stream_error) return false;
+    if (!stream_done) { fprintf(stderr, "incomplete generation stream\n"); return false; }
     return true;
 }
 

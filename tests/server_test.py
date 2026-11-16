@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 
-binary = str(Path(sys.argv[1] if __name__ == '__main__' else './tachyon').resolve())
+binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else './tachyon').resolve())
 
 
 def fixture(path, output='x', thinking=False, vocab=288):

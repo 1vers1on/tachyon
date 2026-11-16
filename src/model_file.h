@@ -106,6 +106,7 @@ class ModelFile {
 public:
     ~ModelFile();
     void open(const std::string& path);
+    void validate_inference() const;  // graph dimensions and weight shapes, before backend allocation
     const TensorInfo* tensor(const std::string& name, bool required = true) const;
     const BlobInfo* blob(const std::string& name, bool required = true) const;
     const Json& header() const { return header_; }

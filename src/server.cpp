@@ -1078,8 +1078,12 @@ private:
         return c.send_response(200, "application/json", m.dump(), hr.keep_alive);
     }
 
-    void log_request(const GenRequest& r, const char* kind) {
-        if (r.t_done == 0) { logi("%s: client disconnected, request cancelled (prompt %d tokens)", kind, (int)r.prompt.size()); return; }
+    void log_request(GenRequest& r, const char* kind) {
+        // A disconnected request may still be running on the engine thread. Only read results after done.
+        {
+            std::lock_guard<std::mutex> lk(r.mu);
+            if (!r.done) { logi("%s: client disconnected, request cancelled", kind); return; }
+        }
         if (r.finish_reason == "error") { loge("%s: generation failed: %s", kind, r.error.c_str()); return; }
         double pp = r.t_prefill_done - r.t_submit, gen = r.t_done - r.t_first;
         logi("%s: prompt %d tok (%d cached, %.0f tok/s), gen %d tok @ %.1f tok/s, ttft %.2fs, total %.2fs, spec %d/%d, %s", kind, r.n_prompt, r.n_cached,
@@ -1097,7 +1101,7 @@ private:
 
 int server_main(Engine& e, const ServerOptions& o) {
     signal(SIGPIPE, SIG_IGN);
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) die("socket failed");
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -1116,7 +1120,7 @@ int server_main(Engine& e, const ServerOptions& o) {
     while (true) {
         sockaddr_in cli{};
         socklen_t cl = sizeof cli;
-        int c = accept(fd, (sockaddr*)&cli, &cl);
+        int c = accept4(fd, (sockaddr*)&cli, &cl, SOCK_CLOEXEC);
         if (c < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {   // transient: keep serving

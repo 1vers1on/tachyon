@@ -1,5 +1,7 @@
 # Tachyon
 
+Version **1.0.0**. See the [release notes](CHANGELOG.md); `./tachyon --version` prints the installed version.
+
 A from-scratch LLM inference engine and server in C++, with hand-written CUDA, AVX-512 and AVX2 kernels (plus a scalar fallback).
 
 Tachyon takes a Hugging Face checkpoint, quantizes it to its own `.tach` format, and serves it over
@@ -416,6 +418,9 @@ python tools/tool_test.py 28657 MODEL...   # tool-call round trip and prefix reu
 `tools/hf_ppl.py` and `tools/hf_compare.py` produce Hugging Face transformers reference outputs. They
 need `torch` and `transformers`.
 `make test-models` additionally needs `numpy` and `safetensors` in the selected Python environment.
+`make test` also checks malformed tokenizer and importance-matrix files, HTTP client framing and stream
+completion, CLI failures, authentication, model aliases, and model-process socket isolation. These checks
+use temporary fixtures and do not download models. Custom `BUILD` and `OUT` paths are supported by the tests.
 
 ## Limitations
 

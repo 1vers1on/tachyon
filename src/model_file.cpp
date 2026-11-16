@@ -176,6 +176,8 @@ void ModelFile::open(const std::string& p) {
     if (!err.empty() || !header_.is_obj()) die("bad header: %s", err.c_str());
     if (data_start > data_end) die("%s is truncated or incomplete", p.c_str());
     const size_t payload = data_end - data_start;
+    if (header_["config"].get_int("n_layers", 0) > (int64_t)header_["tensors"].size())
+        die("invalid model layer count");
     config = ModelConfig::from_json(header_["config"]);
     for (auto& t : header_["tensors"].arr) {
         TensorInfo ti;
@@ -210,6 +212,84 @@ void ModelFile::open(const std::string& p) {
         if (!file_range(bi.offset, bi.size, payload)) die("blob %s out of range", bi.name.c_str());
         bi.data = base + data_start + bi.offset;
         if (!blobs.emplace(bi.name, bi).second) die("duplicate blob %s", bi.name.c_str());
+    }
+}
+
+void ModelFile::validate_inference() const {
+    const auto& c = config;
+    if (c.hidden <= 0 || c.vocab <= 0 || c.n_layers <= 0 || c.max_ctx <= 0 ||
+        c.layers.size() != (size_t)c.n_layers || c.ffn < 0 || c.ple_dim < 0 ||
+        !std::isfinite(c.rms_eps) || c.rms_eps <= 0)
+        die("invalid model dimensions or layer count");
+    auto shape = [&](const std::string& name, int64_t rows, int64_t cols, bool vec = false, bool required = true) {
+        const auto* t = tensor(name, required);
+        if (t && (t->rows != rows || t->cols != cols || (vec && t->type != QType::F32)))
+            die("tensor %s shape/format does not match model config", name.c_str());
+    };
+    auto width = [&](int64_t n) {
+        if (n <= 0 || n > INT32_MAX) die("invalid model projection dimensions");
+        return n;
+    };
+    const int H = c.hidden;
+    shape("tok_embd", c.vocab, H);
+    if (!c.tied_embed) shape("output", c.vocab, H);
+    shape("output_norm", 1, H, true);
+    if (c.ple_dim) {
+        int64_t n = width((int64_t)c.n_layers * c.ple_dim);
+        shape("ple_embd", c.vocab, n); shape("ple_proj", n, H);
+        shape("ple_proj_norm", 1, c.ple_dim, true);
+    }
+    for (int i = 0; i < c.n_layers; i++) {
+        const auto& l = c.layers[i];
+        std::string p = "blk." + std::to_string(i) + ".";
+        if (l.ffn < 0 || l.n_experts < 0 || l.window < 0) die("invalid model layer dimensions");
+        shape(p + "attn_norm", 1, H, true); shape(p + "ffn_norm", 1, H, true);
+        shape(p + "post_attn_norm", 1, H, true, l.sandwich);
+        shape(p + "post_ffn_norm", 1, H, true, l.sandwich);
+        if (l.is_attn()) {
+            if (l.n_heads <= 0 || l.n_kv_heads <= 0 || l.head_dim <= 0 || l.n_heads % l.n_kv_heads ||
+                l.rope_half < 0 || l.rope_half > l.head_dim / 2 || l.rope_rot < 0 || l.rope_rot > l.rope_half ||
+                l.qk_norm < 0 || l.qk_norm > 2 || !std::isfinite(l.rope_theta) || l.rope_theta <= 0 ||
+                l.kv_src < -1 || l.kv_src >= i)
+                die("invalid attention config for layer %d", i);
+            int64_t qd = width((int64_t)l.n_heads * l.head_dim), kd = width((int64_t)l.n_kv_heads * l.head_dim);
+            if (l.kv_src >= 0) {
+                const auto& s = c.layers[l.kv_src];
+                if (!s.is_attn() || s.n_kv_heads != l.n_kv_heads || s.head_dim != l.head_dim || s.window != l.window)
+                    die("invalid shared KV config for layer %d", i);
+            }
+            shape(p + "wqkv", width(qd * (l.attn_gate ? 2 : 1) + (l.kv_src >= 0 ? 0 : kd * (l.k_eq_v ? 1 : 2))), H);
+            shape(p + "wo", H, qd);
+            shape(p + "bqkv", 1, qd + 2 * kd, true, c.attn_bias);
+            shape(p + "q_norm", 1, l.qk_norm == 2 ? qd : l.head_dim, true, l.qk_norm != 0);
+            shape(p + "k_norm", 1, l.qk_norm == 2 ? kd : l.head_dim, true, l.qk_norm != 0 && l.kv_src < 0);
+        } else if (l.type == "conv") {
+            if (l.conv_k < 2 || !c.stateful) die("invalid convolution config for layer %d", i);
+            shape(p + "conv_in", width((int64_t)3 * H), H); shape(p + "conv_out", H, H);
+            shape(p + "conv_w", 1, (int64_t)H * l.conv_k, true);
+        } else if (l.type == "deltanet") {
+            if (l.dn_nk <= 0 || l.dn_nv <= 0 || l.dn_dk <= 0 || l.dn_dv <= 0 || l.dn_conv < 2 ||
+                l.dn_nv % l.dn_nk || !c.stateful) die("invalid delta net config for layer %d", i);
+            int64_t kd = width((int64_t)l.dn_nk * l.dn_dk), vd = width((int64_t)l.dn_nv * l.dn_dv);
+            int64_t cd = width(2 * kd + vd);
+            shape(p + "dn_in", width(cd + vd + 2ll * l.dn_nv), H); shape(p + "dn_out", H, vd);
+            shape(p + "dn_conv", 1, cd * l.dn_conv, true);
+            shape(p + "dn_A", 1, l.dn_nv, true); shape(p + "dn_dt", 1, l.dn_nv, true);
+            shape(p + "dn_norm", 1, l.dn_dv, true);
+        } else die("unknown layer type %s", l.type.c_str());
+        if (l.n_experts) {
+            if (l.top_k <= 0 || l.top_k > l.n_experts || l.expert_ffn <= 0) die("invalid expert config for layer %d", i);
+            shape(p + "router", l.n_experts, H, true);
+            shape(p + "expert_bias", 1, l.n_experts, true, l.expert_bias);
+            shape(p + "wgu_e", width((int64_t)l.n_experts * 2 * l.expert_ffn), H);
+            shape(p + "wdown_e", width((int64_t)l.n_experts * H), l.expert_ffn);
+        } else if (l.ffn) {
+            shape(p + "wgu", width(2ll * l.ffn), H); shape(p + "wdown", H, l.ffn);
+        }
+        if (c.ple_dim) {
+            shape(p + "ple_gate", c.ple_dim, H); shape(p + "ple_out", H, c.ple_dim);
+            shape(p + "ple_post_norm", 1, H, true);
+        }
     }
 }
 

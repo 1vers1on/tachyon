@@ -37,7 +37,10 @@ struct Parser {
         p++;
         while (p < end) {
             const char* s = p;
-            while (p < end && *p != '"' && *p != '\\') p++;
+            while (p < end && *p != '"' && *p != '\\') {
+                if ((unsigned char)*p < 0x20) return fail("unescaped control character");
+                p++;
+            }
             o.append(s, p - s);
             if (p >= end) break;
             if (*p == '"') { p++; return true; }
@@ -132,10 +135,22 @@ struct Parser {
             char* e = nullptr;
             std::string tmp;
             const char* s = p;
-            while (p < end && (isdigit((unsigned char)*p) || *p == '-' || *p == '+' || *p == '.' || *p == 'e' || *p == 'E')) p++;
-            if (p == s) {
-                if (end - p >= 9 && !memcmp(p, "-Infinity", 9)) { p += 9; v.type = Json::Number; v.num = -INFINITY; return true; }
-                return fail("unexpected character");
+            if (end - p >= 9 && !memcmp(p, "-Infinity", 9)) { p += 9; v.type = Json::Number; v.num = -INFINITY; return true; }
+            auto digit = [&] { return p < end && *p >= '0' && *p <= '9'; };
+            if (*p == '-') p++;
+            if (!digit()) return fail("bad number");
+            if (*p == '0') p++;
+            else while (digit()) p++;
+            if (p < end && *p == '.') {
+                p++;
+                if (!digit()) return fail("bad number");
+                while (digit()) p++;
+            }
+            if (p < end && (*p == 'e' || *p == 'E')) {
+                p++;
+                if (p < end && (*p == '+' || *p == '-')) p++;
+                if (!digit()) return fail("bad number");
+                while (digit()) p++;
             }
             tmp.assign(s, p - s);
             v.type = Json::Number;

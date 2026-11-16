@@ -481,6 +481,7 @@ public:
     }
 
     void init(const ModelFile& mf, const BackendOptions& o) override {
+        mf.validate_inference();
         opt = o;
         c_ = mf.config;
         int nt = o.threads > 0 ? o.threads : std::max(1u, std::thread::hardware_concurrency() / 2);
