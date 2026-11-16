@@ -19,7 +19,7 @@
 #include <unistd.h>
 #include <immintrin.h>
 
-#define TACH_VERSION "1.0.0"
+#define TACH_VERSION "1.1.0"
 
 #define TACH_PRINTF(fmt, args) __attribute__((format(printf, fmt, args)))
 

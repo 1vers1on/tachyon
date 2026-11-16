@@ -25,7 +25,7 @@ def cli(*args, valid=True, message=''):
 with tempfile.TemporaryDirectory(prefix='tachyon-release-') as tmp:
     root = Path(tmp)
     env = dict(os.environ, TACHYON_HOME=str(root / 'store'))
-    assert cli('--version').stdout.strip() == '1.0.0'
+    assert cli('--version').stdout.strip() == '1.1.0'
     model = root / 'tiny.tach'
     fixture(model, 'beforeFIRSTmiddleSECONDafter')
     cli('run', '-m', str(model), '--device', 'typo', valid=False, message='invalid device')
@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='tachyon-release-') as tmp:
         valid=False, message='exceeds context')
     cli('bench', '-m', str(model), '--prompt-len', '0', valid=False, message='must be positive')
     with serve(['-m', str(model), '--device', 'cpu', '-t', '2', '--spec', '0'], env) as port:
-        assert request(port, '/api/version')['version'] == '1.0.0'
+        assert request(port, '/api/version')['version'] == '1.1.0'
         body = dict(prompt='hi', max_tokens=1, temperature=0, stop=['SECOND', 'FIRST'])
         assert request(port, '/v1/completions', body)['choices'][0]['text'] == 'before'
         c = http.client.HTTPConnection('127.0.0.1', port, timeout=5)

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-11-16
 
 RTX 3060 12 GB model set. New weight formats are recorded by exact name in the `.tach` file and are never
 requantized on import:
@@ -17,6 +17,8 @@ requantized on import:
 - Fix `INCS` being expanded before `BUILD` was set, which broke a plain `make test`.
 - CPU backend: apply the per-layer YaRN attention factor (it was only applied on CUDA) and copy 16-bit KV
   entries correctly when duplicating a slot.
+- JSON: preserve double precision during serialization and recover consecutive Unicode surrogate escapes
+  without producing invalid UTF-8. Add numeric round-trip and Unicode regression tests to `make test`.
 
 ## 1.0.0 — 2026-11-16
 
