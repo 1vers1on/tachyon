@@ -40,7 +40,10 @@ static void usage() {
         "  --temp T --top-k K --top-p P --min-p P --seed S   sampling (run/bench)\n"
         "  --api-key KEY            serve: require this key (Bearer or x-api-key; also TACHYON_API_KEY)\n"
         "  --alias NAME             serve: model id reported by the API\n"
-        "  -v / -q                  verbose / quiet logging\n\n", TACH_VERSION);
+        "  -v / -q                  verbose (debug) / quiet (warnings and errors only) logging\n"
+        "  --log-level L            error | warn | info | debug (default info; also TACHYON_LOG_LEVEL)\n"
+        "  --log-file PATH          also append log lines to PATH (also TACHYON_LOG_FILE)\n"
+        "  --log-format text|json   log line format (also TACHYON_LOG_FORMAT)\n\n", TACH_VERSION);
     runner_usage();
 }
 
@@ -92,8 +95,7 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--min-p") a.sp.min_p = atof(next().c_str());
         else if (s == "--seed") a.sp.seed = strtoull(next().c_str(), nullptr, 10);
         else if (s == "--repeat-penalty") a.sp.repetition_penalty = atof(next().c_str());
-        else if (s == "-v") g_log_level = 2;
-        else if (s == "-q") g_log_level = 0;
+        else if (log_arg(s, next)) {}
         else if (s == "-h" || s == "--help") { usage(); exit(0); }
         else die("unknown argument %s (see tachyon --help)", s.c_str());
     }
@@ -178,6 +180,7 @@ int convert_calibrated(const std::string& hf_dir, const std::string& out, const 
 }
 
 int main(int argc, char** argv) {
+    log_init_from_env();
     if (argc < 2) { usage(); return 1; }
     std::string cmd = argv[1];
     if (cmd == "-h" || cmd == "--help" || cmd == "help") { usage(); return 0; }

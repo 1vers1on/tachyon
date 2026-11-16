@@ -14,6 +14,7 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
         dev = "cpu";
         Backend* b = create_cuda_backend();
         if (b) { be.reset(b); dev = "cuda"; }
+        else logi("CUDA backend unavailable (%s): using the CPU backend", cuda_backend_error().c_str());
     } else if (dev == "cuda") {
         Backend* b = create_cuda_backend();
         if (!b) die("CUDA backend unavailable: %s", cuda_backend_error().c_str());
@@ -111,6 +112,7 @@ void Engine::stop() {
 
 void Engine::submit(std::shared_ptr<GenRequest> r) {
     r->t_submit = now_sec();
+    if (!r->id) r->id = g_log_req;
     {
         std::lock_guard<std::mutex> lk(mu_);
         queue_.push_back(r);
@@ -155,11 +157,13 @@ void Engine::admit() {
         }
         if (best < 0) break;
         Slot& s = slots_[best];
+        LogScope scope(r->id);
         s.req = r;
         n_active_++;
         queue_.pop_front();
         if ((int)r->prompt.size() + 1 > opt.backend.ctx) {
             r->error = "prompt (" + std::to_string(r->prompt.size()) + " tokens) exceeds context size " + std::to_string(opt.backend.ctx);
+            logw("%s", r->error.c_str());
             finish(s, "error");
             continue;
         }
@@ -201,6 +205,8 @@ void Engine::admit() {
 
 void Engine::finish(Slot& s, const std::string& reason) {
     auto r = s.req;
+    LogScope scope(r->id);
+    logd("finish: %d tokens generated, reason %s%s%s", r->n_gen, reason.c_str(), r->error.empty() ? "" : ": ", r->error.c_str());
     // flush any held-back text
     if (reason != "error") {
         std::string rest = s.pending_text + (s.dec ? s.dec->flush() : "");

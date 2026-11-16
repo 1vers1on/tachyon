@@ -603,7 +603,10 @@ public:
                 auto& r = it->second;
                 int st;
                 if (r->pid > 0 && waitpid(r->pid, &st, WNOHANG) == r->pid) {
-                    logi("model %s exited (pid %d)", r->name.c_str(), r->pid);
+                    char how[64];
+                    if (WIFSIGNALED(st)) snprintf(how, sizeof how, "killed by signal %d (%s)", WTERMSIG(st), strsignal(WTERMSIG(st)));
+                    else snprintf(how, sizeof how, "exit code %d", WEXITSTATUS(st));
+                    logw("model %s exited unexpectedly (pid %d, %s); log: %s", r->name.c_str(), r->pid, how, r->log.c_str());
                     r->pid = -1;
                     it = runners_.erase(it);
                     cv_.notify_all();
@@ -621,16 +624,31 @@ public:
         }
     }
 
-    void handle(int fd) {
+    void handle(int fd, const std::string& peer) {
         Conn c(fd);
-        while (true) {
-            HttpRequest r;
-            int st = 0;
-            if (!c.read_request(r, &st)) {
-                if (st) c.send_response(st, "application/json", err_json(Conn::status_text(st), false).dump(), false);
-                return;
+        c.peer = peer;
+        try {
+            while (true) {
+                HttpRequest r;
+                int st = 0;
+                if (!c.read_request(r, &st)) {
+                    if (st) {
+                        logw("rejected request from %s: %d %s", peer.c_str(), st, Conn::status_text(st));
+                        c.send_response(st, "application/json", err_json(Conn::status_text(st), false).dump(), false);
+                    }
+                    return;
+                }
+                LogScope scope(log_next_request_id());
+                c.status = 0; c.bytes_out = 0; c.note.clear();
+                const double t0 = now_sec();
+                bool ok = route(c, r);
+                http_log_access(c, r, now_sec() - t0);
+                if (!ok || !r.keep_alive) return;
             }
-            if (!route(c, r) || !r.keep_alive) return;
+        } catch (const std::exception& ex) {
+            loge("unhandled exception while serving %s: %s", peer.c_str(), ex.what());
+        } catch (...) {
+            loge("unhandled exception while serving %s", peer.c_str());
         }
     }
 
@@ -650,6 +668,7 @@ private:
     }
     bool reply(Conn& c, const HttpRequest& r, int code, const Json& body) { return c.send_response(code, "application/json", body.dump(), r.keep_alive); }
     bool error(Conn& c, const HttpRequest& r, int code, const std::string& msg) {
+        c.note = msg.size() > 300 ? msg.substr(0, 300) + "..." : msg;
         const bool anth = r.path.find("/messages") != std::string::npos;
         std::string type = code == 404 ? (anth ? "not_found_error" : "model_not_found") : code >= 500 ? "api_error" : code == 401 ? "authentication_error" : "invalid_request_error";
         return reply(c, r, code, err_json(msg, anth, type));
@@ -703,6 +722,7 @@ private:
     pid_t spawn_runner_now(const LocalModel& m, int port, const std::string& log) {
         std::vector<std::string> a = {self_exe(), "serve", "-m", m.path, "--host", "127.0.0.1", "--port", std::to_string(port),
                                       "--alias", m.name};
+        if (g_log_level != 1) a.push_back(g_log_level >= 2 ? "-v" : "-q");   // before the user's args, which win
         for (auto& x : m.args.arr) if (x.is_str()) a.push_back(x.str);
         for (auto& x : o_.runner_args) a.push_back(x);
         pid_t pid = fork();
@@ -799,6 +819,7 @@ private:
                 runners_.erase(m.name);
                 cv_.notify_all();
                 err = "model " + m.name + " failed to load:\n" + tail_file(r->log);
+                loge("%s failed to load after %.1fs (see %s)", m.name.c_str(), now_sec() - r->started, r->log.c_str());
                 return nullptr;
             }
             logi("%s ready in %.1fs", m.name.c_str(), now_sec() - r->started);
@@ -1000,9 +1021,19 @@ int manager_main(const ManagerOptions& o) {
         sockaddr_in cli{};
         socklen_t cl = sizeof cli;
         int c = accept(fd, (sockaddr*)&cli, &cl);
-        if (c < 0) { if (errno == EINTR) continue; break; }
+        if (c < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {   // transient: keep serving
+                logw("accept failed (%s): too many open connections?", strerror(errno));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            loge("accept failed (%s): server stopping", strerror(errno));
+            break;
+        }
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        std::thread([c] { mgr->handle(c); }).detach();
+        std::string peer = http_peer_name(cli);
+        std::thread([c, peer] { mgr->handle(c, peer); }).detach();
     }
     return 0;
 }
@@ -1279,8 +1310,7 @@ int runner_serve(int argc, char** argv) {
         else if (a == "--api-key") o.api_key = next();
         else if (a == "--runner-args") split(next());
         else if (a == "--no-auto-pull") o.auto_pull = false;
-        else if (a == "-v") g_log_level = 2;
-        else if (a == "-q") g_log_level = 0;
+        else if (log_arg(a, next)) {}
         else die("unknown argument %s for `tachyon serve` (model server). To serve one file: tachyon serve -m model.tach", a.c_str());
     }
     return manager_main(o);

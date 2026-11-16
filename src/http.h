@@ -29,12 +29,23 @@ public:
     // true when the peer has closed its side (or the socket failed); never blocks
     bool peer_closed();
     int fd() const { return fd_; }
+    // per-request bookkeeping for the access log (reset by the caller before each request)
+    std::string peer;         // remote address, for log lines
+    std::string note;         // error message of the response, if any
+    int status = 0;           // status code of the response (0 = none sent)
+    size_t bytes_out = 0;     // bytes written since the last reset
     static const char* status_text(int c);
 private:
     bool fill();
     int fd_;
     std::string buf_;
 };
+
+struct sockaddr_in;
+std::string http_peer_name(const sockaddr_in& a);   // "1.2.3.4:5678"
+// One access-log line for a handled request: info, or debug for health checks and CORS preflights; warn for 4xx and
+// error for 5xx responses. Never logs headers or bodies (they carry API keys and prompts).
+void http_log_access(const Conn& c, const HttpRequest& r, double seconds);
 
 // Blocking client. Returns the HTTP status (or -1 with *err). on_data receives decoded body bytes as they arrive;
 // returning false aborts.

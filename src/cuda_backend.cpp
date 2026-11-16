@@ -870,7 +870,8 @@ private:
             if (logn > 1) {
                 std::string log(logn, '\0');
                 dcu.nvrtcGetProgramLog(prog, &log[0]);
-                if (r != NVRTC_SUCCESS || g_log_level >= 2) fprintf(stderr, "%s\n", log.c_str());
+                if (r != NVRTC_SUCCESS) loge("NVRTC kernel compilation failed:\n%s", log.c_str());
+                else logd("NVRTC log:\n%s", log.c_str());
             }
             if (r != NVRTC_SUCCESS) die("kernel compilation failed");
             size_t n;

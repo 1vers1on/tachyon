@@ -119,24 +119,41 @@ class Server {
 public:
     Server(Engine& e, const ServerOptions& o) : e_(e), o_(o) { alias_ = o.alias.empty() ? e.model_name : o.alias; }
 
-    void handle(int fd) {
+    void handle(int fd, const std::string& peer) {
         Conn c(fd);
-        while (true) {
-            HttpRequest r;
-            int st = 0;
-            if (!c.read_request(r, &st)) {
-                if (st) c.send_response(st, "application/json", oai_error(Conn::status_text(st)).dump(), false);
-                return;
+        c.peer = peer;
+        logd("connection from %s opened", peer.c_str());
+        try {
+            while (true) {
+                HttpRequest r;
+                int st = 0;
+                if (!c.read_request(r, &st)) {
+                    if (st) {
+                        logw("rejected request from %s: %d %s", peer.c_str(), st, Conn::status_text(st));
+                        c.send_response(st, "application/json", oai_error(Conn::status_text(st)).dump(), false);
+                    }
+                    break;
+                }
+                LogScope scope(log_next_request_id());
+                c.status = 0; c.bytes_out = 0; c.note.clear();
+                const double t0 = now_sec();
+                bool ok = route(c, r);
+                http_log_access(c, r, now_sec() - t0);
+                if (!ok || !r.keep_alive) break;
             }
-            bool ok = route(c, r);
-            if (!ok || !r.keep_alive) return;
+        } catch (const std::exception& ex) {
+            loge("unhandled exception while serving %s: %s", peer.c_str(), ex.what());
+        } catch (...) {
+            loge("unhandled exception while serving %s", peer.c_str());
         }
+        logd("connection from %s closed", peer.c_str());
     }
 
 private:
     static bool is_anthropic(const HttpRequest& r) { return r.path.find("/messages") != std::string::npos; }
 
     bool send_error(Conn& c, const HttpRequest& r, int code, const std::string& msg, const std::string& type = "invalid_request_error") {
+        c.note = msg;
         std::string atype = code == 401 ? "authentication_error" : code == 404 ? "not_found_error" : code >= 500 ? "api_error" : type;
         return c.send_response(code, "application/json", is_anthropic(r) ? anth_error(msg, atype).dump() : oai_error(msg, type).dump(), r.keep_alive);
     }
@@ -907,9 +924,11 @@ private:
 
     void log_request(const GenRequest& r, const char* kind) {
         if (r.t_done == 0) { logi("%s: client disconnected, request cancelled (prompt %d tokens)", kind, (int)r.prompt.size()); return; }
+        if (r.finish_reason == "error") { loge("%s: generation failed: %s", kind, r.error.c_str()); return; }
         double pp = r.t_prefill_done - r.t_submit, gen = r.t_done - r.t_first;
-        logi("%s: prompt %d (%d cached, %.0f tok/s), gen %d tok @ %.1f tok/s, spec %d/%d, %s", kind, r.n_prompt, r.n_cached,
+        logi("%s: prompt %d tok (%d cached, %.0f tok/s), gen %d tok @ %.1f tok/s, ttft %.2fs, total %.2fs, spec %d/%d, %s", kind, r.n_prompt, r.n_cached,
              (r.n_prompt - r.n_cached) / std::max(pp, 1e-9), r.n_gen, r.n_gen > 1 ? (r.n_gen - 1) / std::max(gen, 1e-9) : 0.0,
+             r.t_first - r.t_submit, r.t_done - r.t_submit,
              r.n_draft_accepted, r.n_draft, r.finish_reason.empty() ? "cancelled" : r.finish_reason.c_str());
     }
 
@@ -933,14 +952,28 @@ int server_main(Engine& e, const ServerOptions& o) {
     if (bind(fd, (sockaddr*)&addr, sizeof addr) < 0) die("cannot bind %s:%d (%s)", o.host.c_str(), o.port, strerror(errno));
     if (listen(fd, 128) < 0) die("listen failed");
     logi("listening on http://%s:%d  (OpenAI API at /v1/chat/completions, Anthropic API at /v1/messages)", o.host.c_str(), o.port);
+    logi("serving %s on %s: context %d tokens, %d slots, speculation %s, API key %s", (o.alias.empty() ? e.model_name : o.alias).c_str(), e.be->name(),
+         e.be->opt.ctx, e.be->opt.n_slots, e.opt.spec_draft > 0 || e.dbe ? "on" : "off", o.api_key.empty() ? "not required" : "required");
+    if (o.api_key.empty() && o.host != "127.0.0.1" && o.host != "localhost")
+        logw("listening on %s without an API key: anyone who can reach this address can use the server", o.host.c_str());
     static Server* srv = new Server(e, o);
     while (true) {
         sockaddr_in cli{};
         socklen_t cl = sizeof cli;
         int c = accept(fd, (sockaddr*)&cli, &cl);
-        if (c < 0) { if (errno == EINTR) continue; break; }
+        if (c < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {   // transient: keep serving
+                logw("accept failed (%s): too many open connections?", strerror(errno));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            loge("accept failed (%s): server stopping", strerror(errno));
+            break;
+        }
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        std::thread([c] { srv->handle(c); }).detach();
+        std::string peer = http_peer_name(cli);
+        std::thread([c, peer] { srv->handle(c, peer); }).detach();
     }
     return 0;
 }

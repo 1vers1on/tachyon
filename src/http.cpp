@@ -1,5 +1,7 @@
 #include "http.h"
+#include "common.h"
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <sys/time.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -115,8 +117,9 @@ bool Conn::write_all(const std::string& s) {
     while (off < s.size()) {
         ssize_t n = ::send(fd_, s.data() + off, s.size() - off, MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
+        if (n <= 0) { logd("write to %s failed after %zu of %zu bytes (%s)", peer.c_str(), off, s.size(), n < 0 ? strerror(errno) : "closed"); return false; }
         off += n;
+        bytes_out += n;
     }
     return true;
 }
@@ -131,10 +134,12 @@ bool Conn::send_response(int code, const std::string& ctype, const std::string& 
     h += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     h += cors() + extra;
     h += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+    status = code;
     return write_all(h + body);
 }
 
 bool Conn::start_chunked(const std::string& ctype) {
+    status = 200;
     return write_all("HTTP/1.1 200 OK\r\nContent-Type: " + ctype + "\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\n"
                      "Transfer-Encoding: chunked\r\n" + cors() + "Connection: keep-alive\r\n\r\n");
 }
@@ -334,4 +339,23 @@ bool http_relay(const HttpRequest& r, const std::string& host, int port, Conn& c
     }
     close(fd);
     return ok && r.keep_alive;
+}
+
+std::string http_peer_name(const sockaddr_in& a) {
+    char ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &a.sin_addr, ip, sizeof ip);
+    return std::string(ip) + ":" + std::to_string(ntohs(a.sin_port));
+}
+
+void http_log_access(const Conn& c, const HttpRequest& r, double seconds) {
+    const bool quiet = r.method == "OPTIONS" || r.path == "/" || r.path == "/health" || r.path == "/v1/health" || r.path == "/api/version";
+    LogLevel lvl = c.status >= 500 ? LOG_ERROR : c.status >= 400 ? LOG_WARN : quiet ? LOG_DEBUG : LOG_INFO;
+    if (!log_enabled(lvl)) return;
+    char kb[32];
+    snprintf(kb, sizeof kb, c.bytes_out >= 10240 ? "%.0f KB" : "%.1f KB", c.bytes_out / 1024.0);
+    std::string m = r.method + " " + r.path + " -> ";
+    m += c.status ? std::to_string(c.status) : "no response";
+    m += " in " + std::to_string((int)(seconds * 1000)) + " ms, " + kb + " to " + c.peer;
+    if (!c.note.empty()) m += ": " + c.note;
+    log_emit(lvl, m);
 }

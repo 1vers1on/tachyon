@@ -21,6 +21,7 @@ struct GenRequest {
     // prompt tokens [0, checkpoint) are a reusable conversation prefix (all messages, without the generation
     // prompt): stateful models save their recurrent state there so the next turn can resume from it
     int checkpoint = 0;
+    uint64_t id = 0;   // request id for log lines (taken from the submitting thread's LogScope)
     // Called on the engine thread with each new chunk of text. Return false to cancel.
     std::function<bool(const std::string& delta)> on_text;
 

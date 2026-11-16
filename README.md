@@ -178,6 +178,25 @@ Useful options:
 
 Run `./tachyon --help` for everything.
 
+### Logging
+
+Log lines go to stderr with a timestamp, a level (`ERROR`, `WARN`, `INFO`, `DEBUG`) and, while a request is
+being handled, its id (`req=N`), so the lines of one request can be followed through the server and the engine.
+Every request gets one access line (method, path, status, duration, bytes, client address; 4xx is a warning, 5xx
+an error) and generation requests add a summary with token counts, speed and time to first token. Headers,
+prompts and API keys are never logged.
+
+| Option | Environment | Effect |
+|---|---|---|
+| `-v` / `-q` | | Debug level / warnings and errors only |
+| `--log-level L` | `TACHYON_LOG_LEVEL` | `error`, `warn`, `info` (default) or `debug` |
+| `--log-file PATH` | `TACHYON_LOG_FILE` | Also append every line to `PATH` (several processes can share one file) |
+| `--log-format text\|json` | `TACHYON_LOG_FORMAT` | `json` writes one JSON object per line (`ts`, `level`, `pid`, `req`, `msg`) |
+
+Flags override the environment. Colors are used on a terminal unless `NO_COLOR` is set. The model server
+(`tachyon serve` without `-m`) passes `-v` / `-q` on to the model processes it starts, whose output is in
+`$TACHYON_HOME/logs/<model>.log`.
+
 ## How it works
 
 ```
