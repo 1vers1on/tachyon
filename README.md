@@ -79,6 +79,11 @@ Models can be named from the catalog (add `-q8` for 8-bit) or as any Hugging Fac
 a supported architecture. Models are stored in `$TACHYON_HOME` (default `~/.tachyon`). An existing
 Hugging Face cache (`$HF_HOME/hub`) is reused when it has the model. Gated repos need `HF_TOKEN`.
 
+`tachyon run NAME` starts a background model manager when none is running, and logs that startup to
+stderr. Its output goes to `$TACHYON_HOME/logs/server.log`. Require an explicitly started server with
+`tachyon run NAME --no-autostart`, or set `TACHYON_AUTOSTART=0` in your shell. The opt-out still lets
+the CLI connect to an existing manager.
+
 ### Use it from an agent
 
 OpenAI-compatible clients use `http://127.0.0.1:28657/v1`. Anthropic-compatible clients use
@@ -120,8 +125,9 @@ durations in nanoseconds. Chat supports `tools`, assistant `tool_calls` with obj
 tool results using `tool_name`, and separate `thinking` output. Generate supports `system` and `raw`.
 `format: "json"` and schema objects add prompt instructions; output is not grammar constrained.
 
-Supported `options`: `temperature`, `top_k`, `top_p`, `min_p`, `seed`, `repeat_penalty`,
-`presence_penalty`, `frequency_penalty`, `stop`, `num_predict`, and `num_ctx`.
+Supported `options`: `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`, `seed`, `repeat_penalty`,
+`repeat_last_n`, `presence_penalty`, `frequency_penalty`, `penalize_prompt`, `logit_bias`, `stop`,
+`ignore_eos`, `num_predict`, `num_ctx`, `cache_prompt`, and `draft_num_predict`.
 `num_predict: -1` / `-2` generate up to the context limit; zero evaluates the prompt without generating.
 `num_ctx` may limit a request within the server's configured context; oversized prompts return HTTP 400.
 
@@ -299,6 +305,53 @@ Useful options:
 
 Run `./tachyon --help` for everything.
 
+### Inference settings
+
+Sampling flags work with `serve`, `run -m FILE`, `run NAME`, and `bench`. With `serve`, they set the
+defaults used when clients omit a field. Start from [sampling.example.json](sampling.example.json):
+
+```bash
+# A manager with explicit backend settings and defaults for every model it loads.
+./tachyon serve --device cuda -c 8192 --slots 2 --prefill-chunk 512 \
+  --sampling-config sampling.example.json --temp 0.6
+
+# Run locally with a fixed seed, a limited repetition window and a stop string.
+./tachyon run -m models/qwen3-0.6b-q4.tach -p "Write a short story" \
+  --sampling-config sampling.example.json --repeat-last-n 64 --seed 42 --stop "THE END"
+```
+
+Config files and flags apply in command-line order; later values replace earlier ones. Repeated
+`--stop` flags append stop strings. A request overrides server defaults, which override the model's
+generation config. Unknown config keys and invalid values are rejected. Omitted settings preserve
+existing behavior; the example file is an optional starting point. Restart or reload a model after
+changing a sampling config file. Backend settings such as context, KV precision and batch size remain
+startup options, and the manager accepts them directly as shown above.
+
+| Control | CLI | API / config | Behavior |
+|---|---|---|---|
+| Typical sampling | `--typical-p P` | `typical_p` | Keep probability mass closest to expected information content; `(0, 1]`, 1 disables it |
+| Repetition window | `--repeat-last-n N` | `repeat_last_n` | Penalize the last N tokens; -1 uses all history, 0 disables repetition/presence/frequency penalties |
+| Repetition strength | `--repeat-penalty P` | `repetition_penalty` / Ollama `repeat_penalty` | Positive multiplier; 1 disables it |
+| Presence / frequency | `--presence-penalty P`, `--frequency-penalty P` | `presence_penalty`, `frequency_penalty` | Penalize seen tokens or their counts within the repetition window |
+| Prompt penalties | `--no-penalize-prompt` | `penalize_prompt: false` | Apply repetition penalties to generated tokens only |
+| Token bias | `--logit-bias '{"123": -10}'` | `logit_bias` | Add -100 through 100 to individual token logits; keys are vocabulary token IDs |
+| Maximum output | `--max-tokens N` | `max_tokens` / Ollama `num_predict` | 0 evaluates without generation; -1/-2 use remaining context |
+| Stop strings | `--stop TEXT` | `stop` / Anthropic `stop_sequences` | Stop before returning a matched string; an empty array clears inherited stops |
+| EOS handling | `--ignore-eos` | `ignore_eos` | Continue through EOS tokens until a token/context limit or stop string |
+| Prompt cache | `--no-prompt-cache` | `cache_prompt: false` | Start this request without reusing a cached prompt prefix |
+| Speculation | `--speculative-tokens N` | `speculative_tokens` / Ollama `draft_num_predict` | -1 uses server defaults; 0 disables all drafting; 1–8 caps draft depth within server capabilities |
+| Seed | `--seed N` | `seed` | -1 selects a random seed; 0 and positive seeds are reproducible |
+
+Temperature zero is greedy decoding and skips probability filters. Otherwise, the filter order is
+temperature, top-k, [locally typical sampling](https://arxiv.org/abs/2202.00666), min-p, then top-p.
+Token biases and repetition penalties are applied before sampling; bias can require transferring full
+logits to the CPU. These controls are extensions on the OpenAI and Anthropic routes; Ollama passes them
+inside `options`. OpenAI and Anthropic requests put them at the top level.
+
+`GET /api/settings` (also `/v1/settings`) reports effective generation defaults and backend settings
+for a single-model server. On the model manager it reports manager settings, explicit generation
+overrides and model-process arguments. It uses the same API-key authentication as inference routes.
+
 ### Logging
 
 Log lines go to stderr with a timestamp, a level (`ERROR`, `WARN`, `INFO`, `DEBUG`) and, while a request is
@@ -352,6 +405,7 @@ data/           calibration text (wikitext-2 train) and evaluation text (wikitex
 ```bash
 make test                                # offline file validation, CPU kernels and HTTP/API regressions
 make test-cuda                           # CUDA candidate sampling vs full logits, including overflow
+TACH_TEST_DEVICE=cuda python3 tests/settings_test.py ./tachyon  # inference controls on CUDA
 make test-models PYTHON=.venv/bin/python  # tiny model conversion + CPU logits vs Transformers; no downloads
 TACH_TEST_DEVICE=cuda make test-models PYTHON=.venv/bin/python  # quantized references on CUDA
 tools/regress.sh                          # perplexity regression across models, both CUDA paths

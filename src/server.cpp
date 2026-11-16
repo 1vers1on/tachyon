@@ -84,17 +84,13 @@ std::string content_text(const Json& c, const char* sep = "") {
 }
 
 // protocol-independent chat request
-struct ChatSpec {
+struct ChatSpec : InferenceSettings {
     std::vector<ChatMessage> msgs;
     std::vector<Json> tools;          // OpenAI shape {"type": "function", "function": {...}}
     std::string tool_choice = "auto"; // auto | none | required | named
     std::string tool_name;            // tool_choice == named
     int thinking = -1;                // -1 model default, 0 off, 1 on
     std::string format_instruction;   // JSON output requested (response_format / output_config.format)
-    SamplingParams sp;
-    int max_tokens = -1;
-    std::vector<std::string> stop;
-    bool ignore_eos = false;
 };
 
 struct Prepared {
@@ -206,6 +202,17 @@ private:
             return c.send_response(200, "text/plain", s, r.keep_alive);
         }
         if (!authorized(r)) return send_error(c, r, 401, "invalid API key");
+        if (r.method == "GET" && (r.path == "/api/settings" || r.path == "/v1/settings")) {
+            Json j = Json::object(), backend = Json::object();
+            j.set("model", alias_); j.set("generation", default_settings().to_json());
+            backend.set("device", e_.be->name()); backend.set("num_ctx", e_.opt.backend.ctx);
+            backend.set("slots", e_.opt.backend.n_slots); backend.set("threads", e_.opt.backend.threads);
+            backend.set("prefill_chunk", e_.opt.prefill_chunk); backend.set("kv_int8", e_.opt.backend.kv_int8);
+            backend.set("cuda_graphs", e_.opt.backend.use_graphs); backend.set("speculative_tokens", e_.opt.spec_draft);
+            backend.set("draft_model", e_.opt.draft_model); backend.set("draft_k", e_.opt.draft_k);
+            j.set("backend", backend);
+            return c.send_response(200, "application/json", j.dump(), r.keep_alive);
+        }
         if (r.method == "GET" && r.path == "/api/version") {
             Json j = Json::object(); j.set("version", TACH_VERSION);
             return c.send_response(200, "application/json", j.dump(), r.keep_alive);
@@ -266,16 +273,13 @@ private:
         return send_error(c, r, 404, "not found: " + r.method + " " + r.path, "not_found_error");
     }
 
-    // sampling defaults: model generation_config
-    SamplingParams default_sampling() const {
-        const Json& gd = e_.gen_defaults;
-        SamplingParams sp;
-        sp.temperature = (float)gd.get_num("temperature", 0.7);
-        sp.top_k = (int)gd.get_int("top_k", 40);
-        sp.top_p = (float)gd.get_num("top_p", 0.95);
-        sp.min_p = (float)gd.get_num("min_p", 0.0);
-        sp.repetition_penalty = (float)gd.get_num("repetition_penalty", 1.0);
-        return sp;
+    InferenceSettings default_settings() const {
+        InferenceSettings settings;
+        std::string err;
+        if (e_.gen_defaults.is_obj()) err = settings.update(e_.gen_defaults);
+        if (err.empty()) err = settings.update(o_.generation_defaults);
+        if (!err.empty()) die("invalid server inference defaults: %s", err.c_str());
+        return settings;
     }
 
     // render + tokenize; returns an error message on failure
@@ -319,9 +323,11 @@ private:
             p.starts_inside = pr.size() >= tag.size() && pr.compare(pr.size() - tag.size(), tag.size(), tag) == 0;
         }
         req->sp = spec.sp;
-        req->max_tokens = spec.max_tokens > 0 ? spec.max_tokens : ctx;
+        req->max_tokens = spec.max_tokens >= 0 ? spec.max_tokens : ctx;
         req->stop = spec.stop;
         req->ignore_eos = spec.ignore_eos;
+        req->cache_prompt = spec.cache_prompt;
+        req->speculative_tokens = spec.speculative_tokens;
         p.req = req;
         return "";
     }
@@ -433,15 +439,7 @@ private:
         if (j.get_bool("logprobs", false)) return send_error(c, hr, 400, "logprobs are not supported");
         if (j["images"].size()) return send_error(c, hr, 400, "image inputs are not supported");
         const Json& options = j["options"];
-        for (const char* key : {"temperature", "top_p", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty"})
-            if (options.has(key) && (!options[key].is_num() || !std::isfinite(options[key].num))) return send_error(c, hr, 400, std::string("invalid option: ") + key);
-        for (const char* key : {"num_predict", "num_ctx", "top_k", "seed"})
-            if (options.has(key) && (!options[key].is_num() || !std::isfinite(options[key].num) || options[key].num < -2 || options[key].num > INT32_MAX || options[key].num != options[key].as_int()))
-                return send_error(c, hr, 400, std::string("invalid integer option: ") + key);
-        // Translate the options supported by the common sampler.
-        Json translated = options;
-        translated.set("max_tokens", options.get_int("num_predict", -1));
-        translated.set("repetition_penalty", options.get_num("repeat_penalty", default_sampling().repetition_penalty));
+        Json translated = options.is_obj() ? options : Json::object();
         ChatSpec spec;
         if (chat) {
             if (!j["messages"].is_arr()) return send_error(c, hr, 400, "messages must be an array");
@@ -462,18 +460,14 @@ private:
         } else {
             if (j.has("prompt") && !j["prompt"].is_str()) return send_error(c, hr, 400, "prompt must be a string");
             if (j.has("system") && !j["system"].is_str()) return send_error(c, hr, 400, "system must be a string");
-            oai_sampling(translated, spec);
+            if (!(err = oai_sampling(translated, spec)).empty()) return send_error(c, hr, 400, err);
             if (!j.get_str("system", "").empty()) { ChatMessage m; m.role = "system"; m.content = j["system"].str; spec.msgs.push_back(m); }
             ChatMessage m; m.role = "user"; m.content = j.get_str("prompt", ""); spec.msgs.push_back(m);
         }
         if (j["think"].is_bool()) spec.thinking = j["think"].b;
-        spec.sp.seed_set = options.has("seed") && options.get_int("seed", -1) >= 0;
-        if (!spec.sp.seed_set) spec.sp.seed = 0;
         if (j["format"].is_obj() || j.get_str("format", "") == "json") spec.format_instruction = json_instruction(j["format"]);
-        const auto& sp = spec.sp;
-        if (!std::isfinite(sp.temperature) || sp.temperature < 0 || !std::isfinite(sp.top_p) || sp.top_p < 0 || sp.top_p > 1 ||
-            !std::isfinite(sp.min_p) || sp.min_p < 0 || sp.min_p > 1 || !std::isfinite(sp.repetition_penalty) || sp.repetition_penalty <= 0 ||
-            !std::isfinite(sp.presence_penalty) || !std::isfinite(sp.frequency_penalty)) return send_error(c, hr, 400, "invalid sampling options");
+        if (options.has("num_ctx") && (!options["num_ctx"].is_num() || !std::isfinite(options["num_ctx"].num) || options["num_ctx"].num != options["num_ctx"].as_int()))
+            return send_error(c, hr, 400, "num_ctx must be an integer");
         const int64_t requested_ctx = options.get_int("num_ctx", e_.opt.backend.ctx);
         if (requested_ctx <= 0 || requested_ctx > e_.opt.backend.ctx) return send_error(c, hr, 400, "num_ctx must be within the server context length");
         if (options.has("num_predict") && (!options["num_predict"].is_num() || options["num_predict"].num != options.get_int("num_predict", -1) || options["num_predict"].num < -2))
@@ -486,6 +480,9 @@ private:
                 p.req = std::make_shared<GenRequest>();
                 p.req->prompt = e_.tok.encode(j["prompt"].str);
                 p.req->sp = spec.sp; p.req->stop = spec.stop;
+                p.req->ignore_eos = spec.ignore_eos;
+                p.req->cache_prompt = spec.cache_prompt;
+                p.req->speculative_tokens = spec.speculative_tokens;
                 p.req->max_tokens = spec.max_tokens > 0 ? spec.max_tokens : (int)requested_ctx;
             } else if (!(err = prepare(spec, p)).empty()) return send_error(c, hr, 400, err);
             if (p.req->prompt.size() >= (size_t)requested_ctx) return send_error(c, hr, 400, "prompt exceeds num_ctx");
@@ -543,26 +540,19 @@ private:
 
     // ------------------------------------------------------------------------------------------ OpenAI
 
-    void oai_sampling(const Json& j, ChatSpec& s) const {
-        s.sp = default_sampling();
-        s.sp.temperature = (float)j.get_num("temperature", s.sp.temperature);
-        s.sp.top_p = (float)j.get_num("top_p", s.sp.top_p);
-        s.sp.top_k = (int)j.get_int("top_k", s.sp.top_k);
-        s.sp.min_p = (float)j.get_num("min_p", s.sp.min_p);
-        s.sp.presence_penalty = (float)j.get_num("presence_penalty", 0);
-        s.sp.frequency_penalty = (float)j.get_num("frequency_penalty", 0);
-        s.sp.repetition_penalty = (float)j.get_num("repetition_penalty", s.sp.repetition_penalty);
-        s.sp.seed = (uint64_t)j.get_int("seed", 0);
-        s.sp.seed_set = j.has("seed") && j["seed"].is_num();
-        s.max_tokens = (int)j.get_int("max_completion_tokens", j.get_int("max_tokens", -1));
-        const Json& stop = j["stop"];
-        if (stop.is_str()) s.stop.push_back(stop.str);
-        else for (auto& x : stop.arr) if (x.is_str()) s.stop.push_back(x.str);
-        s.ignore_eos = j.get_bool("ignore_eos", false);
+    std::string oai_sampling(const Json& j, ChatSpec& s) const {
+        static_cast<InferenceSettings&>(s) = default_settings();
+        // max_completion_tokens has precedence over the legacy max_tokens field.
+        Json values = j;
+        if (j.has("max_completion_tokens")) values.set("max_tokens", j["max_completion_tokens"]);
+        std::string err = s.update(values);
+        if (err.empty()) err = s.validate_vocab(e_.mf.config.vocab);
+        return err;
     }
 
     std::string oai_spec(const Json& j, ChatSpec& s) const {
-        oai_sampling(j, s);
+        std::string sampling_error = oai_sampling(j, s);
+        if (!sampling_error.empty()) return sampling_error;
         if (!j["messages"].is_arr()) return "messages must be an array";
         for (auto& m : j["messages"].arr) {
             ChatMessage cm;
@@ -734,7 +724,7 @@ private:
         Json j = Json::parse(hr.body, &err);
         if (!err.empty() || !j.is_obj()) return send_error(c, hr, 400, "invalid JSON body: " + err);
         ChatSpec spec;
-        oai_sampling(j, spec);
+        if (!(err = oai_sampling(j, spec)).empty()) return send_error(c, hr, 400, err);
         Prepared p;
         p.req = std::make_shared<GenRequest>();
         const Json& pj = j["prompt"];
@@ -752,9 +742,11 @@ private:
         if ((int)p.req->prompt.size() + 1 > ctx)
             return send_error(c, hr, 400, "prompt is too long: " + std::to_string(p.req->prompt.size()) + " tokens > " + std::to_string(ctx - 1) + " maximum");
         p.req->sp = spec.sp;
-        p.req->max_tokens = spec.max_tokens > 0 ? spec.max_tokens : ctx;
+        p.req->max_tokens = spec.max_tokens >= 0 ? spec.max_tokens : ctx;
         p.req->stop = spec.stop;
         p.req->ignore_eos = spec.ignore_eos;
+        p.req->cache_prompt = spec.cache_prompt;
+        p.req->speculative_tokens = spec.speculative_tokens;
         const bool stream = j.get_bool("stream", false);
         const bool include_usage = j["stream_options"].get_bool("include_usage", false);
         const bool echo = j.get_bool("echo", false);
@@ -826,12 +818,12 @@ private:
     // ------------------------------------------------------------------------------------------ Anthropic
 
     std::string anth_spec(const Json& j, ChatSpec& s) const {
-        s.sp = default_sampling();
-        s.sp.temperature = (float)j.get_num("temperature", s.sp.temperature);
-        s.sp.top_p = (float)j.get_num("top_p", s.sp.top_p);
-        s.sp.top_k = (int)j.get_int("top_k", s.sp.top_k);
-        s.max_tokens = (int)j.get_int("max_tokens", -1);
-        for (auto& x : j["stop_sequences"].arr) if (x.is_str() && !x.str.empty()) s.stop.push_back(x.str);
+        std::string err = oai_sampling(j, s);
+        if (!err.empty()) return err;
+        if (j.has("stop_sequences")) {
+            Json translated = Json::object(); translated.set("stop", j["stop_sequences"]);
+            if (!(err = s.update(translated)).empty()) return err;
+        }
         const std::string sys = content_text(j["system"], "\n");
         if (!sys.empty()) { ChatMessage m; m.role = "system"; m.content = sys; s.msgs.push_back(m); }
         if (!j["messages"].is_arr()) return "messages: field required";

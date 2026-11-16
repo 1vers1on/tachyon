@@ -6,6 +6,7 @@ struct ServerOptions {
     int port = 28657;
     std::string api_key;   // require "Authorization: Bearer KEY" or "x-api-key: KEY" (empty = open)
     std::string alias;     // model id reported by /v1/models (default: the model's name)
+    Json generation_defaults = Json::object();
 };
 
 int server_main(Engine& e, const ServerOptions& o);

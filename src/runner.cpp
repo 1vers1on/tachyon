@@ -10,6 +10,7 @@
 #include "http.h"
 #include "model_file.h"
 #include "ollama.h"
+#include "sampler.h"
 #include "https.h"
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -582,6 +583,7 @@ struct ManagerOptions {
     std::string default_model;        // used for requests naming an unknown model (e.g. Claude Code's haiku calls)
     std::string api_key;
     std::vector<std::string> runner_args;
+    Json generation_overrides = Json::object();
     bool auto_pull = true;
 };
 
@@ -886,6 +888,14 @@ private:
             return reply(c, r, 200, j);
         }
         if (!authorized(r)) return error(c, r, 401, "invalid API key");
+        if (r.method == "GET" && (r.path == "/api/settings" || r.path == "/v1/settings")) {
+            Json j = Json::object(), args = Json::array();
+            j.set("manager", true); j.set("keep_alive", o_.keep_alive); j.set("max_loaded", o_.max_loaded);
+            j.set("auto_pull", o_.auto_pull); j.set("generation_overrides", o_.generation_overrides);
+            for (const auto& arg : o_.runner_args) args.push(arg);
+            j.set("runner_args", args);
+            return reply(c, r, 200, j);
+        }
         if (r.method == "GET" && (r.path == "/v1/models" || r.path == "/models")) {
             Json arr = Json::array();
             for (auto& m : list_local()) arr.push(model_entry(m));
@@ -1117,14 +1127,19 @@ bool manager_up(const Endpoint& ep, bool* is_manager = nullptr) {
 }
 
 // start `tachyon serve` (manager) in the background when nothing listens yet
-bool ensure_manager(const Endpoint& ep) {
+bool ensure_manager(const Endpoint& ep, bool autostart) {
     bool mgr = false;
     if (manager_up(ep, &mgr)) {
         if (!mgr) { loge("%s:%d is a single-model `tachyon serve -m`; stop it or set TACHYON_HOST", ep.host.c_str(), ep.port); return false; }
         return true;
     }
+    if (!autostart) {
+        loge("Tachyon server is not running; auto-start is disabled. Start it explicitly with `tachyon serve`.");
+        return false;
+    }
     mkdirs(home_dir() + "/logs");
     std::string log = home_dir() + "/logs/server.log";
+    logi("starting background Tachyon server (log: %s); TACHYON_AUTOSTART=0 disables auto-start", log.c_str());
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
@@ -1151,11 +1166,13 @@ struct ChatOpts {
     std::string model, system;
     int think = -1;   // -1 model default
     bool show_thinking = true, verbose = false;
+    bool autostart = true;
+    Json generation = Json::object();
 };
 
 // stream one chat turn; prints as it goes. Returns false on error. Appends the assistant turn to history.
 bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
-    Json body = Json::object();
+    Json body = o.generation;
     body.set("model", o.model);
     body.set("messages", history);
     body.set("stream", true);
@@ -1245,6 +1262,7 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
 
 int run_cli(int argc, char** argv) {
     ChatOpts o;
+    if (const char* value = getenv("TACHYON_AUTOSTART")) o.autostart = strcmp(value, "0") && strcasecmp(value, "false");
     std::string prompt;
     bool keep = false;
     for (int i = 0; i < argc; i++) {
@@ -1256,6 +1274,8 @@ int run_cli(int argc, char** argv) {
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "-s" || a == "--system") o.system = next();
         else if (a == "--keep-download") keep = true;
+        else if (a == "--no-autostart") o.autostart = false;
+        else if (inference_arg(a, next, o.generation)) {}
         else if (o.model.empty()) o.model = a;
         else prompt += (prompt.empty() ? "" : " ") + a;
     }
@@ -1267,7 +1287,7 @@ int run_cli(int argc, char** argv) {
     }
     o.model = lm.name;
     Endpoint ep = endpoint();
-    if (!ensure_manager(ep)) return 1;
+    if (!ensure_manager(ep, o.autostart)) return 1;
     auto base = [&]() {
         Json h = Json::array();
         if (!o.system.empty()) { Json s = Json::object(); s.set("role", "system"); s.set("content", o.system); h.push(s); }
@@ -1344,10 +1364,11 @@ bool runner_is_command(const std::string& cmd) {
 void runner_usage() {
     fprintf(stderr,
         "model runner (ollama-style):\n"
-        "  tachyon run <model> [prompt]   chat with a model (pulls it and starts the background server when needed)\n"
+        "  tachyon run <model> [prompt]   chat; --no-autostart or TACHYON_AUTOSTART=0 requires an existing server\n"
         "  tachyon serve                  model server on $TACHYON_HOST (default 127.0.0.1:28657): any local model by name,\n"
         "                                 loaded on demand  [--keep-alive SECS] [--max-loaded N] [--default-model NAME]\n"
         "                                 [--runner-args \"--kv8 ...\"] [--api-key KEY] [--no-auto-pull]\n"
+        "                                 sampling flags and --sampling-config FILE set defaults for model processes\n"
         "  tachyon pull <model>           download from Hugging Face + convert (Q4 + importance matrix)\n"
         "  tachyon list                   local models          tachyon catalog   models that can be pulled\n"
         "  tachyon ps                     loaded models         tachyon stop <model>   unload\n"
@@ -1370,6 +1391,14 @@ int runner_serve(int argc, char** argv) {
     for (int i = 0; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) die("missing value for %s", a.c_str()); return argv[++i]; };
+        const int first_arg = i;
+        if (inference_arg(a, next, o.generation_overrides)) {
+            for (int n = first_arg; n <= i; n++) o.runner_args.push_back(argv[n]);
+            continue;
+        }
+        static const std::set<std::string> backend_values = {"--device", "-c", "--ctx", "--slots", "-t", "--threads", "--spec", "--draft", "--draft-k", "--draft-vocab", "--prefill-chunk", "--cpu-moe"};
+        if (backend_values.count(a)) { o.runner_args.push_back(a); o.runner_args.push_back(next()); continue; }
+        if (a == "--kv8" || a == "--no-graphs") { o.runner_args.push_back(a); continue; }
         if (a == "--host") o.ep.host = next();
         else if (a == "--port") o.ep.port = atoi(next().c_str());
         else if (a == "--keep-alive") o.keep_alive = atof(next().c_str());

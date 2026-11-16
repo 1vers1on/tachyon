@@ -1,0 +1,19 @@
+{
+  "temperature": 0.7,
+  "top_k": 40,
+  "top_p": 0.95,
+  "min_p": 0.05,
+  "typical_p": 1.0,
+  "repetition_penalty": 1.05,
+  "repeat_last_n": 128,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "penalize_prompt": true,
+  "logit_bias": {},
+  "seed": -1,
+  "max_tokens": 512,
+  "stop": [],
+  "ignore_eos": false,
+  "cache_prompt": true,
+  "speculative_tokens": -1
+}

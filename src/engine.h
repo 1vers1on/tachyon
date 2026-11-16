@@ -18,6 +18,8 @@ struct GenRequest {
     int max_tokens = 512;
     std::vector<std::string> stop;
     bool ignore_eos = false;
+    bool cache_prompt = true;
+    int speculative_tokens = -1;  // -1 engine default, 0 off; capped by the server's capabilities
     // prompt tokens [0, checkpoint) are a reusable conversation prefix (all messages, without the generation
     // prompt): stateful models save their recurrent state there so the next turn can resume from it
     int checkpoint = 0;

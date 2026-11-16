@@ -37,7 +37,12 @@ static void usage() {
         "  --cpu-moe N              keep the experts of the last N MoE layers in system RAM (CPU compute); default: auto\n"
         "  --prefill-chunk N        prompt tokens per forward (default 512; 2048 for MoE models larger than VRAM)\n"
         "  --no-graphs              disable CUDA graphs\n"
-        "  --temp T --top-k K --top-p P --min-p P --seed S   sampling (run/bench)\n"
+        "  --sampling-config FILE  JSON generation defaults (serve, run, bench); later flags override\n"
+        "  --temp T --top-k K --top-p P --min-p P --typical-p P --seed S\n"
+        "  --repeat-penalty P --repeat-last-n N --presence-penalty P --frequency-penalty P\n"
+        "  --max-tokens N --stop TEXT (repeatable) --ignore-eos\n"
+        "  --no-penalize-prompt --logit-bias '{\"TOKEN_ID\": BIAS}'\n"
+        "  --no-prompt-cache --speculative-tokens N   request defaults (0 disables speculation)\n"
         "  --api-key KEY            serve: require this key (Bearer or x-api-key; also TACHYON_API_KEY)\n"
         "  --alias NAME             serve: model id reported by the API\n"
         "  -v / -q                  verbose (debug) / quiet (warnings and errors only) logging\n"
@@ -55,7 +60,8 @@ struct Args {
     bool ctx_set = false;
     int draft_k = 4, draft_vocab = 0, cpu_moe = -1, prefill_chunk = 0;
     SamplingParams sp;
-    bool temp_set = false;
+    InferenceSettings generation;
+    Json sampling_defaults = Json::object();
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -70,7 +76,7 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--host") a.host = next();
         else if (s == "-o" || s == "--output") a.out = next();
         else if (s == "--port") a.port = atoi(next().c_str());
-        else if (s == "-n" || s == "--n-predict") a.n = atoi(next().c_str());
+        else if (s == "-n" || s == "--n-predict") { a.n = atoi(next().c_str()); a.sampling_defaults.set("max_tokens", a.n); }
         else if (s == "-c" || s == "--ctx") { a.ctx = atoi(next().c_str()); a.ctx_set = true; }
         else if (s == "--api-key") a.api_key = next();
         else if (s == "--alias") a.alias = next();
@@ -89,16 +95,16 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--think") a.think = true;
         else if (s == "--kv8") a.kv8 = true;
         else if (s == "--no-graphs") a.graphs = false;
-        else if (s == "--temp") { a.sp.temperature = atof(next().c_str()); a.temp_set = true; }
-        else if (s == "--top-k") a.sp.top_k = atoi(next().c_str());
-        else if (s == "--top-p") a.sp.top_p = atof(next().c_str());
-        else if (s == "--min-p") a.sp.min_p = atof(next().c_str());
-        else if (s == "--seed") { a.sp.seed = strtoull(next().c_str(), nullptr, 10); a.sp.seed_set = true; }
-        else if (s == "--repeat-penalty") a.sp.repetition_penalty = atof(next().c_str());
+        else if (inference_arg(s, next, a.sampling_defaults)) {}
         else if (log_arg(s, next)) {}
         else if (s == "-h" || s == "--help") { usage(); exit(0); }
         else die("unknown argument %s (see tachyon --help)", s.c_str());
     }
+    a.generation.sp = a.sp;
+    std::string err = a.generation.update(a.sampling_defaults, true);
+    if (!err.empty()) die("invalid inference settings: %s", err.c_str());
+    a.sp = a.generation.sp;
+    if (a.ctx <= 0 || a.prefill_chunk < 0 || a.spec < -1 || a.spec > 8 || a.draft_k < 1 || a.draft_k > 8) die("invalid context, prefill chunk or speculation size");
     if (a.model.empty()) die("missing -m model.tach");
     return a;
 }
@@ -266,13 +272,20 @@ int main(int argc, char** argv) {
     }
     Engine e;
     load_engine(e, a);
+    std::string settings_error = a.generation.validate_vocab(e.be->vocab());
+    if (!settings_error.empty()) die("%s", settings_error.c_str());
+    auto configure_request = [&](GenRequest& r) {
+        r.sp = a.sp;
+        r.max_tokens = a.sampling_defaults.has("max_tokens") ? (a.generation.max_tokens >= 0 ? a.generation.max_tokens : e.opt.backend.ctx) : a.n;
+        r.stop = a.generation.stop; r.ignore_eos = a.generation.ignore_eos;
+        r.cache_prompt = a.generation.cache_prompt; r.speculative_tokens = a.generation.speculative_tokens;
+    };
     if (cmd == "run") {
         auto r = std::make_shared<GenRequest>();
         std::string text = a.prompt;
         if (a.chat) text = e.tok.render_chat({{"user", a.prompt, ""}}, true, a.no_think ? false : (a.think || e.tok.think_default()));
         r->prompt = e.tok.encode(text);
-        r->sp = a.sp;
-        r->max_tokens = a.n;
+        configure_request(*r);
         r->on_text = [](const std::string& d) { fwrite(d.data(), 1, d.size(), stdout); fflush(stdout); return true; };
         e.run_sync(r);
         printf("\n");
@@ -289,8 +302,7 @@ int main(int argc, char** argv) {
             auto r = std::make_shared<GenRequest>();
             if (rep == 1) prompt[0] ^= 1;  // defeat prefix cache for second run
             r->prompt = prompt;
-            r->sp = a.sp;
-            r->max_tokens = a.n;
+            configure_request(*r);
             r->ignore_eos = true;
             e.run_sync(r);
             if (rep == 1 || g_log_level >= 2) print_stats(*r);
@@ -371,6 +383,7 @@ int main(int argc, char** argv) {
         so.port = a.port;
         so.api_key = a.api_key.empty() && getenv("TACHYON_API_KEY") ? getenv("TACHYON_API_KEY") : a.api_key;
         so.alias = a.alias;
+        so.generation_defaults = a.sampling_defaults;
         return server_main(e, so);
     }
     usage();

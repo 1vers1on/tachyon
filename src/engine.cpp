@@ -174,7 +174,7 @@ void Engine::admit() {
         }
         if (r->prompt.empty()) r->prompt.push_back(tok.bos() >= 0 ? tok.bos() : 0);
         // keep at least one prompt token to evaluate so we get logits
-        int keep = std::min(best_lcp, (int)r->prompt.size() - 1);
+        int keep = r->cache_prompt ? std::min(best_lcp, (int)r->prompt.size() - 1) : 0;
         // ring buffers (sliding window): the tokens cached after the prefix may have overwritten the window before it
         if ((int)s.cache.size() - keep > ring_slack_) keep = 0;
         // recurrent state describes the whole cached sequence: reuse all of it, resume from the prompt checkpoint
@@ -197,10 +197,10 @@ void Engine::admit() {
         s.generating = false;
         s.last = -1;
         s.sampler.init(r->sp);
-        for (int t : r->prompt) s.sampler.accept(t);
+        if (r->sp.penalize_prompt) for (int t : r->prompt) s.sampler.accept(t);
         s.dec = std::make_unique<StreamDecoder>(&tok);
         s.pending_text.clear();
-        s.spec_k = opt.spec_draft;
+        s.spec_k = r->speculative_tokens < 0 ? opt.spec_draft : std::min(r->speculative_tokens, opt.spec_draft);
         s.acc_ema = 0.7f; s.spec_pause = 0;
         s.spec_miss = 0;
         r->n_prompt = (int)r->prompt.size();
@@ -408,7 +408,8 @@ bool Engine::step() {
         if (s.spec_pause > 0) { s.spec_pause--; k = 0; }
         if (k > 0) ngram_drafts[si] = draft_ngram(s, k, dbe ? 2 : 1);
         // the draft model only pays off when few streams are active (batching already fills the GPU otherwise)
-        if (ngram_drafts[si].empty() && dbe && n_active <= 2 && std::min(s.dk, cap) > 0) need_model.push_back({si, std::min(s.dk, cap)});
+        const int model_k = s.req->speculative_tokens < 0 ? s.dk : std::min(s.dk, s.req->speculative_tokens);
+        if (ngram_drafts[si].empty() && dbe && n_active <= 2 && std::min(model_k, cap) > 0) need_model.push_back({si, std::min(model_k, cap)});
     }
     std::vector<std::vector<int>> model_drafts;
     if (!need_model.empty()) draft_with_model(need_model, model_drafts);
@@ -491,7 +492,11 @@ bool Engine::step() {
             s.acc_ema = 0.8f * s.acc_ema + 0.2f * accepted / nd;
             if (s.acc_ema < spec_min_accept_) { s.spec_pause = 16; s.acc_ema = spec_min_accept_; }
             if (accepted == 0) { if (++s.spec_miss >= 4 && s.spec_k > 1) { s.spec_k--; s.spec_miss = 0; } }
-            else { s.spec_miss = 0; if (accepted == nd && s.spec_k < 8 && s.spec_k < opt.spec_draft * 2) s.spec_k++; }
+            else {
+                s.spec_miss = 0;
+                const int limit = s.req && s.req->speculative_tokens >= 0 ? std::min(s.req->speculative_tokens, opt.spec_draft) : opt.spec_draft * 2;
+                if (accepted == nd && s.spec_k < 8 && s.spec_k < limit) s.spec_k++;
+            }
         }
         if (s.req && accepted == nd && nd > 0 && s.last == rr.draft[nd - 1]) {
             // all drafts accepted: last emitted token is the extra sampled one (already set via s.last)

@@ -47,6 +47,7 @@ test: tachyon $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/text-test
 	python3 tests/file_test.py $(BUILD)/file-probe
 	$(BUILD)/kernel-test
 	python3 tests/server_test.py ./tachyon $(BUILD)/text-test
+	python3 tests/settings_test.py ./tachyon
 
 $(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/cuda_api.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)

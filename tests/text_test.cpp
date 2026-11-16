@@ -38,5 +38,31 @@ int main(int argc, char** argv) {
         assert(j.as_int(123) == 123);
         assert(!j.dump().empty());
     }
+    params.repetition_penalty = 2; params.presence_penalty = 3; params.frequency_penalty = 1;
+    params.repeat_last_n = 2; a.init(params);
+    a.accept(1); a.accept(2); a.accept(1);  // token 1 occurs once within the last two tokens
+    float logits[] = {10, -8, 10}; a.apply_penalties(logits, 3);
+    assert(logits[0] == 10 && logits[1] == -20 && logits[2] == 1);
+    a.accept(0);
+    float expired[] = {10, -8, 10}; a.apply_penalties(expired, 3);
+    assert(expired[0] == 1 && expired[1] == -20 && expired[2] == 10);
+    params.repeat_last_n = 0; a.init(params); a.accept(1);
+    float unpenalized[] = {10, -8, 10}; a.apply_penalties(unpenalized, 3);
+    assert(!params.has_penalties() && unpenalized[1] == -8);
+    params.logit_bias[1] = 30; params.temperature = 0; a.init(params); a.apply_penalties(unpenalized, 3);
+    assert(params.has_penalties() && a.sample(unpenalized, 3) == 1);
+    params = SamplingParams{}; params.seed_set = true; params.temperature = 1;
+    params.typical_p = .1f; params.top_p = 1; params.top_k = 0;
+    a.init(params);
+    const float typical_logits[] = {logf(.5f), logf(.3f), logf(.2f)};
+    for (int i = 0; i < 100; i++) assert(a.sample(typical_logits, 3) == 1);
+    InferenceSettings settings;
+    assert(settings.update(Json::parse(R"({"typical_p":0.8,"repeat_last_n":64,"seed":0,"cache_prompt":false,"draft_num_predict":0,"logit_bias":{"1":4},"num_predict":10})"), true).empty());
+    InferenceSettings restored; assert(restored.update(settings.to_json(), true).empty());
+    assert(restored.sp.typical_p == settings.sp.typical_p && restored.sp.seed_set && !restored.cache_prompt && restored.max_tokens == 10);
+    assert(!settings.update(Json::parse(R"({"typical_p":0})")).empty());
+    assert(!settings.update(Json::parse(R"({"repeat_last_n":-2})")).empty());
+    assert(!settings.update(Json::parse(R"({"unknown_setting":1})"), true).empty());
+    assert(!settings.validate_vocab(1).empty());
     puts("UTF-8 streaming, seeded sampling and JSON numeric checks passed");
 }
