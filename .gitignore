@@ -12,7 +12,7 @@
 *.ptx
 
 # ---- models, weights, conversion intermediates (large, regenerable) ----
-/models/
+/models
 *.tach
 *.tach.partial
 *.q8tmp
