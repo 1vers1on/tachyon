@@ -44,8 +44,8 @@ int convert_calibrated(const std::string& hf_dir, const std::string& out, const 
 int convert_main(int argc, char** argv);
 
 static const unsigned char kCalibBytes[] = {
-#embed "../data/calib.txt"
-    , 0};
+#include "calib.inc"
+    0};
 static const char* const kCalibText = (const char*)kCalibBytes;
 
 namespace {

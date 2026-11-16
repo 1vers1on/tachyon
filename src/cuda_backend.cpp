@@ -21,8 +21,8 @@ namespace {
 const CudaApi& dcu = cuda_api();
 
 static const char kKernelSource[] = {
-#embed "kernels/kernels.cu"
-    , 0};
+#include "kernels.inc"
+    0};
 
 #define CU(x) do { CUresult _e = (x); if (_e != CUDA_SUCCESS) { const char* s = nullptr; dcu.cuGetErrorString(_e, &s); die("CUDA error %s at %s:%d: %s", s ? s : "?", __FILE__, __LINE__, #x); } } while (0)
 #define NVRTC(x) do { nvrtcResult _e = (x); if (_e != NVRTC_SUCCESS) die("NVRTC error %s at %s:%d", dcu.nvrtcGetErrorString(_e), __FILE__, __LINE__); } while (0)

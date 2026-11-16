@@ -5,9 +5,8 @@
 // Without AVX-512 VNNI the same dot product is built from VPMADDUBSW + VPMADDWD, and without AVX2/FMA/F16C the
 // kernels are plain scalar C++ (slow, but runs on any x86-64 CPU and gives the same int8 quantization).
 //
-// The instruction set is chosen at compile time from the -march flags (the default is -march=native), so a
-// binary runs only on CPUs that have what it was built for. To get a lower path on a newer machine, lower
-// -march, e.g. `make OPT="-O3 -march=haswell"` (AVX2) or `make OPT="-O3 -march=x86-64"` (scalar).
+// Source builds default to baseline x86-64. CPU=avx2 / avx512 select explicit, vendor-neutral ISA sets.
+// Release archives include all three variants; the baseline launcher checks CPU and OS support before exec.
 #include "backend.h"
 #include "threadpool.h"
 #include "quant.h"
