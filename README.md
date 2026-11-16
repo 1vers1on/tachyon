@@ -191,6 +191,12 @@ tools/bench.sh cpu                                  # CPU kernel sets: qwen3:0.6
 tools/bench.sh cpu -r 3 -t 16 -p 2048 qwen3:1.7b    # runs, CPU threads, prompt length, generated tokens (-n)
 ```
 
+Speculative decoding is off in these runs (`-s N` turns it on). `tachyon bench` uses a prompt that repeats one
+sentence, so with n-gram speculation (on by default on the GPU) nearly every draft token is accepted and decode
+looks 4 to 5 times faster than real single-stream decode. As a sanity check, single-stream decode cannot exceed
+memory bandwidth divided by the model file size (roughly 1.8 TB/s / 4.8 GB, about 370 tok/s, for Qwen3-8B Q4 on an
+RTX 5090).
+
 Models are downloaded from Hugging Face and converted (Q4 + importance matrix) the first time they are used, and
 are kept in `$TACHYON_HOME` (default `~/.tachyon`). Gated models need `HF_TOKEN`. `cpu` mode builds a binary per
 kernel set in `build/bench/` (AVX-512, AVX2 and scalar, whichever the CPU can run), so it takes a few minutes the

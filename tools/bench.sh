@@ -8,6 +8,8 @@
 #           -t threads    CPU threads (default: half of the logical cores)
 #           -p tokens     prompt length (default 512 for cpu, 2048 for gpu)
 #           -n tokens     generated tokens (default 128)
+#           -s tokens     n-gram speculative draft tokens (default 0 = off). The benchmark prompt repeats one sentence, so
+#                         with speculation on nearly every draft is accepted and decode looks 4-5x faster than it is
 # models:   catalog names or Hugging Face repos, as for `tachyon pull`; each is downloaded and converted if missing.
 #           Defaults: cpu: qwen3:0.6b qwen3:0.6b-q8 qwen3:1.7b   gpu: qwen3:0.6b qwen3:8b
 #
@@ -23,10 +25,10 @@ case $mode in cpu|gpu) shift ;; *) usage ;; esac
 
 if [ "$mode" = cpu ]; then REPS=5; P=512; DEFAULT_MODELS=(qwen3:0.6b qwen3:0.6b-q8 qwen3:1.7b)
 else REPS=3; P=2048; DEFAULT_MODELS=(qwen3:0.6b qwen3:8b); fi
-N=128
+N=128; SPEC=0
 T=$(( $(nproc) / 2 )); [ "$T" -ge 1 ] || T=1
-while getopts r:t:p:n: o; do
-    case $o in r) REPS=$OPTARG ;; t) T=$OPTARG ;; p) P=$OPTARG ;; n) N=$OPTARG ;; *) usage ;; esac
+while getopts r:t:p:n:s: o; do
+    case $o in r) REPS=$OPTARG ;; t) T=$OPTARG ;; p) P=$OPTARG ;; n) N=$OPTARG ;; s) SPEC=$OPTARG ;; *) usage ;; esac
 done
 shift $((OPTIND - 1))
 MODELS=("$@"); [ ${#MODELS[@]} -gt 0 ] || MODELS=("${DEFAULT_MODELS[@]}")
@@ -71,7 +73,7 @@ for rep in $(seq "$REPS"); do                     # interleaved, so drift in mac
     for m in "${MODELS[@]}"; do
         for v in "${VARS[@]}"; do
             # shellcheck disable=SC2086
-            r=$("${BIN[$v]}" bench -m "${FILE[$m]}" ${ARGS[$v]} -n "$N" --prompt-len "$P" --temp 0 2>&1 \
+            r=$("${BIN[$v]}" bench -m "${FILE[$m]}" ${ARGS[$v]} -n "$N" --prompt-len "$P" --temp 0 --spec "$SPEC" 2>&1 \
                 | sed -n 's/.*= \([0-9.]*\) tok\/s | gen .*= \([0-9.]*\) tok\/s.*/\1 \2/p' | tail -1) || true
             if [ -z "$r" ]; then echo "run $rep/$REPS $m $v: no result" >&2; continue; fi
             echo "$v $m $r" >> "$raw"
@@ -83,7 +85,7 @@ done
 echo
 echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //'), $(nproc) logical cores"
 if [ "$mode" = gpu ] && command -v nvidia-smi >/dev/null; then echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"; fi
-echo "$mode backend, prompt $P tokens, $N generated, greedy, median of $REPS runs (min-max)$([ "$mode" = cpu ] && echo ", $T threads")"
+echo "$mode backend, prompt $P tokens, $N generated, greedy, median of $REPS runs (min-max), speculation $([ "$SPEC" = 0 ] && echo off || echo "on ($SPEC draft tokens)")$([ "$mode" = cpu ] && echo ", $T threads")"
 echo
 python3 -I - "$raw" "${VARS[*]}" "${MODELS[*]}" <<'EOF'
 import sys, statistics as st
