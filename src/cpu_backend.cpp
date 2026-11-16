@@ -2,11 +2,12 @@
 //
 // Weights: Q4 (asymmetric 4-bit, group 64) or Q8; activations are quantized on the fly to int8 with one
 // scale per 64 values, so the inner loop is u8 x s8 VPDPBUSD (4-bit weight nibbles are unsigned 0..15).
-// Without AVX-512 VNNI the same dot product is built from VPMADDUBSW + VPMADDWD.
+// Without AVX-512 VNNI the same dot product is built from VPMADDUBSW + VPMADDWD, and without AVX2/FMA/F16C the
+// kernels are plain scalar C++ (slow, but runs on any x86-64 CPU and gives the same int8 quantization).
 //
 // The instruction set is chosen at compile time from the -march flags (the default is -march=native), so a
-// binary runs only on CPUs that have what it was built for. To get the AVX2 path on an AVX-512 machine, add
-// -mno-avx512f to OPT, e.g. `make OPT="-O3 -march=native -mno-avx512f"`.
+// binary runs only on CPUs that have what it was built for. To get a lower path on a newer machine, lower
+// -march, e.g. `make OPT="-O3 -march=haswell"` (AVX2) or `make OPT="-O3 -march=x86-64"` (scalar).
 #include "backend.h"
 #include "threadpool.h"
 #include "quant.h"
@@ -14,12 +15,16 @@
 #include <algorithm>
 #include <memory>
 
+// TACH_AVX512: AVX-512 VNNI kernels. TACH_AVX2: AVX2 kernels (also set when TACH_AVX512 is). Neither: portable scalar C++.
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
 #define TACH_AVX512 1
+#define TACH_AVX2 1
 #elif defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 #define TACH_AVX512 0
+#define TACH_AVX2 1
 #else
-#error "CPU backend needs AVX2, FMA and F16C (Haswell / Zen 1 or newer); it uses AVX-512 VNNI when available. Build with -march=native."
+#define TACH_AVX512 0
+#define TACH_AVX2 0
 #endif
 
 namespace {
@@ -55,6 +60,8 @@ struct QAct {
     }
 };
 
+#if TACH_AVX2
+
 inline float hsum(__m256 v) {
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
@@ -71,6 +78,8 @@ inline __m256i dot_u8s8(__m256i u, __m256i s) {
     return _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1));
 #endif
 }
+
+#endif  // TACH_AVX2
 
 #if TACH_AVX512
 
@@ -129,7 +138,7 @@ inline void dot_q4(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, 
     for (int t = 0; t < T; t++) out[t] = hsum(acc[t]) + macc[t];
 }
 
-#else  // AVX2
+#elif TACH_AVX2
 
 // quantize one row of K floats to int8 blocks of 64 (bit-identical to the AVX-512 version)
 void quantize_act_row(const float* x, int K, int8_t* q, float* d, float* s) {
@@ -204,7 +213,56 @@ inline void dot_q4(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, 
     for (int t = 0; t < T; t++) out[t] = hsum(acc[t]) + macc[t];
 }
 
+#else  // scalar
+
+// quantize one row of K floats to int8 blocks of 64 (bit-identical to the SIMD versions)
+void quantize_act_row(const float* x, int K, int8_t* q, float* d, float* s) {
+    for (int g = 0; g < K / CPU_ABLK; g++) {
+        const float* xp = x + g * CPU_ABLK;
+        float amax = 0;
+        for (int i = 0; i < CPU_ABLK; i++) amax = std::max(amax, fabsf(xp[i]));
+        const float dd = amax / 127.f;
+        const float inv = amax > 0 ? 127.f / amax : 0.f;
+        int isum = 0;
+        for (int i = 0; i < CPU_ABLK; i++) {
+            const int v = (int)lrintf(xp[i] * inv);  // round to nearest even, like CVTPS2DQ
+            isum += v;
+            q[g * CPU_ABLK + i] = (int8_t)std::clamp(v, -128, 127);
+        }
+        d[g] = dd;
+        s[g] = dd * isum;
+    }
+}
+
+// ---- Q4 x int8 dot products for T tokens against one weight row ----
+template <int T>
+inline void dot_q4(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, int m0, float* out) {
+    const int G = K / 64;
+    float acc[T], macc[T];
+    for (int t = 0; t < T; t++) { acc[t] = 0; macc[t] = 0; }
+    for (int g = 0; g < G; g++) {
+        const float sw = h2f(ws[2 * g]), mw = h2f(ws[2 * g + 1]);
+        const uint8_t* wp = wq + g * 32;
+        for (int t = 0; t < T; t++) {
+            const int m = m0 + t;
+            const int8_t* xp = a.q + (size_t)m * K + g * 64;
+            int is = 0;
+            // two 32-element blocks; in each, byte j holds element j (low nibble) and j + 16 (high nibble)
+            for (int b = 0; b < 2; b++)
+                for (int j = 0; j < 16; j++) {
+                    const int byte = wp[b * 16 + j];
+                    is += (byte & 15) * xp[b * 32 + j] + (byte >> 4) * xp[b * 32 + 16 + j];
+                }
+            acc[t] += (float)is * (sw * a.d[(size_t)m * G + g]);
+            macc[t] += mw * a.s[(size_t)m * G + g];
+        }
+    }
+    for (int t = 0; t < T; t++) out[t] = acc[t] + macc[t];
+}
+
 #endif
+
+#if TACH_AVX2
 
 template <int T>
 inline void dot_q8(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, int m0, float* out) {
@@ -225,6 +283,29 @@ inline void dot_q8(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, 
     }
     for (int t = 0; t < T; t++) out[t] = hsum(acc[t]);
 }
+
+#else  // scalar
+
+template <int T>
+inline void dot_q8(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, int m0, float* out) {
+    const int G = K / 32, GA = K / 64;
+    float acc[T];
+    for (int t = 0; t < T; t++) acc[t] = 0;
+    for (int g = 0; g < G; g++) {
+        const int8_t* wp = (const int8_t*)wq + g * 32;
+        const float sw = h2f(ws[g]);
+        for (int t = 0; t < T; t++) {
+            const int m = m0 + t;
+            const int8_t* xp = a.q + (size_t)m * K + g * 32;
+            int is = 0;
+            for (int j = 0; j < 32; j++) is += wp[j] * xp[j];
+            acc[t] += (float)is * (sw * a.d[(size_t)m * GA + g / 2]);
+        }
+    }
+    for (int t = 0; t < T; t++) out[t] = acc[t];
+}
+
+#endif
 
 #if TACH_AVX512
 
@@ -256,7 +337,7 @@ inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
     for (; i < n; i++) out[i] += scale * h2f(v[i]);
 }
 
-#else  // AVX2
+#elif TACH_AVX2
 
 inline float dot_f16(const uint16_t* w, const float* x, int K) {
     __m256 acc = _mm256_setzero_ps();
@@ -284,6 +365,33 @@ inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
         _mm256_storeu_ps(out + i, _mm256_fmadd_ps(p, value, _mm256_loadu_ps(out + i)));
     }
     for (; i < n; i++) out[i] += scale * h2f(v[i]);
+}
+
+#else  // scalar
+
+// four independent accumulators: the compiler won't reassociate a float sum, and this keeps the adds pipelined
+inline float dot_f16(const uint16_t* w, const float* x, int K) {
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int i = 0;
+    for (; i + 4 <= K; i += 4) {
+        s0 += h2f(w[i]) * x[i]; s1 += h2f(w[i + 1]) * x[i + 1];
+        s2 += h2f(w[i + 2]) * x[i + 2]; s3 += h2f(w[i + 3]) * x[i + 3];
+    }
+    float sum = (s0 + s1) + (s2 + s3);
+    for (; i < K; i++) sum += h2f(w[i]) * x[i];
+    return sum;
+}
+inline float dot_f32(const float* w, const float* x, int K) {
+    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int i = 0;
+    for (; i + 4 <= K; i += 4) { s0 += w[i] * x[i]; s1 += w[i + 1] * x[i + 1]; s2 += w[i + 2] * x[i + 2]; s3 += w[i + 3] * x[i + 3]; }
+    float sum = (s0 + s1) + (s2 + s3);
+    for (; i < K; i++) sum += w[i] * x[i];
+    return sum;
+}
+
+inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
+    for (int i = 0; i < n; i++) out[i] += scale * h2f(v[i]);
 }
 
 #endif

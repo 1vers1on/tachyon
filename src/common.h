@@ -219,8 +219,44 @@ inline double now_sec() {
 }
 
 // ---- half / bfloat16 helpers (host) ----
+#ifdef __F16C__
 inline float h2f(uint16_t h) { return _cvtsh_ss(h); }
 inline uint16_t f2h(float f) { return _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT); }
+#else
+// Software fallback for CPUs / builds without F16C. Matches the instructions: round to nearest even, signalling NaNs quieted.
+inline float h2f(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    const uint32_t e = (h >> 10) & 0x1f;
+    uint32_t m = h & 0x3ff, u;
+    if (e == 0x1f) u = sign | 0x7f800000 | (m ? 0x400000 | (m << 13) : 0);   // inf / NaN
+    else if (e) u = sign | ((e + 112) << 23) | (m << 13);                       // normal
+    else if (!m) u = sign;                                                       // zero
+    else {                                                                       // subnormal: normalize
+        int s = 0;
+        while (!(m & 0x400)) { m <<= 1; s++; }
+        u = sign | ((uint32_t)(113 - s) << 23) | ((m & 0x3ff) << 13);
+    }
+    float f; memcpy(&f, &u, 4); return f;
+}
+inline uint16_t f2h(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000, a = u & 0x7fffffff;
+    if (a >= 0x7f800000) return sign | 0x7c00 | (a > 0x7f800000 ? 0x200 | ((a >> 13) & 0x3ff) : 0);  // inf / NaN
+    if (a >= 0x477ff000) return sign | 0x7c00;                                  // >= 65520 rounds to inf
+    if (a <= 0x33000000) return sign;                                           // <= 2^-25 rounds to zero
+    if (a < 0x38800000) {                                                       // half subnormal
+        const uint32_t m = (a & 0x7fffff) | 0x800000, shift = 126 - (a >> 23);
+        uint32_t r = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (r & 1))) r++;
+        return sign | r;
+    }
+    uint32_t h = (a - (112u << 23)) >> 13;                                      // normal
+    const uint32_t rem = a & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) h++;
+    return sign | h;
+}
+#endif
 inline float bf2f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
 
 inline std::string read_file(const std::string& path) {
