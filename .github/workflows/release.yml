@@ -61,7 +61,7 @@ jobs:
         run: |
           tar -xzf dist/tachyon-linux-x86_64.tar.gz -C dist
           docker run --rm -v "$PWD/dist:/release:ro" "$DISTRO" sh -ec '
-            cd /release/tachyon-*
+            cd /release/tachyon-*/
             bin/tachyon --version
             TACHYON_CPU=scalar bin/tachyon selftest
             bin/tachyon catalog
