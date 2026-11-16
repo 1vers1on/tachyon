@@ -155,6 +155,16 @@ On the CPU backend alone (8 threads), Qwen3-1.7B Q4 decodes at about 52 tok/s.
 With vectorized CPU attention, Qwen3-0.6B Q4 measures about 324 tok/s prefill and 75 tok/s decode
 after a 2048-token prompt (8 threads, 64 generated tokens, speculation off; two runs).
 
+### RTX 5090
+
+Measured with `tools/bench.sh gpu` on an RTX 5090: a 2048-token prompt, 128 generated tokens, greedy decoding with
+speculation off, median of 3 runs (min-max). Decode is single-stream.
+
+| Model | Prefill tok/s | Decode tok/s |
+|---|---|---|
+| Qwen3-0.6B Q4 | 73920 (73888-74238) | 923 (923-924) |
+| Qwen3-8B Q4 | 9256 (9255-9258) | 228 (228-228) |
+
 ### CPU kernel sets
 
 The CPU backend has AVX-512, AVX2 and scalar kernels (see [Requirements](#requirements)). Median of 5 interleaved
