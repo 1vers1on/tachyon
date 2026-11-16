@@ -27,14 +27,14 @@ jobs:
       - name: Build and run offline tests
         run: |
           source /opt/rh/gcc-toolset-12/enable
-          make -j2 BUILD=build/release/obj-scalar CPU=scalar LDFLAGS='-static-libstdc++ -static-libgcc' test
+          make -j"$(nproc)" BUILD=build/release/obj-scalar CPU=scalar LDFLAGS='-static-libstdc++ -static-libgcc' test
           python3 tests/install_test.py
       - name: Package all CPU variants and CUDA runtime compiler
         run: |
           source /opt/rh/gcc-toolset-12/enable
           # The devel container omits the toolkit's EULA.txt; retain the official versioned notice.
           curl -fsSL --retry 3 https://docs.nvidia.com/cuda/archive/12.6.3/eula/index.html -o build/CUDA-EULA.html
-          CUDA_EULA=build/CUDA-EULA.html JOBS=2 tools/package.sh
+          CUDA_EULA=build/CUDA-EULA.html tools/package.sh
           floor=$(cat build/release/tachyon-*/GLIBC_MIN)
           test "$(printf '%s\n' "$floor" 2.28 | sort -V | tail -1)" = 2.28
       - uses: actions/upload-artifact@v4

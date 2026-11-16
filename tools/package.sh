@@ -12,6 +12,11 @@ source_version=$(sed -n 's/^#define TACH_VERSION "\(.*\)"/\1/p' src/common.h)
 cuda=${CUDA:-/usr/local/cuda}
 cxx=${CXX:-g++}
 jobs=${JOBS:-$(nproc)}
+# Validate metadata/notice inputs before spending time compiling. Actions containers can run as a
+# different UID from the host-owned checkout; trust only this explicitly selected working directory.
+revision=$(git -c safe.directory="$PWD" rev-parse HEAD)
+license=${CUDA_EULA:-"$cuda/EULA.txt"}
+[[ -f $license ]] || { echo 'CUDA license notice missing; set CUDA_EULA to the matching toolkit EULA file' >&2; exit 1; }
 work="$PWD/build/release"
 name="tachyon-${version}-linux-x86_64"
 stage="$work/$name"
@@ -54,13 +59,11 @@ for pattern in 'libnvrtc.so*' 'libnvrtc-builtins.so*'; do
 done
 # Keep the complete header tree so transitive CUDA includes match the bundled NVRTC version.
 cp -LR "$cuda/include" "$stage/cuda/include"
-license=${CUDA_EULA:-"$cuda/EULA.txt"}
-[[ -f $license ]] || { echo 'CUDA license notice missing; set CUDA_EULA to the matching toolkit EULA file' >&2; exit 1; }
 cp "$license" "$stage/share/licenses/CUDA-EULA.${license##*.}"
 cp LICENSE.txt "$stage/share/licenses/Tachyon-MIT.txt"
 cp README.md "$stage/README.md"
 printf '%s\n' "$version" > "$stage/VERSION"
-git rev-parse HEAD > "$stage/COMMIT"
+printf '%s\n' "$revision" > "$stage/COMMIT"
 
 # Record the actual glibc floor of this build, including bundled CUDA libraries.
 floor=$(find "$stage/bin" "$stage/libexec" "$stage/cuda/lib64" -type f -exec objdump -T {} + |
