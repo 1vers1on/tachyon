@@ -155,6 +155,29 @@ On the CPU backend alone (8 threads), Qwen3-1.7B Q4 decodes at about 52 tok/s.
 With vectorized CPU attention, Qwen3-0.6B Q4 measures about 324 tok/s prefill and 75 tok/s decode
 after a 2048-token prompt (8 threads, 64 generated tokens, speculation off; two runs).
 
+### CPU kernel sets
+
+The CPU backend has AVX-512, AVX2 and scalar kernels (see [Requirements](#requirements)). Median of 5 interleaved
+runs on the Ryzen 7 7700X (Zen 4) above, with `--device cpu -t 8`, a 512-token prompt, 128 generated tokens and
+greedy decoding. Each set is built from the same source with a different `-march`: native, `haswell` and `x86-64`.
+
+| Model | Kernels | Prefill tok/s | Decode tok/s |
+|---|---|---|---|
+| Qwen3-0.6B Q4 | AVX-512 | 425 | 115 |
+| | AVX2 | 432 | 117 |
+| | scalar | 51 | 23 |
+| Qwen3-0.6B Q8 | AVX-512 | 383 | 67 |
+| | AVX2 | 380 | 68 |
+| | scalar | 83 | 32 |
+| Qwen3-1.7B Q4 | AVX-512 | 170 | 46 |
+| | AVX2 | 175 | 47 |
+| | scalar | 23 | 11 |
+
+AVX-512 and AVX2 are within 3% of each other here, which is inside the run-to-run spread (about 10%), so this
+machine doesn't separate them. Zen 4 executes AVX-512 on 256-bit datapaths, so a CPU with full-width 512-bit
+units may behave differently; that has not been measured. The scalar kernels are 4 to 8x slower on Q4 and 2 to 5x
+slower on Q8, so use them only on CPUs that lack AVX2.
+
 To measure on your own hardware, run `./tachyon bench -m model.tach`.
 
 ## Command reference
