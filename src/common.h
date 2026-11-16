@@ -39,6 +39,11 @@ struct LogState {
     bool json = false;
     int tty = -1;   // stderr is a terminal (resolved on first use)
     bool color = false;
+    // in-place progress line (see log_progress)
+    bool progress_on = false;      // a progress line is drawn on the terminal right now
+    std::string progress_text;     // ... this one, without a newline
+    int progress_step = -1;        // last 10% step that was logged for the current task
+    double progress_t = 0;         // when the last line was logged, for tasks of unknown size
 };
 inline LogState& log_state() { static LogState s; return s; }
 inline thread_local uint64_t g_log_req = 0;   // id of the request this thread is working on (0 = none)
@@ -89,8 +94,8 @@ inline std::string log_json_escape(const std::string& s) {
     return o;
 }
 
-// Writes one finished message (no trailing newline needed) at the given level.
-inline void log_emit(LogLevel lvl, const std::string& msg_in) {
+// Formats one message as a log line (with its newline): `line` is for stderr, `fline` for the log file. Needs st.mu held.
+inline void log_format(LogState& st, LogLevel lvl, const std::string& msg_in, std::string& line, std::string& fline) {
     static const char* const kTag[] = {"ERROR", "WARN ", "INFO ", "DEBUG"};
     static const char* const kName[] = {"error", "warn", "info", "debug"};
     static const char* const kColor[] = {"\033[1;31m", "\033[33m", "\033[32m", "\033[2m"};
@@ -100,12 +105,9 @@ inline void log_emit(LogLevel lvl, const std::string& msg_in) {
     clock_gettime(CLOCK_REALTIME, &ts);
     tm t;
     int ms = (int)(ts.tv_nsec / 1000000);
-    LogState& st = log_state();
-    std::lock_guard<std::mutex> lk(st.mu);
     if (st.tty < 0) { st.tty = isatty(2) ? 1 : 0; st.color = st.tty && !getenv("NO_COLOR"); }
     char tbuf[48], req[32] = "";
     if (g_log_req) snprintf(req, sizeof req, "req=%llu", (unsigned long long)g_log_req);
-    std::string line, fline;
     if (st.json) {
         gmtime_r(&ts.tv_sec, &t);
         snprintf(tbuf, sizeof tbuf, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, ms);
@@ -124,8 +126,22 @@ inline void log_emit(LogLevel lvl, const std::string& msg_in) {
         else line = std::string(st.tty ? tbuf : full) + " " + kTag[lvl] + " " + (st.tty ? "" : "[" + std::to_string((int)getpid()) + "] ") + tail;
         fline = std::string(full) + " " + kTag[lvl] + " [" + std::to_string((int)getpid()) + "] " + tail;
     }
+}
+
+// Needs st.mu held. While a progress line is on screen it is lifted off for the message and redrawn below it.
+inline void log_emit_locked(LogState& st, LogLevel lvl, const std::string& msg) {
+    std::string line, fline;
+    log_format(st, lvl, msg, line, fline);
+    if (st.progress_on) line = "\r\033[K" + line + st.progress_text;
     log_write_fd(2, line);
     if (st.file_fd >= 0) log_write_fd(st.file_fd, fline);
+}
+
+// Writes one finished message (no trailing newline needed) at the given level.
+inline void log_emit(LogLevel lvl, const std::string& msg) {
+    LogState& st = log_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    log_emit_locked(st, lvl, msg);
 }
 
 inline std::string log_vformat(const char* fmt, va_list ap) {
@@ -216,6 +232,41 @@ inline bool log_arg(const std::string& a, const std::function<std::string()>& ne
 inline double now_sec() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Progress of a long task (a download, a conversion): `msg` says what and how far, `frac` is the fraction done (0..1, or
+// negative when the size is unknown). On a terminal it is one line redrawn in place, in the usual log line format, that
+// stays at the bottom while other lines are logged above it. Anywhere else (stderr redirected, JSON format) it is logged as
+// ordinary info lines, one per 10% (one per 5 seconds when the size is unknown), so logs do not fill up with \r updates.
+// The log file gets those same sparse lines. Call log_progress_end() when the task is over. Shown at info level and above.
+inline void log_progress(const std::string& msg, double frac) {
+    if (!log_enabled(LOG_INFO)) return;
+    LogState& st = log_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    const double now = now_sec();
+    const int step = frac < 0 ? -1 : std::min(10, (int)(frac * 10));
+    const bool due = frac < 0 ? (st.progress_t == 0 || now - st.progress_t >= 5) : step > st.progress_step;
+    std::string line, fline;
+    log_format(st, LOG_INFO, msg, line, fline);   // also resolves st.tty
+    if (st.tty == 1 && !st.json) {
+        line.pop_back();   // no newline: the line is redrawn in place
+        st.progress_text = line;
+        log_write_fd(2, "\r\033[K" + line);
+        st.progress_on = true;
+        if (due && st.file_fd >= 0) log_write_fd(st.file_fd, fline);
+    } else if (due) {
+        log_emit_locked(st, LOG_INFO, msg);
+    }
+    if (due) { if (frac >= 0) st.progress_step = step; st.progress_t = now; }
+}
+inline void log_progress_end() {
+    LogState& st = log_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    if (st.progress_on) log_write_fd(2, "\r\033[K");
+    st.progress_on = false;
+    st.progress_text.clear();
+    st.progress_step = -1;
+    st.progress_t = 0;
 }
 
 // ---- half / bfloat16 helpers (host) ----

@@ -303,6 +303,7 @@ int main(int argc, char** argv) {
         g_imatrix = &im;  // must be set before the first forward
         auto ids = e.tok.encode(a.prompt, false);
         int win = 512, nwin = 0;
+        const int nwin_total = (int)std::min<size_t>((size_t)std::max(a.n, 0), ids.size() / win);
         double t0 = now_sec();
         for (size_t st = 0; st + win <= ids.size() && nwin < a.n; st += win, nwin++) {
             for (int c = 0; c < win; c += 128) {
@@ -310,12 +311,14 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 128; i++) b[i] = {ids[st + c + i], 0, c + i, i == 127};
                 e.be->forward(b);
             }
-            fprintf(stderr, "\r[tachyon] imatrix window %d", nwin + 1);
+            log_progress("collecting activation statistics: window " + std::to_string(nwin + 1) + "/" + std::to_string(nwin_total),
+                         (double)(nwin + 1) / nwin_total);
         }
+        log_progress_end();
         e.be->imat_flush();
         std::string out = a.out.empty() ? "imatrix.bin" : a.out;
         im.save(out);
-        fprintf(stderr, "\n[tachyon] wrote %s (%d windows of %d tokens, %.1fs)\n", out.c_str(), nwin, win, now_sec() - t0);
+        logi("wrote %s (%d windows of %d tokens, %.1fs)", out.c_str(), nwin, win, now_sec() - t0);
         return 0;
     }
     if (cmd == "ppl") {

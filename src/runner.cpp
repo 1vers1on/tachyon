@@ -393,10 +393,10 @@ bool hf_list(const std::string& repo, std::vector<HfFile>& files, std::string& c
 // one file to dst + ".part" (resumed when present), with retries; renamed to dst when complete
 bool hf_fetch(const std::string& url, const std::string& dst, size_t expect, std::string& err) {
     const std::string part = dst + ".part";
-    const bool tty = isatty(2);
+    const std::string label = dst.substr(dst.rfind('/') + 1);   // file name for messages (the whole of dst if it has no directory)
     bool ok = false;
     for (int attempt = 0; attempt < 6 && !ok; attempt++) {
-        if (attempt) { fprintf(stderr, "retrying (%s)\n", err.c_str()); sleep(2 * attempt); }
+        if (attempt) { logw("retrying %s (%s)", label.c_str(), err.c_str()); sleep(2 * attempt); }
         HttpGetOptions o = hf_opts();
         o.range_from = (int64_t)file_size(part);
         if (expect && (size_t)o.range_from == expect) { ok = true; break; }   // complete from an earlier run
@@ -407,11 +407,13 @@ bool hf_fetch(const std::string& url, const std::string& dst, size_t expect, std
         double t0 = now_sec(), last = 0;
         auto progress = [&](bool final) {
             double t = now_sec();
-            if (!tty || !f || (!final && t - last < 0.25)) return;
+            if (!f || (!final && t - last < 0.25)) return;
             double rate = (have - start) / std::max(t - t0, 1e-3);
-            if (expect) fprintf(stderr, "\r  %5.1f%%  %s / %s  %s/s   ", 100.0 * have / expect, human((double)have).c_str(), human((double)expect).c_str(), human(rate).c_str());
-            else fprintf(stderr, "\r  %s  %s/s   ", human((double)have).c_str(), human(rate).c_str());
-            if (final) fprintf(stderr, "\n");
+            char m[256];
+            if (expect) snprintf(m, sizeof m, "downloading %s: %.1f%%  %s / %s  %s/s", label.c_str(), 100.0 * have / expect, human((double)have).c_str(), human((double)expect).c_str(), human(rate).c_str());
+            else snprintf(m, sizeof m, "downloading %s: %s  %s/s", label.c_str(), human((double)have).c_str(), human(rate).c_str());
+            log_progress(m, expect ? (double)have / expect : -1.0);
+            if (final) log_progress_end();
             last = t;
         };
         HttpGetResult r = http_get(url, o, [&](const char* p, size_t n) {
@@ -451,14 +453,14 @@ bool hf_download(const std::string& repo, const std::vector<HfFile>& files, cons
         const HfFile& f = files[i];
         std::string dst = dir + "/" + f.path;
         if (is_file(dst) && (f.size == 0 || file_size(dst) == f.size)) continue;
-        fprintf(stderr, "pulling %s (%zu/%zu, %s)\n", f.path.c_str(), i + 1, files.size(), human((double)f.size).c_str());
+        logi("pulling %s (%zu/%zu, %s)", f.path.c_str(), i + 1, files.size(), human((double)f.size).c_str());
         std::string e;
         if (!hf_fetch("https://huggingface.co/" + repo + "/resolve/main/" + f.path, dst, f.size, e)) {
             err = "download of " + f.path + " failed: " + e;
             return false;
         }
     }
-    fprintf(stderr, "downloaded %s\n", human((double)total).c_str());
+    logi("downloaded %s", human((double)total).c_str());
     return true;
 }
 
@@ -470,7 +472,7 @@ struct PullLock {
         fd = open((models_dir() + "/." + slug(name) + ".lock").c_str(), O_RDWR | O_CREAT, 0644);
         if (fd < 0) return;
         if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-            fprintf(stderr, "waiting for another pull of %s...\n", name.c_str());
+            logi("waiting for another pull of %s...", name.c_str());
             flock(fd, LOCK_EX);
         }
     }
@@ -480,20 +482,20 @@ struct PullLock {
 int do_pull(const std::string& ref_str, bool keep_download, const std::string& device) {
     ModelRef ref = parse_ref(ref_str);
     if (!ref.known) {
-        fprintf(stderr, "unknown model '%s'. Use a name from `tachyon catalog`, a Hugging Face repo (org/name or hf.co/org/name),\n"
-                        "or `tachyon import <file.tach|hf_dir> <name>`.\n", ref_str.c_str());
+        loge("unknown model '%s': use a name from `tachyon catalog`, a Hugging Face repo (org/name or hf.co/org/name), "
+             "or `tachyon import <file.tach|hf_dir> <name>`", ref_str.c_str());
         return 1;
     }
     PullLock lock(ref.name);
     LocalModel lm;
-    if (find_local(ref.name, lm)) { fprintf(stderr, "%s is up to date (%s)\n", ref.name.c_str(), lm.path.c_str()); return 0; }
+    if (find_local(ref.name, lm)) { logi("%s is up to date (%s)", ref.name.c_str(), lm.path.c_str()); return 0; }
     std::string hf_dir = hf_cache_dir(ref.repo), canonical = ref.repo, dl_dir;
-    if (!hf_dir.empty()) fprintf(stderr, "using Hugging Face cache %s\n", hf_dir.c_str());
+    if (!hf_dir.empty()) logi("using Hugging Face cache %s", hf_dir.c_str());
     else {
         std::vector<HfFile> files;
         std::string err;
-        fprintf(stderr, "pulling manifest for %s\n", ref.repo.c_str());
-        if (!hf_list(ref.repo, files, canonical, err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+        logi("pulling manifest for %s", ref.repo.c_str());
+        if (!hf_list(ref.repo, files, canonical, err)) { loge("%s", err.c_str()); return 1; }
         hf_dir = hf_cache_dir(canonical);
         if (hf_dir.empty()) {
             size_t total = 0;
@@ -505,17 +507,17 @@ int do_pull(const std::string& ref_str, bool keep_download, const std::string& d
                 double free_b = (double)vs.f_bavail * vs.f_frsize;
                 double need = total * (ref.quant == "q8" ? 1.6 : 1.4) + (1ull << 30);   // checkpoint + temporary Q8 + output
                 if (free_b < need)
-                    fprintf(stderr, "warning: %s free in %s, about %s needed (set TACHYON_HOME to a bigger disk)\n", human(free_b).c_str(),
-                            home_dir().c_str(), human(need).c_str());
+                    logw("%s free in %s, about %s needed (set TACHYON_HOME to a bigger disk)", human(free_b).c_str(),
+                         home_dir().c_str(), human(need).c_str());
             }
-            if (!hf_download(canonical, files, dl_dir, err)) { fprintf(stderr, "error: %s (rerun to resume)\n", err.c_str()); return 1; }
+            if (!hf_download(canonical, files, dl_dir, err)) { loge("%s (rerun to resume)", err.c_str()); return 1; }
             hf_dir = dl_dir;
         }
     }
     mkdirs(models_dir());
     const std::string out = models_dir() + "/" + slug(ref.name) + ".tach";
-    fprintf(stderr, "converting %s -> %s (%s%s)\n", canonical.c_str(), out.c_str(), ref.quant.c_str(),
-            ref.quant == "q8" ? "" : " + importance matrix");
+    logi("converting %s -> %s (%s%s)", canonical.c_str(), out.c_str(), ref.quant.c_str(),
+         ref.quant == "q8" ? "" : " + importance matrix");
     const double t0 = now_sec();
     int rc;
     if (ref.quant == "q8") {
@@ -527,10 +529,10 @@ int do_pull(const std::string& ref_str, bool keep_download, const std::string& d
         rc = convert_calibrated(hf_dir, out, {"-q", ref.quant}, kCalibText, device, 40);
         remove((out + ".imatrix").c_str());
     }
-    if (rc != 0 || !is_file(out)) { fprintf(stderr, "error: conversion failed\n"); return 1; }
+    if (rc != 0 || !is_file(out)) { loge("conversion failed"); return 1; }
     write_manifest(ref.name, out, canonical, ref.quant);
     if (!dl_dir.empty() && !keep_download) remove_tree(dl_dir);
-    fprintf(stderr, "success: %s (%s) ready in %.0fs\n", ref.name.c_str(), human((double)file_size(out)).c_str(), now_sec() - t0);
+    logi("%s (%s) ready in %.0fs", ref.name.c_str(), human((double)file_size(out)).c_str(), now_sec() - t0);
     return 0;
 }
 
@@ -1052,7 +1054,7 @@ bool manager_up(const Endpoint& ep, bool* is_manager = nullptr) {
 bool ensure_manager(const Endpoint& ep) {
     bool mgr = false;
     if (manager_up(ep, &mgr)) {
-        if (!mgr) { fprintf(stderr, "error: %s:%d is a single-model `tachyon serve -m`; stop it or set TACHYON_HOST\n", ep.host.c_str(), ep.port); return false; }
+        if (!mgr) { loge("%s:%d is a single-model `tachyon serve -m`; stop it or set TACHYON_HOST", ep.host.c_str(), ep.port); return false; }
         return true;
     }
     mkdirs(home_dir() + "/logs");
@@ -1075,7 +1077,7 @@ bool ensure_manager(const Endpoint& ep) {
         if (manager_up(ep)) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    fprintf(stderr, "error: could not start the tachyon server (log: %s)\n", log.c_str());
+    loge("could not start the tachyon server (log: %s)", log.c_str());
     return false;
 }
 
@@ -1155,13 +1157,13 @@ bool chat_turn(const Endpoint& ep, const ChatOpts& o, Json& history) {
     if (in_reasoning && tty) printf("\033[0m");
     printf("\n");
     fflush(stdout);
-    if (st < 0) { fprintf(stderr, "error: %s\n", err.c_str()); return false; }
+    if (st < 0) { loge("%s", err.c_str()); return false; }
     if (st != 200) {
         Json j = Json::parse(raw);
-        fprintf(stderr, "error: %s\n", j["error"].get_str("message", raw).c_str());
+        loge("%s", j["error"].get_str("message", raw).c_str());
         return false;
     }
-    if (!err_msg.empty()) { fprintf(stderr, "error: %s\n", err_msg.c_str()); return false; }
+    if (!err_msg.empty()) { loge("%s", err_msg.c_str()); return false; }
     if (o.verbose && usage.is_obj())
         fprintf(stderr, "%s[%lld prompt tokens (%lld cached) | %lld generated | prompt %.0f tok/s | generation %.1f tok/s]%s\n", isatty(2) ? "\033[36m" : "",
                 (long long)usage.get_int("prompt_tokens", 0), (long long)usage["prompt_tokens_details"].get_int("cached_tokens", 0),
@@ -1358,7 +1360,7 @@ int runner_main(const std::string& cmd, int argc, char** argv) {
         int rc = 0;
         for (int i = 0; i < argc; i++) {
             LocalModel m;
-            if (!find_local(argv[i], m) || m.manifest.empty()) { fprintf(stderr, "error: model '%s' not found\n", argv[i]); rc = 1; continue; }
+            if (!find_local(argv[i], m) || m.manifest.empty()) { loge("model '%s' not found", argv[i]); rc = 1; continue; }
             if (manager_up(ep)) {   // unload first
                 Json b = Json::object(); b.set("model", m.name);
                 http_call(ep.host, ep.port, "POST", "/api/stop", b.dump(), nullptr, nullptr, 10);
@@ -1371,7 +1373,7 @@ int runner_main(const std::string& cmd, int argc, char** argv) {
     if (cmd == "ps") {
         std::string body;
         if (http_call(ep.host, ep.port, "GET", "/api/ps", "", [&](const std::string& d) { body += d; return true; }, nullptr, 5) != 200) {
-            fprintf(stderr, "tachyon server is not running (start: tachyon serve)\n");
+            loge("tachyon server is not running (start: tachyon serve)");
             return 1;
         }
         std::vector<std::vector<std::string>> rows = {{"NAME", "SIZE", "STATUS", "PID", "UNTIL"}};
@@ -1389,7 +1391,7 @@ int runner_main(const std::string& cmd, int argc, char** argv) {
         b.set("model", argv[0]);
         std::string body;
         int st = http_call(ep.host, ep.port, "POST", "/api/stop", b.dump(), [&](const std::string& d) { body += d; return true; }, nullptr, 30);
-        if (st != 200) { fprintf(stderr, "error: %s\n", st < 0 ? "tachyon server is not running" : Json::parse(body)["error"].get_str("message", body).c_str()); return 1; }
+        if (st != 200) { loge("%s", st < 0 ? "tachyon server is not running" : Json::parse(body)["error"].get_str("message", body).c_str()); return 1; }
         return 0;
     }
     if (cmd == "show") {

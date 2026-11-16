@@ -695,7 +695,7 @@ int convert_main(int argc, char** argv) {
             write_matrix(o_ + "ple_out", o.wtype, H, c.ple_dim, simple(need(p + "per_layer_projection.weight")));
             write_vec(o_ + "ple_post_norm", need(p + "post_per_layer_input_norm.weight"));
         }
-        if (g_log_level >= 1) { fprintf(stderr, "\r[tachyon] layer %d/%d", l + 1, c.n_layers); fflush(stderr); }
+        log_progress("converting layer " + std::to_string(l + 1) + "/" + std::to_string(c.n_layers), (double)(l + 1) / c.n_layers);
     }
     if (c.ple_dim) {
         const STTensor* pe = need(P + "embed_tokens_per_layer.weight");
@@ -703,7 +703,7 @@ int convert_main(int argc, char** argv) {
         write_matrix("ple_proj", o.wtype, (int64_t)c.n_layers * c.ple_dim, H, simple(need(P + "per_layer_model_projection.weight")));
         write_vec("ple_proj_norm", need(P + "per_layer_projection_norm.weight"));
     }
-    if (g_log_level >= 1) fprintf(stderr, "\n");
+    log_progress_end();
     Json header = Json::object();
     header.set("format", "tachyon");
     header.set("version", 1);
