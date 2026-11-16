@@ -54,7 +54,9 @@ for pattern in 'libnvrtc.so*' 'libnvrtc-builtins.so*'; do
 done
 # Keep the complete header tree so transitive CUDA includes match the bundled NVRTC version.
 cp -LR "$cuda/include" "$stage/cuda/include"
-cp "$cuda/EULA.txt" "$stage/share/licenses/CUDA-EULA.txt"
+license=${CUDA_EULA:-"$cuda/EULA.txt"}
+[[ -f $license ]] || { echo 'CUDA license notice missing; set CUDA_EULA to the matching toolkit EULA file' >&2; exit 1; }
+cp "$license" "$stage/share/licenses/CUDA-EULA.${license##*.}"
 cp LICENSE.txt "$stage/share/licenses/Tachyon-MIT.txt"
 cp README.md "$stage/README.md"
 printf '%s\n' "$version" > "$stage/VERSION"

@@ -63,7 +63,9 @@ gh release upload v1.0.0 dist/tachyon-linux-x86_64.tar.gz dist/tachyon-linux-x86
 
 Avoid replacing existing public assets: publish a new patch version so pinned installs stay reproducible.
 CUDA's redistributable components retain their license notices in `share/licenses/CUDA-EULA.txt` and
-the header files. Source builds do not need the bundled archive.
+the header files (`CUDA-EULA.html` in official CI builds). Minimal toolkit containers may omit `EULA.txt`;
+set `CUDA_EULA=/path/to/matching-license` to include an explicitly supplied notice. Source builds do not
+need the bundled archive.
 
 ## Local validation
 

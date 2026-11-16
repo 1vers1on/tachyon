@@ -21,7 +21,7 @@ jobs:
         shell: bash
     steps:
       - name: Install build tools
-        run: dnf install -y git gcc-toolset-12-gcc-c++ gcc-toolset-12-libstdc++-devel make python3.11 tar gzip binutils findutils
+        run: dnf install -y git gcc-toolset-12-gcc-c++ gcc-toolset-12-libstdc++-devel make python3.11 tar gzip binutils findutils curl
       - run: ln -sf /usr/bin/python3.11 /usr/local/bin/python3
       - uses: actions/checkout@v4
       - name: Build and run offline tests
@@ -32,8 +32,11 @@ jobs:
       - name: Package all CPU variants and CUDA runtime compiler
         run: |
           source /opt/rh/gcc-toolset-12/enable
-          JOBS=2 tools/package.sh
-          test "$(cat build/release/tachyon-*/GLIBC_MIN)" = 2.28
+          # The devel container omits the toolkit's EULA.txt; retain the official versioned notice.
+          curl -fsSL --retry 3 https://docs.nvidia.com/cuda/archive/12.6.3/eula/index.html -o build/CUDA-EULA.html
+          CUDA_EULA=build/CUDA-EULA.html JOBS=2 tools/package.sh
+          floor=$(cat build/release/tachyon-*/GLIBC_MIN)
+          test "$(printf '%s\n' "$floor" 2.28 | sort -V | tail -1)" = 2.28
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
