@@ -8,6 +8,10 @@ build requirements and known limitations.
 
 Release fixes:
 
+- Add a checksum-verified installer and relocatable Linux release archives with automatic CPU selection,
+  bundled NVRTC/headers, and a glibc 2.28 CI baseline across multiple distros.
+- Default source builds to baseline x86-64, offer explicit AVX2/AVX-512 targets, and replace GCC 15-only
+  resource embedding with generated initializers so GCC 11+ can build the project.
 - Reject invalid device names and invalid benchmark sizes; return a failure exit code when local generation fails.
 - Stop at the earliest matching stop string when a decoded token contains multiple matches.
 - Validate tokenizer blobs, token IDs, model graph dimensions, weight shapes and importance-matrix bounds before use.

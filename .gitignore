@@ -75,3 +75,6 @@ perf.data*
 
 # ---- agent handoff notes (local only) ----
 /TACHYON.md
+
+# ---- release archives ----
+/dist/

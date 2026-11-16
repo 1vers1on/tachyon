@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <vector>
+#include <unistd.h>
+#include <limits.h>
 
 #ifndef TACH_CUDA_DIR
 #define TACH_CUDA_DIR "/usr/local/cuda"
@@ -31,6 +33,15 @@ std::vector<std::string> cuda_dirs() {
     std::vector<std::string> d;
     for (const char* v : {"TACHYON_CUDA", "CUDA_PATH", "CUDA_HOME"})
         if (const char* e = getenv(v); e && *e) d.push_back(e);
+    // Release layout: libexec/tachyon-<isa> beside cuda/{lib64,include}.
+    // Resolve the running executable, including when invoked through an install symlink.
+    char executable[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (n > 0) {
+        executable[n] = 0;
+        std::string p = executable;
+        d.push_back(p.substr(0, p.rfind('/')) + "/../cuda");
+    }
     d.push_back(TACH_CUDA_DIR);
     d.push_back("/usr/local/cuda");
     return d;
@@ -41,14 +52,14 @@ void load(CudaApi& a) {
     void* cu = open_first({"libcuda.so.1", "libcuda.so", "/usr/lib/wsl/lib/libcuda.so.1"}, tried);
     if (!cu) { a.error = "NVIDIA driver library not found (tried " + tried + ")"; return; }
 
-    // libnvrtc: an explicit path, the dynamic loader's search path, then the toolkit lib directories
+    // Prefer explicit toolkit settings and the matching bundled headers/libraries before system NVRTC.
     std::vector<std::string> names;
     if (const char* e = getenv("TACHYON_NVRTC"); e && *e) names.push_back(e);
     static const char* sonames[] = {"libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11.2"};
-    for (auto s : sonames) names.push_back(s);
     for (auto& dir : cuda_dirs())
         for (const char* sub : {"/lib64/", "/lib/", "/targets/x86_64-linux/lib/"})
             for (auto s : sonames) names.push_back(dir + sub + s);
+    for (auto s : sonames) names.push_back(s);
     tried.clear();
     void* nv = open_first(names, tried);
     if (!nv) { a.error = "NVRTC library (libnvrtc.so, part of the CUDA toolkit) not found; set TACHYON_NVRTC or CUDA_PATH"; return; }

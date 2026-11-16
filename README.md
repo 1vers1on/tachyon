@@ -32,38 +32,63 @@ repository.
 - **No build-time CUDA compiler.** The kernels are compiled at runtime with NVRTC, with every model
   dimension baked in as a compile-time constant, and the result is cached.
 
+## Install
+
+On Linux x86-64 (including WSL2):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash
+```
+
+This downloads a prebuilt release, verifies its SHA-256 checksum, and installs `tachyon` and
+`tachyon-client` in `~/.local/bin`. No sudo, compiler, CUDA toolkit or AVX-512 CPU is needed.
+If that directory is outside your `PATH`, the installer prints the line to add to your shell profile.
+
+```bash
+# Pin a version, or choose an installation prefix (containing bin/ and lib/).
+curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --version 1.0.0
+curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --prefix "$HOME/apps/tachyon"
+```
+
+Run the same command to upgrade. Both commands switch to the new release together; previous releases
+stay in `~/.local/lib/tachyon` so processes already running can finish. To uninstall, remove the two
+symlinks in `~/.local/bin` and `~/.local/lib/tachyon`. Models in `~/.tachyon` are stored separately.
+
 ## Requirements
 
-- Linux x86-64 (native or WSL2).
-- To build: `g++` 15 or newer (the CUDA kernels and calibration text are embedded with `#embed`) and the CUDA
-  toolkit headers (`cuda.h`, `nvrtc.h`). Nothing is linked beyond the C/C++ runtime; `nvcc` is not used.
-- An x86-64 CPU. The CPU backend has three kernel sets, chosen at build time from the compiler's `-march` (the
-  Makefile default is `-march=native`), so a binary only runs on CPUs with the instructions it was built for:
-  - AVX-512 (F/BW/VL/VNNI, such as Zen 4 or Ice Lake and newer): the fastest VNNI kernels.
-  - AVX2 + FMA + F16C (Haswell / Zen 1 or newer): used when AVX-512 VNNI isn't available.
-  - Scalar C++: used when AVX2, FMA or F16C isn't available. It works on any x86-64 CPU but is much slower.
-
-  To build for a less capable CPU than the build machine, lower `-march`: `make OPT="-O3 -march=haswell"` gives
-  a binary that runs on any AVX2 CPU, and `make OPT="-O3 -march=x86-64"` one that runs on any x86-64 CPU.
-  The CPU backend is always compiled, so this applies even if you only use the GPU.
-
-At runtime, everything else is optional and loaded only when used:
-
-- **GPU inference:** the NVIDIA driver (`libcuda`), `libnvrtc` from a CUDA toolkit (developed with 12.6), and a
-  GPU with compute capability 8.0 or higher (Ampere or newer). Without them, `--device auto` uses the CPU.
-  Set `CUDA_PATH` or `TACHYON_NVRTC=/path/to/libnvrtc.so` if `libnvrtc` isn't on the library path.
-- **`tachyon pull`:** the system OpenSSL library (`libssl.so.3` or `1.1`), present on virtually every
-  distribution, for HTTPS. Certificates are verified against the system CA bundle (`SSL_CERT_FILE` overrides it).
+- **Linux x86-64 with glibc 2.28 or newer** for official binaries: Debian 10+, Ubuntu 20.04+,
+  Rocky/Alma/RHEL 8+, and newer Fedora/openSUSE systems. Alpine/musl, ARM and macOS do not have
+  prebuilt releases. The installer checks the actual glibc requirement recorded in each archive.
+- **Any x86-64 CPU.** Releases include scalar, AVX2 + FMA + F16C, and AVX-512 F/BW/VL/VNNI binaries.
+  A baseline launcher checks CPU and OS support and selects the fastest supported variant on each run.
+  `TACHYON_CPU=scalar|avx2|avx512` selects a specific variant; unsupported selections fail with a message.
+- **GPU inference (optional):** an NVIDIA Ampere or newer GPU (compute capability 8.0+) and a compatible
+  NVIDIA driver. Releases bundle NVRTC 12.6 and its matching headers; the driver comes from your system.
+  `--device auto` uses the CPU when CUDA is unavailable. For GPUs needing a newer toolkit, set
+  `CUDA_PATH=/path/to/cuda` (or `TACHYON_CUDA`) to use its compiler and headers instead.
+  `TACHYON_NVRTC=/path/to/libnvrtc.so` overrides just the compiler library.
+- **Model downloads:** system OpenSSL (`libssl.so.3` or `1.1`) and CA certificates. Certificates are verified
+  against the system CA bundle (`SSL_CERT_FILE` overrides it). The installer itself uses Bash, curl, tar,
+  gzip and `sha256sum` (or `shasum`).
 
 ## Build
 
+Source builds need GCC 11+ with C++20 support, Make, Python 3, and CUDA toolkit headers
+(`cuda.h`, `nvrtc.h`). `nvcc` and an NVIDIA GPU are not needed to compile.
+
 ```bash
-make -j16          # builds ./tachyon and ./tachyon-client
+make -j16                    # portable baseline x86-64; builds ./tachyon and ./tachyon-client
+make -j16 CPU=avx2           # explicit AVX2/FMA/F16C target
+make -j16 CPU=avx512         # explicit AVX-512 VNNI target
+make -j16 CPU=native         # tune only for this machine; do not distribute this build
 ```
 
-Set `CUDA=/path/to/cuda` if the toolkit isn't in `/usr/local/cuda`. The first start on a new model
-compiles its kernels, which takes about 2 seconds. They are cached in `~/.cache/tachyon`, so later
-starts are instant.
+`CUDA=/path/to/cuda` selects the build-time toolkit. CPU variants use separate object directories;
+changes to compiler flags also trigger rebuilding. Only the C/C++ runtime is linked, and CUDA libraries
+are loaded at runtime. For a source build to use the GPU, provide system NVRTC and matching CUDA
+headers. The first start on a new model compiles its kernels and caches them in `~/.cache/tachyon`.
+
+See [release builds](docs/releases.md) to make an installer-compatible archive locally or in GitHub Actions.
 
 ## Quick start
 

@@ -75,14 +75,14 @@ $(BUILD)/text-test: tests/text_test.cpp $(BUILD)/tokenizer.o $(BUILD)/model_file
 $(BUILD)/http-probe: tests/http_probe.cpp $(BUILD)/http.o $(BUILD)/https.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
 
-test: tachyon tachyon-client $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/quant-test $(BUILD)/text-test $(BUILD)/http-probe
+test: tachyon $(CLIENT_OUT) $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/quant-test $(BUILD)/text-test $(BUILD)/http-probe
 	python3 tests/file_test.py $(BUILD)/file-probe
 	$(BUILD)/kernel-test
 	$(BUILD)/quant-test
 	python3 tests/server_test.py $(abspath $(OUT)) $(BUILD)/text-test
 	python3 tests/settings_test.py $(abspath $(OUT))
-	python3 tests/http_test.py $(BUILD)/http-probe ./tachyon-client
-	python3 tests/release_test.py $(abspath $(OUT)) $(abspath tachyon-client)
+	python3 tests/http_test.py $(BUILD)/http-probe $(abspath $(CLIENT_OUT))
+	python3 tests/release_test.py $(abspath $(OUT)) $(abspath $(CLIENT_OUT))
 
 $(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/cuda_api.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)

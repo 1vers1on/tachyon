@@ -1,0 +1,102 @@
+name: Portable Linux release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container:
+      # Rocky 8 gives releases a glibc 2.28 baseline. No GPU or AVX-512 runner is needed.
+      image: nvidia/cuda:12.6.3-devel-rockylinux8@sha256:948e2dfa9f2ff9fb83b1f128b682ad4b63926c9e5b2fd88b8ce681e3241f2f3e
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: dnf install -y git gcc-toolset-12-gcc-c++ gcc-toolset-12-libstdc++-devel make python3.11 tar gzip binutils findutils
+      - run: ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+      - uses: actions/checkout@v4
+      - name: Build and run offline tests
+        run: |
+          source /opt/rh/gcc-toolset-12/enable
+          make -j2 BUILD=build/release/obj-scalar CPU=scalar LDFLAGS='-static-libstdc++ -static-libgcc' test
+          python3 tests/install_test.py
+      - name: Package all CPU variants and CUDA runtime compiler
+        run: |
+          source /opt/rh/gcc-toolset-12/enable
+          JOBS=2 tools/package.sh
+          test "$(cat build/release/tachyon-*/GLIBC_MIN)" = 2.28
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian:buster, debian:bookworm, ubuntu:20.04, ubuntu:24.04, rockylinux:8, fedora:latest, opensuse/leap:15.6]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Test archive without a compiler, toolkit or NVIDIA driver
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          docker run --rm -v "$PWD/dist:/release:ro" "$DISTRO" sh -ec '
+            cd /tmp
+            tar -xzf /release/tachyon-linux-x86_64.tar.gz
+            cd tachyon-*
+            bin/tachyon --version
+            TACHYON_CPU=scalar bin/tachyon selftest
+            bin/tachyon catalog
+          '
+
+  cpu-dispatch:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user
+      - name: Exercise the launcher and kernels with CPU features masked
+        run: |
+          tar -xzf dist/tachyon-linux-x86_64.tar.gz -C /tmp
+          python3 tests/launcher_test.py /tmp/tachyon-*/bin/tachyon
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, smoke, cpu-dispatch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^#define TACH_VERSION "\(.*\)"/\1/p' src/common.h)
+          test "$RELEASE_TAG" = "v$version"
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Tachyon $version" --generate-notes
