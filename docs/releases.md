@@ -8,15 +8,23 @@ tachyon-linux-x86_64.tar.gz.sha256
 ```
 
 The archive includes a baseline CPU launcher, three inference binaries (scalar, AVX2, AVX-512 VNNI),
-a baseline `tachyon-client`, NVRTC and its builtins, matching CUDA headers, license notices, and
+a baseline `tachyon-client`, the `tachyon-bench` script, NVRTC and its builtins, matching CUDA headers, license notices, and
 version/commit/glibc metadata. All binaries use explicit CPU flags. A GPU and AVX-512 hardware are
 unnecessary on the build machine: CUDA kernels are compiled on the user's machine by NVRTC.
-The host's NVIDIA driver is never bundled.
+The host's NVIDIA driver is never bundled. CUDA 12.8.1 supports native compilation for both
+RTX 3060 (`sm_86`) and RTX 5090 (`sm_120`). A compatible NVIDIA driver is required; users do not
+need a separate CUDA toolkit. CI compiles representative real kernels for both targets, including
+FP16 and int8 KV caches, using the packaged compiler, builtins and headers without a GPU.
+
+The installer links `tachyon-bench` into the same `bin/` directory as `tachyon`. It uses the bundled
+CPU binaries or CUDA backend without building, and needs only Bash and standard Linux utilities.
+Results default to `${XDG_CACHE_HOME:-$HOME/.cache}/tachyon/bench`; `TACHYON_BENCH_DIR` overrides this.
+Source-tree use through `tools/bench.sh` still builds from the current checkout.
 
 ## GitHub Actions
 
 `.github/workflows/release.yml` builds on pushes to `main`, pull requests, version tags and manual
-dispatches. It uses CUDA 12.6.3 on Rocky Linux 8 with GCC Toolset 12, links the C++ runtimes statically,
+dispatches. It uses CUDA 12.8.1 on Rocky Linux 8 with GCC Toolset 12, links the C++ runtimes statically,
 and checks that the resulting glibc minimum is 2.28. The offline tests run before packaging.
 The archive is tested on Debian, Ubuntu, Rocky, Fedora and openSUSE without a toolkit or NVIDIA driver.
 QEMU tests CPU selection and the scalar/AVX2 kernels with CPU features masked.
@@ -38,7 +46,7 @@ With GCC 11+, Make, Python 3, binutils and a CUDA toolkit installed:
 ```bash
 CUDA=/usr/local/cuda JOBS=8 tools/package.sh
 # Optional explicit version; it must match src/common.h:
-tools/package.sh 1.1.0
+tools/package.sh 1.1.1
 ```
 
 The files appear in `dist/`. This uses the same archive format and CPU flags as CI. It records the
@@ -48,11 +56,11 @@ official glibc 2.28 baseline:
 
 ```bash
 docker run --rm -v "$PWD:/src" -w /src \
-  nvidia/cuda:12.6.3-devel-rockylinux8 \
+  nvidia/cuda:12.8.1-devel-rockylinux8 \
   bash -lc 'dnf install -y git gcc-toolset-12-gcc-c++ gcc-toolset-12-libstdc++-devel make python3.11 tar gzip binutils findutils curl &&
     ln -sf /usr/bin/python3.11 /usr/local/bin/python3 &&
     source /opt/rh/gcc-toolset-12/enable && mkdir -p build &&
-    curl -fsSL https://docs.nvidia.com/cuda/archive/12.6.3/eula/index.html -o build/CUDA-EULA.html &&
+    curl -fsSL https://docs.nvidia.com/cuda/archive/12.8.1/eula/index.html -o build/CUDA-EULA.html &&
     CUDA_EULA=build/CUDA-EULA.html tools/package.sh'
 ```
 
@@ -60,7 +68,7 @@ Use a clean checkout when building published assets; `COMMIT` records the checko
 Keep `TACH_VERSION` and the GitHub tag aligned. To upload locally built assets to an existing release:
 
 ```bash
-gh release upload v1.1.0 dist/tachyon-linux-x86_64.tar.gz dist/tachyon-linux-x86_64.tar.gz.sha256
+gh release upload v1.1.1 dist/tachyon-linux-x86_64.tar.gz dist/tachyon-linux-x86_64.tar.gz.sha256
 ```
 
 Avoid replacing existing public assets: publish a new patch version so pinned installs stay reproducible.

@@ -51,10 +51,13 @@ esac
         file.write_text(body)
         file.chmod(0o755)
 
-    def release(self, version='1.0.0', floor='2.28', broken=False):
+    def release(self, version='1.0.0', floor='2.28', broken=False, bench=True):
         files = {'VERSION': version + '\n', 'GLIBC_MIN': floor + '\n',
                  'bin/tachyon': '#!/bin/bash\n' + ('exit 1\n' if broken else 'echo ' + version + '\n'),
-                 'bin/tachyon-client': '#!/bin/bash\necho client\n'}
+                 'bin/tachyon-client': '#!/bin/bash\necho client\n',
+                 'bin/tachyon-bench': '#!/bin/bash\necho benchmark\n'}
+        if not bench:
+            files.pop('bin/tachyon-bench')
         files.update({'libexec/tachyon-' + cpu: '#!/bin/bash\nexit 0\n' for cpu in ('scalar', 'avx2', 'avx512')})
         with tarfile.open(self.downloads / 'archive', 'w:gz') as archive:
             for name, body in files.items():
@@ -79,19 +82,33 @@ esac
         self.run_installer(pipe=True)
         command = self.home / '.local/bin/tachyon'
         self.assertEqual(subprocess.check_output([str(command)], text=True).strip(), '1.0.0')
+        bench = self.home / '.local/bin/tachyon-bench'
+        self.assertEqual(subprocess.check_output([str(bench)], text=True).strip(), 'benchmark')
+        old_bench = bench.resolve()
         old = command.resolve()
         self.release('1.0.1')
         self.run_installer('--version', '1.0.1')
         self.assertNotEqual(command.resolve(), old)
+        self.assertNotEqual(bench.resolve(), old_bench)
         self.assertTrue(old.exists(), 'running installations must survive upgrades')
         self.assertEqual(subprocess.check_output([str(command)], text=True).strip(), '1.0.1')
         self.assertIn('/releases/download/v1.0.1/', (self.downloads / 'requests').read_text())
+
+    def test_upgrade_from_release_without_bench(self):
+        self.release(bench=False)
+        self.run_installer()
+        command = self.home / '.local/bin/tachyon-bench'
+        self.assertFalse(command.exists())
+        self.release('1.0.1')
+        self.run_installer()
+        self.assertTrue(command.is_file())
 
     def test_custom_prefix_with_spaces_and_pinned_version(self):
         prefix = self.root / 'custom prefix'
         self.env.update(TACHYON_INSTALL_DIR=str(prefix), TACHYON_VERSION='v1.0.0')
         self.run_installer()
         self.assertTrue((prefix / 'bin/tachyon-client').is_file())
+        self.assertTrue((prefix / 'bin/tachyon-bench').is_file())
         self.assertIn('/releases/download/v1.0.0/', (self.downloads / 'requests').read_text())
 
     def test_checksum_failure_preserves_installation(self):
@@ -106,6 +123,14 @@ esac
         self.env['FAIL_DOWNLOAD'] = '1'
         self.assertIn('release not available', self.run_installer(valid=False))
         self.assertFalse((self.home / '.local/bin/tachyon').exists())
+
+    def test_existing_bench_is_preserved(self):
+        command = self.home / '.local/bin/tachyon-bench'
+        command.parent.mkdir(parents=True)
+        command.write_text('mine')
+        self.assertIn('not managed', self.run_installer(valid=False))
+        self.assertEqual(command.read_text(), 'mine')
+        self.assertFalse((self.home / '.local/lib/tachyon/current').exists())
 
     def test_existing_command_is_preserved(self):
         command = self.home / '.local/bin/tachyon'

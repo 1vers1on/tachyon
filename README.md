@@ -1,6 +1,6 @@
 # Tachyon
 
-Version **1.1.0**. See the [release notes](CHANGELOG.md); `./tachyon --version` prints the installed version.
+Version **1.1.1**. See the [release notes](CHANGELOG.md); `./tachyon --version` prints the installed version.
 
 A from-scratch LLM inference engine and server in C++, with hand-written CUDA, AVX-512 and AVX2 kernels (plus a scalar fallback).
 
@@ -46,11 +46,11 @@ If that directory is outside your `PATH`, the installer prints the line to add t
 
 ```bash
 # Pin a version, or choose an installation prefix (containing bin/ and lib/).
-curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --version 1.1.0
+curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --version 1.1.1
 curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --prefix "$HOME/apps/tachyon"
 ```
 
-Run the same command to upgrade. Both commands switch to the new release together; previous releases
+Run the same command to upgrade. All installed commands switch to the new release together; previous releases
 stay in `~/.local/lib/tachyon` so processes already running can finish. To uninstall, remove the two
 symlinks in `~/.local/bin` and `~/.local/lib/tachyon`. Models in `~/.tachyon` are stored separately.
 
@@ -265,9 +265,21 @@ slower on Q8, so use them only on CPUs that lack AVX2.
 
 ### Benchmark your own hardware
 
-`tools/bench.sh` pulls the models it needs, runs `tachyon bench` several times (interleaved, so drift in machine
-state hits every configuration equally) and prints the median and range as a markdown table. It needs a built
-tree (see [Build](#build)) and `python3`.
+Prebuilt releases include `tachyon-bench`: no source checkout, compiler, Python or separate CUDA toolkit
+is needed. The bundled CUDA 12.8.1 compiler targets both RTX 3060 and RTX 5090; a compatible NVIDIA
+driver must be installed on the host (the Windows host for WSL2).
+
+```bash
+tachyon-bench gpu -r 3 -p 2048 -n 128 qwen3:8b qwen3.5:9b bonsai2:9b
+tachyon-bench cpu -r 3 -t 16 qwen3:1.7b
+```
+
+The script pulls the models it needs, runs `tachyon bench` several times (interleaved, so drift in machine
+state hits every configuration equally) and prints the median and range as a markdown table. Installed
+releases use the bundled binaries and write raw runs to `${XDG_CACHE_HOME:-$HOME/.cache}/tachyon/bench`.
+Set `TACHYON_BENCH_DIR` to choose another results directory.
+
+From a source checkout, `tools/bench.sh` builds the binaries (see [Build](#build)):
 
 ```bash
 tools/bench.sh gpu                                  # GPU backend: qwen3:0.6b and qwen3:8b, 2048-token prompt, 3 runs

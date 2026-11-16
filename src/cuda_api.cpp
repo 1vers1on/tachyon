@@ -72,6 +72,22 @@ void load(CudaApi& a) {
     TACH_NVRTC_FUNCS(TACH_LOAD_NV)
     if (!missing.empty()) { a.error = "CUDA libraries are too old (missing " + missing + ")"; return; }
 
+    // NVRTC may search for its builtins by soname rather than beside an explicitly
+    // dlopened compiler. Preload the matching library so relocated bundles work
+    // without LD_LIBRARY_PATH (including CUDA 12.8 on Blackwell).
+    int major = 0, minor = 0;
+    if (a.nvrtcVersion(&major, &minor) != NVRTC_SUCCESS) { a.error = "Cannot query NVRTC version"; return; }
+    std::string builtins = "libnvrtc-builtins.so." + std::to_string(major) + "." + std::to_string(minor);
+    link_map* compiler = nullptr;
+    std::vector<std::string> builtin_names;
+    if (dlinfo(nv, RTLD_DI_LINKMAP, &compiler) == 0 && compiler && compiler->l_name) {
+        std::string path = compiler->l_name;
+        if (path.rfind('/') != std::string::npos) builtin_names.push_back(path.substr(0, path.rfind('/') + 1) + builtins);
+    }
+    builtin_names.push_back(builtins);
+    tried.clear();
+    if (!open_first(builtin_names, tried)) { a.error = "Matching NVRTC builtins library not found (tried " + tried + ")"; return; }
+
     // toolkit root of the loaded libnvrtc (…/lib64/libnvrtc.so -> …), used for NVRTC include paths
     link_map* lm = nullptr;
     if (dlinfo(nv, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name) {

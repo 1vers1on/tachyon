@@ -88,7 +88,9 @@ EOF
     mkdir -p -- "$prefix/bin" "$prefix/lib/tachyon"
     prefix=$(cd -- "$prefix" && pwd -P)
     local root="$prefix/lib/tachyon" binary
-    for binary in tachyon tachyon-client; do
+    local binaries=(tachyon tachyon-client)
+    if [[ -f $payload/bin/tachyon-bench && ! -L $payload/bin/tachyon-bench ]]; then binaries+=(tachyon-bench); fi
+    for binary in "${binaries[@]}"; do
         if [[ -e $prefix/bin/$binary || -L $prefix/bin/$binary ]]; then
             [[ -L $prefix/bin/$binary && $(readlink "$prefix/bin/$binary") == "$root/current/bin/$binary" ]] ||
                 die "$prefix/bin/$binary already exists and is not managed by this installer; move it first"
@@ -99,10 +101,10 @@ EOF
     cp -a "$payload/." "$install_staging/"
     install_switch_dir=$(mktemp -d "$root/.switch.XXXXXXXX")
     ln -s "$install_staging" "$install_switch_dir/current"
-    # A single rename switches both commands. Existing processes keep using their previous release.
+    # A single rename switches the commands. Existing processes keep using their previous release.
     mv -Tf "$install_switch_dir/current" "$root/current"
     install_staging=''
-    for binary in tachyon tachyon-client; do
+    for binary in "${binaries[@]}"; do
         ln -s "$root/current/bin/$binary" "$install_switch_dir/$binary"
         mv -Tf "$install_switch_dir/$binary" "$prefix/bin/$binary"
     done

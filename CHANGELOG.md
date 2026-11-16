@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.1 — 2026-11-16
+
+- Bundle CUDA 12.8.1 NVRTC, matching builtins and headers so RTX 5090 (`sm_120`) kernels can compile
+  while retaining RTX 3060 (`sm_86`) support. No separate CUDA toolkit is needed; a compatible host
+  NVIDIA driver is still required.
+- Preload the matching NVRTC builtins beside the compiler so relocated bundles do not need
+  `LD_LIBRARY_PATH` to compile kernels.
+- Include `tachyon-bench` in release archives and installer upgrades. Benchmark GPU or supported CPU
+  variants using the shipped binaries, without downloading source, building or installing Python.
+- Store installed benchmark logs in the user cache (overridable with `TACHYON_BENCH_DIR`), resolve
+  installer symlinks and model paths containing spaces, and validate benchmark options.
+- Add offline installed-benchmark and installer upgrade tests, plus cross-compilation of real CUDA
+  kernels for both architectures using the packaged libraries and headers.
+
 ## 1.1.0 — 2026-11-16
 
 RTX 3060 12 GB model set. New weight formats are recorded by exact name in the `.tach` file and are never

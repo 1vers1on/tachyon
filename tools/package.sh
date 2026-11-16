@@ -41,6 +41,7 @@ make -j"$jobs" CXX="$cxx" CUDA="$cuda" CPU=scalar BUILD="$work/obj-scalar" \
 "$cxx" -O2 -std=c++20 -march=x86-64 -mtune=generic -static-libstdc++ -static-libgcc \
     tools/launcher.cpp -o "$stage/bin/tachyon"
 strip "$stage"/bin/* "$stage"/libexec/*
+install -m 755 tools/bench.sh "$stage/bin/tachyon-bench"
 
 # Bundle NVRTC and its matching builtins/headers. The NVIDIA driver remains supplied by the host.
 # Preserve the versioned builtins filename: NVRTC locates that exact name beside itself.
