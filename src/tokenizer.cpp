@@ -1,4 +1,5 @@
 #include "tokenizer.h"
+#include "template.h"
 #include "file_validation.h"
 #include "unicode_tables.h"
 #include <algorithm>
@@ -160,6 +161,7 @@ void Tokenizer::load(const ModelFile& mf) {
     bos_ = tj.has("bos") ? token_id_value(tj["bos"], true) : -1;
     add_bos_ = tj.get_bool("add_bos", false);
     thinking_ = tj.get_bool("thinking", false);
+    native_template_=tj.get_str("template_engine","")=="jinja"?tj.get_str("chat_template",""):"";
     chat_format_ = tj.get_str("chat_format", "chatml");
     chat_prefix_ = tj.get_str("chat_prefix", "");
     think_tag_open_ = tj.get_str("think_tag_open", "<think>");
@@ -183,9 +185,10 @@ void Tokenizer::load(const ModelFile& mf) {
     }
     {
         const std::string ct = tj.get_str("chat_template", "");
-        if (chat_format_ == "chatml")
+        if (chat_format_ == "chatml" || chat_format_ == "mimo")
             tool_format_ = tool_style_ == "xml" ? ToolFormat::QwenXml
                          : ct.find("<|tool_call_start|>") != std::string::npos ? ToolFormat::Lfm2 : ToolFormat::Hermes;
+        else if(chat_format_=="ifm")tool_format_=ToolFormat::Ifm;
         else if (chat_format_ == "gemma4") tool_format_ = ToolFormat::Gemma4;
         else if (chat_format_ == "mistral" && token_id("[TOOL_CALLS]") >= 0) tool_format_ = ToolFormat::Mistral;
         else tool_format_ = ToolFormat::Generic;
@@ -475,7 +478,9 @@ static const char* kHermesToolsEnd =
     "<tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
 
 std::string Tokenizer::tool_call_prefix(const std::string& name) const {
+    if(chat_format_=="mimo")return "<tool_call><function="+(name.empty()?std::string():name+">");
     switch (tool_format_) {
+        case ToolFormat::Ifm: return "<ifm|tool_calls>\n<ifm|tool_call>"+(name.empty()?std::string():name+"\n");
         case ToolFormat::QwenXml: return "<tool_call>\n<function=" + (name.empty() ? std::string() : name + ">\n");
         case ToolFormat::Lfm2: return "<|tool_call_start|>[" + (name.empty() ? std::string() : name + "(");
         case ToolFormat::Gemma4: return "<|tool_call>call:" + (name.empty() ? std::string() : name + "{");
@@ -692,12 +697,26 @@ std::string Tokenizer::render_gemma4(const std::vector<ChatMessage>& msgs, bool 
 
 std::string Tokenizer::render_chat(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,
                                    const std::vector<Json>& tools) const {
+    if(!native_template_.empty()) {
+        Json vars=Json::object(),messages=Json::array(),definitions=Json::array();
+        for(auto& m:msgs){Json j=Json::object();j.set("role",m.role);j.set("content",m.content);j.set("reasoning_content",m.reasoning);
+            if(!m.name.empty())j.set("name",m.name);if(!m.tool_call_id.empty())j.set("tool_call_id",m.tool_call_id);
+            Json calls=Json::array();for(auto& tc:m.tool_calls){Json call=Json::object(),fn=Json::object();call.set("id",tc.id);call.set("type","function");fn.set("name",tc.name);fn.set("arguments",call_args(tc));call.set("function",fn);calls.push(call);}j.set("tool_calls",calls);messages.push(j);}
+        for(auto& t:tools)definitions.push(t);
+        vars.set("messages",messages);vars.set("tools",definitions);vars.set("add_generation_prompt",add_gen);vars.set("enable_thinking",enable_thinking);
+        vars.set("bos_token",bos_>=0?vocab_[bos_]:"");vars.set("eos_token",eos_.empty()?"":vocab_[eos_[0]]);
+        auto rendered=render_checkpoint_template(native_template_,vars);
+        if(add_bos_&&bos_>=0&&rendered.rfind(vocab_[bos_],0)==0)rendered.erase(0,vocab_[bos_].size());
+        return rendered;
+    }
     if (tool_format_ == ToolFormat::Generic) {
         bool tooly = !tools.empty();
         for (auto& m : msgs) tooly |= m.role == "tool" || !m.tool_calls.empty();
         if (tooly) return render_generic_tools(msgs, add_gen, enable_thinking, tools);
     }
     if (chat_format_ == "gemma4") return render_gemma4(msgs, add_gen, enable_thinking, tools);
+
+
     std::string o = chat_prefix_;
     if (chat_format_ == "llama3") {
         if (!add_bos_) o += "<|begin_of_text|>";

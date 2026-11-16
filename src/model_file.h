@@ -23,6 +23,9 @@ struct TensorInfo {
     uint64_t scale_offset = 0;    // scales (Q4/Q8)
     uint64_t scale_bytes = 0;
     const uint8_t* data = nullptr;    // resolved pointers (mmap)
+    int hadamard_block = 0;  // normalized block FWHT on matrix input, inverse after embedding lookup
+    bool hadamard_inverse = false;
+    std::string hadamard_signs;  // F32 blob, one +/-1 value per input column
     const uint8_t* scales = nullptr;
 };
 
@@ -38,6 +41,8 @@ struct LayerCfg {
     // --- attention ---
     int n_heads = 0, n_kv_heads = 0, head_dim = 0;
     float rope_theta = 10000.f;
+    std::vector<float> rope_inv_freq; // optional checkpoint-derived per-layer frequencies (e.g. YaRN)
+    float rope_mscale = 1.f;
     int rope_half = 0;           // rotation pairs are (i, i + rope_half); dims >= 2*rope_half untouched
     int rope_rot = 0;            // number of frequencies actually rotating (proportional rope: rest are 0)
     int rope_den = 0;            // frequency exponent denominator: theta^(-2i/rope_den) (0 = head_dim; Qwen3.5: 2*rope_half)
@@ -76,6 +81,7 @@ struct LayerCfg {
 struct ModelConfig {
     std::string arch;          // qwen3 | qwen2 | llama (incl. Mixtral) | gemma | gemma3 | gemma4 | lfm2 | lfm2_moe | olmoe | qwen3_5
     std::string name;
+    int norm_groups = 1;       // grouped RMSNorm (K2 Horizon), global hidden-state norms only
     int n_layers = 0, hidden = 0, n_heads = 0, n_kv_heads = 0, head_dim = 0, ffn = 0, vocab = 0;
     float rms_eps = 1e-6f;
     float rope_theta = 10000.f;

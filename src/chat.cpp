@@ -389,8 +389,21 @@ bool parse_mistral(const std::string& body0, std::vector<ToolCall>& calls) {
 
 }  // namespace
 
+static bool parse_ifm(const std::string& body,std::vector<ToolCall>& calls) {
+    size_t pos=0;bool any=false;
+    while(true){size_t a=body.find("<ifm|tool_call>",pos);if(a==std::string::npos)break;a+=15;size_t b=body.find("</ifm|tool_call>",a);if(b==std::string::npos)return false;std::string inner=trim(body.substr(a,b-a));
+        if(!inner.empty()&&inner.front()=='{'){if(!parse_tool_calls(ToolFormat::Hermes,inner,calls))return false;}
+        else {ToolCall call;size_t end=inner.find_first_of("\r\n<");call.name=trim(inner.substr(0,end));if(call.name.empty())return false;Json args=Json::object();size_t k=0;
+            while((k=inner.find("<ifm|arg_key>",k))!=std::string::npos){k+=13;size_t ke=inner.find("</ifm|arg_key>",k);if(ke==std::string::npos)return false;std::string key=inner.substr(k,ke-k);size_t v=inner.find("<ifm|arg_value>",ke);if(v==std::string::npos)return false;v+=15;size_t ve=inner.find("</ifm|arg_value>",v);if(ve==std::string::npos)return false;std::string text=inner.substr(v,ve-v),error;auto value=Json::parse(text,&error);args.set(key,error.empty()?value:Json(text));k=ve+16;}
+            call.arguments=args.dump();calls.push_back(call);}
+        any=true;pos=b+16;
+    }
+    return any;
+}
+
 bool parse_tool_calls(ToolFormat f, const std::string& body, std::vector<ToolCall>& calls) {
     switch (f) {
+        case ToolFormat::Ifm: return parse_ifm(body,calls);
         case ToolFormat::Lfm2: return parse_lfm2(body, calls);
         case ToolFormat::Gemma4: return parse_gemma4(body, calls);
         case ToolFormat::Mistral: return parse_mistral(body, calls);
@@ -401,6 +414,7 @@ bool parse_tool_calls(ToolFormat f, const std::string& body, std::vector<ToolCal
 void ToolCallParser::init(ToolFormat f) {
     fmt_ = f;
     switch (f) {
+        case ToolFormat::Ifm: start_="<ifm|tool_calls>";end_="</ifm|tool_calls>";break;
         case ToolFormat::Lfm2: start_ = "<|tool_call_start|>"; end_ = "<|tool_call_end|>"; break;
         case ToolFormat::Gemma4: start_ = "<|tool_call>"; end_ = "<tool_call|>"; break;
         case ToolFormat::Mistral: start_ = "[TOOL_CALLS]"; end_.clear(); break;

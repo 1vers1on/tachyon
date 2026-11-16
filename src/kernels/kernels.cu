@@ -23,10 +23,24 @@ typedef unsigned long long uint64_t;
 #define EPI_ADD 1
 #define EPI_SILU 2
 
+#ifndef NORM_GROUPS
+#define NORM_GROUPS 1
+#endif
+
 #ifndef KV8
 #define KV8 0
 #endif
 
+// TACH_PACKED_SOURCE
+__device__ __forceinline__ size_t packed_row_bytes(int qt,int k) {
+    return qt==0?(size_t)k*4:qt==1||qt==12?(size_t)k*2:(size_t)(k/packed_group(qt))*packed_bytes(qt);
+}
+__device__ __forceinline__ float packed_read(int qt,const uint8_t* row,int k) {
+    if(qt==0)return ((const float*)row)[k];
+    if(qt==1)return __half2float(((const half*)row)[k]);
+    if(qt==12)return __uint_as_float((unsigned)((const uint16_t*)row)[k]<<16);
+    return packed_value(qt,row,k);
+}
 // ------------------------------------------------------------------------------------------------
 // helpers
 // ------------------------------------------------------------------------------------------------
@@ -179,6 +193,8 @@ extern "C" __global__ void embed(const uint8_t* __restrict__ E, const uint8_t* _
         int q = j < 16 ? (b & 15) : (b >> 4);
         half2 sm = ((const half2*)ES)[(size_t)tok * (HID / 64) + i / 64];
         v = __low2float(sm) * q + __high2float(sm);
+#elif EQ >= 5
+        v = packed_read(EQ, E + (size_t)tok * packed_row_bytes(EQ,HID),i);
 #elif EQ == QT_Q8
         v = __half2float(((const half*)ES)[(size_t)tok * (HID / 32) + i / 32]) * (float)((const int8_t*)E)[(size_t)tok * HID + i];
 #else
@@ -197,6 +213,19 @@ __device__ __forceinline__ void rmsnorm_impl(const float* __restrict__ x, const 
                                              int8_t* __restrict__ q, float2* __restrict__ ds, half* __restrict__ oh) {
     __shared__ float red[8];
     const float* xr = x + (size_t)in_row * HID;
+#if NORM_GROUPS > 1
+    constexpr int width=HID/NORM_GROUPS;
+    for(int g=0;g<NORM_GROUPS;g++){
+        float ss=0;for(int i=threadIdx.x;i<width;i+=256){float v=xr[g*width+i];ss+=v*v;}
+        ss=warp_sum(ss);if(threadIdx.x%32==0)red[threadIdx.x/32]=ss;__syncthreads();
+        float sum=0;for(int i=0;i<8;i++)sum+=red[i];float inv=rsqrtf(sum/width+EPS);
+        for(int b=threadIdx.x/32;b<width/32;b+=8){int i=g*width+b*32+threadIdx.x%32;float v=xr[i]*inv*w[i];
+            if(OUT_F16)oh[(size_t)out_row*HID+i]=__float2half_rn(v);
+            else {float peak=warp_max(fabsf(v)),d=peak/127.f;int z=d>0?__float2int_rn(v/d):0;int sumq=warp_sum_i(z);q[(size_t)out_row*HID+i]=z;if(threadIdx.x%32==0)ds[(size_t)out_row*(HID/32)+i/32]=make_float2(d,d*sumq);}}
+        __syncthreads();
+    }
+    return;
+#endif
     float ss = 0;
     for (int i = threadIdx.x; i < HID; i += 256) { float v = xr[i]; ss += v * v; }
     ss = warp_sum(ss);
@@ -259,6 +288,7 @@ __global__ void __launch_bounds__(256) gemm(const half* __restrict__ A, int M, i
     const int wrow = tid / 2, wpart = tid % 2;  // each thread dequantizes 32 weights of one row
     uint4 wreg0, wreg1;
     half2 wsc;
+    int packed_kt=0;
     auto load_A = [&](int kt, int buf) {
 #pragma unroll
         for (int i = 0; i < 2; i++) {
@@ -273,7 +303,8 @@ __global__ void __launch_bounds__(256) gemm(const half* __restrict__ A, int M, i
     auto fetch_W = [&](int kt) {
         int gn = n0 + wrow;
         if (gn >= N) gn = N - 1;
-        if constexpr (QT == QT_Q4) {
+        if constexpr (QT >= 5 || QT == 0 || QT == 1) { packed_kt=kt; }
+        else if constexpr (QT == QT_Q4) {
             wreg0 = ld_stream(W + (size_t)gn * (K / 2) + kt * 32 + wpart * 16);
             wsc = ((const half2*)S)[(size_t)gn * (K / 64) + kt];
         } else if constexpr (QT == QT_Q3) {
@@ -288,7 +319,11 @@ __global__ void __launch_bounds__(256) gemm(const half* __restrict__ A, int M, i
     };
     auto store_W = [&](int buf) {
         half2 v[16];
-        if constexpr (QT == QT_Q4) {
+        if constexpr (QT >= 5 || QT == 0 || QT == 1) {
+            int gn=min(n0+wrow,N-1);const uint8_t* row=W+(size_t)gn*packed_row_bytes(QT,K);
+#pragma unroll
+            for(int i=0;i<16;i++)v[i]=__floats2half2_rn(packed_read(QT,row,packed_kt*64+wpart*32+2*i),packed_read(QT,row,packed_kt*64+wpart*32+2*i+1));
+        } else if constexpr (QT == QT_Q4) {
             dequant_q4_block(wreg0, __half2half2(__low2half(wsc)), __half2half2(__high2half(wsc)), v);
         } else if constexpr (QT == QT_Q3) {
             const half2 sc2 = __half2half2(__low2half(wsc)), mn2 = __half2half2(__high2half(wsc));
@@ -1823,12 +1858,15 @@ __global__ void __launch_bounds__(128) conv_par(const float* __restrict__ in, in
         else out[(size_t)m * C + ch] = acc / (1.f + __expf(-acc));
     }
 }
-// rolling state <- last K-1 inputs of the batch (M >= K-1). grid ceil(C/256), block 256
+// Rolling state for any batch length, including one-token incremental prefill.
 template <int MODE>
-__global__ void conv_state(const float* __restrict__ in, int stride, int C, int K, float* __restrict__ state, int M) {
+__global__ void conv_state(const float* __restrict__ in, int stride, int C, int K, float* __restrict__ state, int M, int fresh) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= C) return;
-    for (int k = 0; k < K - 1; k++) state[(size_t)k * C + ch] = conv_xin<MODE>(in, stride, C, M - (K - 1) + k, ch);
+    for (int k = 0; k < K - 1; k++) {
+        int row=M-(K-1)+k;
+        state[(size_t)k*C+ch]=row>=0?conv_xin<MODE>(in,stride,C,row,ch):fresh?0.f:state[(size_t)(M+k)*C+ch];
+    }
 }
 
 // ---- chunked gated delta rule (Qwen3.5 prefill) --------------------------------------------------
@@ -2408,4 +2446,314 @@ extern "C" __global__ void ple_combine(const float* __restrict__ proj, const flo
 extern "C" __global__ void ple_mul(float* __restrict__ g, const float* __restrict__ ple, int l, int D, int W) {
     const int m = blockIdx.x, i = threadIdx.x;
     g[(size_t)m * D + i] = act_fn(g[(size_t)m * D + i]) * ple[(size_t)m * W + (size_t)l * D + i];
+}
+
+// Exact floating point activation path for imported block formats. All weight blocks stay packed.
+extern "C" __global__ void packed_prepare(const float* x,const float* norm,const int* rows,
+        const int8_t* xq,const float2* ds,float* out,int K,int pro) {
+    const int m=blockIdx.x,r=rows?rows[m]:m;
+    if(!pro){for(int i=threadIdx.x;i<K;i+=blockDim.x)out[(size_t)m*K+i]=float(xq[(size_t)m*K+i])*ds[(size_t)m*(K/32)+i/32].x;return;}
+    __shared__ float reduction[8];const int width=K/NORM_GROUPS;
+    for(int g=0;g<NORM_GROUPS;g++){
+        float sum=0;for(int j=threadIdx.x;j<width;j+=blockDim.x){float v=x[(size_t)r*K+g*width+j];sum+=v*v;}
+        sum=warp_sum(sum);if(threadIdx.x%32==0)reduction[threadIdx.x/32]=sum;__syncthreads();
+        float inv=0;for(int i=0;i<8;i++)inv+=reduction[i];inv=rsqrtf(inv/width+EPS);
+        for(int j=threadIdx.x;j<width;j+=blockDim.x){int i=g*width+j;out[(size_t)m*K+i]=x[(size_t)r*K+i]*inv*(norm?norm[i]:1.f);}
+        __syncthreads();
+    }
+}
+extern "C" __global__ void packed_fwht(const void* input,void* output,int K,int B,const float* signs,
+        int input_half,int output_half,int inverse) {
+    extern __shared__ float v[];
+    const int off=blockIdx.x*B;const size_t base=(size_t)blockIdx.y*K+off;
+    for(int i=threadIdx.x;i<B;i+=blockDim.x){float x=input_half?__half2float(((const half*)input)[base+i]):((const float*)input)[base+i];v[i]=x*(!inverse&&signs?signs[off+i]:1.f);}
+    __syncthreads();
+    for(int stride=1;stride<B;stride*=2){
+        for(int pair=threadIdx.x;pair<B/2;pair+=blockDim.x){int i=(pair/stride)*(2*stride)+pair%stride;float a=v[i],b=v[i+stride];v[i]=a+b;v[i+stride]=a-b;}
+        __syncthreads();
+    }
+    float scale=rsqrtf(float(B));
+    for(int i=threadIdx.x;i<B;i+=blockDim.x){float x=v[i]*scale*(inverse&&signs?signs[off+i]:1.f);if(output_half)((half*)output)[base+i]=__float2half_rn(x);else((float*)output)[base+i]=x;}
+}
+template<int QT>
+__global__ void packed_mv(const uint8_t* weights,int unused_qt,const void* input,int input_half,
+        int K,int N,float* output,int stride,int offset,int add,const float* bias) {
+    constexpr int qt=QT;int row=blockIdx.x*8+threadIdx.x/32,m=blockIdx.y,lane=threadIdx.x%32;if(row>=N)return;
+    const uint8_t* w=weights+(size_t)row*packed_row_bytes(qt,K);float acc=0;
+    for(int k=lane;k<K;k+=32){float x=input_half?__half2float(((const half*)input)[(size_t)m*K+k]):((const float*)input)[(size_t)m*K+k];acc=fmaf(packed_read(qt,w,k),x,acc);}
+    acc=warp_sum(acc);if(lane==0){if(bias)acc+=bias[row];float* y=output+(size_t)m*stride+offset+row;if(add)*y+=acc;else*y=acc;}
+}
+extern "C" __global__ void packed_gate(const float* input,half* output,int F) {
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<F;i+=gridDim.x*blockDim.x)output[i]=__float2half_rn(act_fn(input[2*i])*input[2*i+1]);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fast GEMV for packed block formats (decode and small verify batches). One warp per output row, MB tokens per pass.
+// Weights are decoded a block at a time into registers (scale applied once per block), activations are fp32 and are
+// never requantized, so results match the reference decode exactly up to summation order.
+// ---------------------------------------------------------------------------------------------------------------
+__device__ __forceinline__ unsigned ld_u16x2(const uint8_t* p) {
+    return (unsigned)*(const unsigned short*)p | ((unsigned)*(const unsigned short*)(p + 2) << 16);
+}
+__device__ __forceinline__ float4 ld_x4(const float* p) { return *(const float4*)p; }
+// int -> float without the (slow, 1/8 rate) I2F instruction: for 0 <= v < 2^23, (2^23 | v) as float is 2^23 + v exactly
+__device__ __forceinline__ float u2f(unsigned v, float bias) { return __uint_as_float(v | 0x4B000000u) - bias; }
+
+// R output rows per warp share each activation load (the activation vector re-read per row was the bottleneck).
+// w0 = first row, rb = row stride in bytes, nr = valid rows (<= R; surplus rows alias the last valid one and are not stored)
+template <int QT, int MB, int R>
+__device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, int nr, const float* __restrict__ X, int K, int lane, float (&acc)[R][MB]) {
+#define PROW(r) (w0 + (size_t)min(r, nr - 1) * rb)
+    if constexpr (QT == 7) {                       // Q4_0: 18-byte blocks of 32, 4 lanes per block
+        const int nb = K / 32, t = lane & 3;
+        #pragma unroll 2
+        for (int b = lane >> 2; b < nb; b += 8) {
+            float4 a[MB], c[MB];
+#pragma unroll
+            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 32; a[m] = ld_x4(x + 4 * t); c[m] = ld_x4(x + 16 + 4 * t); }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const uint8_t* p = PROW(r) + (size_t)b * 18;
+                const float d = packed_half(p);
+                const unsigned v = ld_u16x2(p + 2 + 4 * t);
+                float lo[4], hi[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) { lo[j] = u2f((v >> (8 * j)) & 15u, 8388616.f); hi[j] = u2f((v >> (8 * j + 4)) & 15u, 8388616.f); }
+#pragma unroll
+                for (int m = 0; m < MB; m++) {
+                    const float s = lo[0] * a[m].x + lo[1] * a[m].y + lo[2] * a[m].z + lo[3] * a[m].w + hi[0] * c[m].x + hi[1] * c[m].y + hi[2] * c[m].z + hi[3] * c[m].w;
+                    acc[r][m] = fmaf(d, s, acc[r][m]);
+                }
+            }
+        }
+    } else if constexpr (QT == 8) {                // Q8_0: 34-byte blocks of 32, 4 lanes per block
+        const int nb = K / 32, t = lane & 3;
+        #pragma unroll 2
+        for (int b = lane >> 2; b < nb; b += 8) {
+            float4 a[MB], c[MB];
+#pragma unroll
+            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 32 + 8 * t; a[m] = ld_x4(x); c[m] = ld_x4(x + 4); }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const uint8_t* p = PROW(r) + (size_t)b * 34;
+                const float d = packed_half(p);
+                const unsigned v0 = ld_u16x2(p + 2 + 8 * t), v1 = ld_u16x2(p + 6 + 8 * t);
+                float q[8];
+#pragma unroll
+                for (int j = 0; j < 4; j++) { q[j] = u2f(((v0 >> (8 * j)) & 255u) ^ 128u, 8388736.f); q[4 + j] = u2f(((v1 >> (8 * j)) & 255u) ^ 128u, 8388736.f); }
+#pragma unroll
+                for (int m = 0; m < MB; m++) {
+                    const float s = q[0] * a[m].x + q[1] * a[m].y + q[2] * a[m].z + q[3] * a[m].w + q[4] * c[m].x + q[5] * c[m].y + q[6] * c[m].z + q[7] * c[m].w;
+                    acc[r][m] = fmaf(d, s, acc[r][m]);
+                }
+            }
+        }
+    } else if constexpr (QT == 5) {                // PQ2_0: 34-byte blocks of 128 (2-bit codes, value = code-1), 8 lanes per block
+        const int nb = K / 128, t = lane & 7;
+        #pragma unroll 2
+        for (int b = lane >> 3; b < nb; b += 4) {
+            float4 xv[MB][4];
+#pragma unroll
+            for (int m = 0; m < MB; m++) {
+                const float* x = X + (size_t)m * K + (size_t)b * 128 + 16 * t;
+#pragma unroll
+                for (int j = 0; j < 4; j++) xv[m][j] = ld_x4(x + 4 * j);
+            }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const uint8_t* p = PROW(r) + (size_t)b * 34;
+                const float d = packed_half(p);
+                const unsigned v0 = ld_u16x2(p + 2 + 4 * t);
+                float q[16];
+#pragma unroll
+                for (int j = 0; j < 16; j++) q[j] = u2f((v0 >> (2 * j)) & 3u, 8388609.f);
+#pragma unroll
+                for (int m = 0; m < MB; m++) {
+                    float s = 0.f;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) s += q[4 * j] * xv[m][j].x + q[4 * j + 1] * xv[m][j].y + q[4 * j + 2] * xv[m][j].z + q[4 * j + 3] * xv[m][j].w;
+                    acc[r][m] = fmaf(d, s, acc[r][m]);
+                }
+            }
+        }
+    } else if constexpr (QT == 6) {                // PTQ1_0: 28-byte blocks of 128 (26 base-3 bytes + fp16 scale), one block per pass
+        const int nb = K / 128;
+        const int base = lane < 16 ? lane : lane < 24 ? 80 + (lane - 16) : 120 + (lane - 24);
+        const int step = lane < 16 ? 16 : lane < 24 ? 8 : 2;
+        const int cnt = lane < 24 ? 5 : 4;
+        for (int b = 0; b < nb; b++) {
+            float xv[MB][5];
+#pragma unroll
+            for (int m = 0; m < MB; m++) {
+                const float* x = X + (size_t)m * K + (size_t)b * 128 + base;
+#pragma unroll
+                for (int k = 0; k < 5; k++) xv[m][k] = (lane < 26 && k < cnt) ? x[step * k] : 0.f;
+            }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const uint8_t* p = PROW(r) + (size_t)b * 28;
+                const float d = packed_half(p + 26);
+                const int byte = p[lane < 26 ? lane : 0];
+                float q[5];
+#pragma unroll
+                for (int k = 0; k < 5; k++) {
+                    const int f = k == 0 ? 1 : k == 1 ? 3 : k == 2 ? 9 : k == 3 ? 27 : 81;
+                    q[k] = u2f((((byte * f) & 255) * 3 >> 8), 8388609.f);
+                }
+#pragma unroll
+                for (int m = 0; m < MB; m++) {
+                    float s = 0.f;
+#pragma unroll
+                    for (int k = 0; k < 5; k++) s = fmaf(q[k], xv[m][k], s);   // inactive lanes / k >= cnt have x = 0
+                    acc[r][m] = fmaf(d, s, acc[r][m]);
+                }
+            }
+        }
+    } else if constexpr (QT == 9 || QT == 10) {    // Q4_K / Q5_K: 256-element super-blocks, one per pass, 8 elements per lane
+        const int nb = K / 256, c = lane >> 3, j = (lane & 7) * 4;
+        constexpr int BS = QT == 9 ? 144 : 176;
+        for (int b = 0; b < nb; b++) {
+            float4 a[MB], h[MB];
+#pragma unroll
+            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 256 + 64 * c + j; a[m] = ld_x4(x); h[m] = ld_x4(x + 32); }
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const uint8_t* p = PROW(r) + (size_t)b * BS;
+                const float dd = packed_half(p), dm = packed_half(p + 2);
+                uint8_t sb[12];
+#pragma unroll
+                for (int i = 0; i < 3; i++) { const unsigned u = *(const unsigned*)(p + 4 + 4 * i); sb[4 * i] = u & 255; sb[4 * i + 1] = (u >> 8) & 255; sb[4 * i + 2] = (u >> 16) & 255; sb[4 * i + 3] = u >> 24; }
+                float sc0, mn0, sc1, mn1;
+                {
+                    const int g0 = 2 * c, g1 = 2 * c + 1;
+                    if (c < 2) { sc0 = sb[g0] & 63; mn0 = sb[g0 + 4] & 63; sc1 = sb[g1] & 63; mn1 = sb[g1 + 4] & 63; }
+                    else {
+                        sc0 = (sb[g0 + 4] & 15) | ((sb[g0 - 4] >> 6) << 4); mn0 = (sb[g0 + 4] >> 4) | ((sb[g0] >> 6) << 4);
+                        sc1 = (sb[g1 + 4] & 15) | ((sb[g1 - 4] >> 6) << 4); mn1 = (sb[g1 + 4] >> 4) | ((sb[g1] >> 6) << 4);
+                    }
+                }
+                const unsigned qs = *(const unsigned*)(p + (QT == 9 ? 16 : 48) + c * 32 + j);
+                float q0[4], q1[4];
+#pragma unroll
+                for (int e = 0; e < 4; e++) { q0[e] = u2f((qs >> (8 * e)) & 15u, 8388608.f); q1[e] = u2f((qs >> (8 * e + 4)) & 15u, 8388608.f); }
+                if constexpr (QT == 10) {
+                    const unsigned qh = *(const unsigned*)(p + 16 + j);
+#pragma unroll
+                    for (int e = 0; e < 4; e++) { q0[e] += (float)(((qh >> (8 * e + 2 * c)) & 1) << 4); q1[e] += (float)(((qh >> (8 * e + 2 * c + 1)) & 1) << 4); }
+                }
+                const float d0 = dd * sc0, m0 = dm * mn0, d1 = dd * sc1, m1 = dm * mn1;
+#pragma unroll
+                for (int m = 0; m < MB; m++) {
+                    const float sq0 = q0[0] * a[m].x + q0[1] * a[m].y + q0[2] * a[m].z + q0[3] * a[m].w, sx0 = a[m].x + a[m].y + a[m].z + a[m].w;
+                    const float sq1 = q1[0] * h[m].x + q1[1] * h[m].y + q1[2] * h[m].z + q1[3] * h[m].w, sx1 = h[m].x + h[m].y + h[m].z + h[m].w;
+                    acc[r][m] += d0 * sq0 - m0 * sx0 + d1 * sq1 - m1 * sx1;
+                }
+            }
+        }
+    } else if constexpr (QT == 11) {               // Q6_K: 210-byte blocks of 256, one per pass, 8 elements per lane
+        const int nb = K / 256;
+        for (int b = 0; b < nb; b++) {
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                float xv[MB][4];
+#pragma unroll
+                for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 256 + h * 128 + lane; xv[m][0] = x[0]; xv[m][1] = x[32]; xv[m][2] = x[64]; xv[m][3] = x[96]; }
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    const uint8_t* p = PROW(r) + (size_t)b * 210;
+                    const float d = packed_half(p + 208);
+                    const int a0 = p[h * 64 + lane], a1 = p[h * 64 + 32 + lane], qh = p[128 + h * 32 + lane];
+                    const int q0 = ((a0 & 15) | ((qh & 3) << 4)) - 32, q1 = ((a1 & 15) | (((qh >> 2) & 3) << 4)) - 32;
+                    const int q2 = ((a0 >> 4) | (((qh >> 4) & 3) << 4)) - 32, q3 = ((a1 >> 4) | (((qh >> 6) & 3) << 4)) - 32;
+                    const int sb = 192 + h * 8 + (lane >> 4);
+                    const float c0 = d * (float)(signed char)p[sb] * q0, c1 = d * (float)(signed char)p[sb + 2] * q1;
+                    const float c2 = d * (float)(signed char)p[sb + 4] * q2, c3 = d * (float)(signed char)p[sb + 6] * q3;
+#pragma unroll
+                    for (int m = 0; m < MB; m++) acc[r][m] += c0 * xv[m][0] + c1 * xv[m][1] + c2 * xv[m][2] + c3 * xv[m][3];
+                }
+            }
+        }
+    } else if constexpr (QT == 0) {                // F32
+        for (int k = lane * 4; k < K; k += 128) {
+            float4 a[MB];
+#pragma unroll
+            for (int m = 0; m < MB; m++) a[m] = ld_x4(X + (size_t)m * K + k);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const float4 wv = *(const float4*)(PROW(r) + (size_t)k * 4);
+#pragma unroll
+                for (int m = 0; m < MB; m++) acc[r][m] += wv.x * a[m].x + wv.y * a[m].y + wv.z * a[m].z + wv.w * a[m].w;
+            }
+        }
+    } else {                                       // F16 (1) / BF16 (12)
+        for (int k = lane * 4; k < K; k += 128) {
+            float4 a[MB];
+#pragma unroll
+            for (int m = 0; m < MB; m++) a[m] = ld_x4(X + (size_t)m * K + k);
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const uint2 u = *(const uint2*)(PROW(r) + (size_t)k * 2);
+                float wv[4];
+                if constexpr (QT == 1) {
+                    const float2 f0 = __half22float2(*(const half2*)&u.x), f1 = __half22float2(*(const half2*)&u.y);
+                    wv[0] = f0.x; wv[1] = f0.y; wv[2] = f1.x; wv[3] = f1.y;
+                } else {
+                    wv[0] = __uint_as_float(u.x << 16); wv[1] = __uint_as_float(u.x & 0xffff0000u);
+                    wv[2] = __uint_as_float(u.y << 16); wv[3] = __uint_as_float(u.y & 0xffff0000u);
+                }
+#pragma unroll
+                for (int m = 0; m < MB; m++) acc[r][m] += wv[0] * a[m].x + wv[1] * a[m].y + wv[2] * a[m].z + wv[3] * a[m].w;
+            }
+        }
+    }
+#undef PROW
+}
+
+// y[m][row] (op)= W[row] . X[m]; grid ceil(N / (8 R)), block 256 (8 warps x R rows), X rows contiguous (stride K)
+template <int QT, int MB, int R>
+__global__ void __launch_bounds__(256) pmv2(const uint8_t* __restrict__ W, const float* __restrict__ X, int K, int N, int M,
+                                            float* __restrict__ Y, int stride, int offset, int add, const float* __restrict__ bias) {
+    const int lane = threadIdx.x & 31, row0 = (blockIdx.x * 8 + (threadIdx.x >> 5)) * R;
+    if (row0 >= N) return;
+    const int nr = min(R, N - row0);
+    float acc[R][MB];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int m = 0; m < MB; m++) acc[r][m] = 0.f;
+    const size_t rb = packed_row_bytes(QT, K);
+    pdot<QT, MB, R>(W + (size_t)row0 * rb, rb, nr, X, K, lane, acc);
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int m = 0; m < MB; m++) {
+            const float v = warp_sum(acc[r][m]);
+            if (lane == 0 && m < M && r < nr) { const int row = row0 + r; float* y = Y + (size_t)m * stride + offset + row; const float t = v + (bias ? bias[row] : 0.f); if (add) *y += t; else *y = t; }
+        }
+}
+
+// Expert-indexed variant for MoE decode: pair p uses expert ids[p] (rows [e*N, (e+1)*N)) and activation row p / act_div.
+// grid (ceil(N / (8 R)), P)
+template <int QT, int R>
+__global__ void __launch_bounds__(256) pmv_ind(const uint8_t* __restrict__ W, const float* __restrict__ X, int K, int N,
+                                               const int* __restrict__ ids, int act_div, float* __restrict__ Y) {
+    const int lane = threadIdx.x & 31, row0 = (blockIdx.x * 8 + (threadIdx.x >> 5)) * R, p = blockIdx.y;
+    if (row0 >= N) return;
+    const int nr = min(R, N - row0);
+    float acc[R][1];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r][0] = 0.f;
+    const size_t rb = packed_row_bytes(QT, K);
+    pdot<QT, 1, R>(W + ((size_t)ids[p] * N + row0) * rb, rb, nr, X + (size_t)(p / act_div) * K, K, lane, acc);
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float v = warp_sum(acc[r][0]);
+        if (lane == 0 && r < nr) Y[(size_t)p * N + row0 + r] = v;
+    }
+}
+
+// gate/up pairs [P][2F] (interleaved) -> act(g)*u in fp32 [P][F]. grid P, block 256
+extern "C" __global__ void __launch_bounds__(256) packed_act_rows(const float* __restrict__ gu, int F, float* __restrict__ out) {
+    const float* g = gu + (size_t)blockIdx.x * 2 * F;
+    for (int i = threadIdx.x; i < F; i += 256) out[(size_t)blockIdx.x * F + i] = act_fn(g[2 * i]) * g[2 * i + 1];
 }

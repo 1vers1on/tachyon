@@ -13,7 +13,7 @@ endif
 OPT      ?= -O3 $(CPU_$(CPU))
 CXXFLAGS ?= $(OPT) -std=gnu++20 -g -Wall -Wno-unused-function -Wno-sign-compare -Wno-unused-variable -Wno-array-bounds -fno-math-errno -pthread
 LDFLAGS  ?=
-INCS     := -I$(CUDA)/include -I$(BUILD)/generated -Isrc -DTACH_CUDA_DIR='"$(CUDA)"'
+INCS     = -I$(CUDA)/include -I$(BUILD)/generated -Isrc -Isrc/vendor -DTACH_CUDA_DIR='"$(CUDA)"'
 # libcuda and libnvrtc are loaded at runtime (src/cuda_api.cpp): only the CUDA headers are needed to build, and the
 # binary runs on the CPU backend where no NVIDIA driver is installed
 LDCUDA   := -ldl
@@ -22,8 +22,10 @@ BUILD ?= build/$(CPU)
 OUT ?= tachyon
 CLIENT_OUT ?= tachyon-client
 PYTHON ?= python3
-CORE_SRCS := src/json.cpp src/http.cpp src/https.cpp src/chat.cpp src/runner.cpp src/model_file.cpp src/safetensors.cpp src/quant.cpp src/convert.cpp src/tokenizer.cpp \
-             src/cpu_backend.cpp src/cuda_api.cpp src/cuda_backend.cpp src/sampler.cpp src/engine.cpp src/server.cpp src/main.cpp
+TEMPLATE_SRCS := src/template.cpp src/vendor/unicode.cpp $(wildcard src/vendor/jinja/*.cpp)
+TEMPLATE_OBJS = $(TEMPLATE_SRCS:src/%.cpp=$(BUILD)/%.o)
+CORE_SRCS := src/json.cpp src/http.cpp src/https.cpp src/chat.cpp src/runner.cpp src/model_file.cpp src/safetensors.cpp src/quant.cpp src/convert.cpp src/gguf.cpp src/tokenizer.cpp \
+             src/cpu_backend.cpp src/cuda_api.cpp src/cuda_backend.cpp src/sampler.cpp src/engine.cpp src/server.cpp src/main.cpp $(TEMPLATE_SRCS)
 CORE_OBJS := $(CORE_SRCS:src/%.cpp=$(BUILD)/%.o)
 
 all: tachyon $(CLIENT_OUT)
@@ -31,10 +33,13 @@ all: tachyon $(CLIENT_OUT)
 $(BUILD)/generated/kernels.inc: src/kernels/kernels.cu tools/embed.py
 	$(PYTHON) tools/embed.py $< $@
 
+$(BUILD)/generated/packed.inc: src/packed.h tools/embed.py
+	$(PYTHON) tools/embed.py $< $@
+
 $(BUILD)/generated/calib.inc: data/calib.txt tools/embed.py
 	$(PYTHON) tools/embed.py $< $@
 
-$(BUILD)/cuda_backend.o: $(BUILD)/generated/kernels.inc
+$(BUILD)/cuda_backend.o: $(BUILD)/generated/kernels.inc $(BUILD)/generated/packed.inc
 $(BUILD)/runner.o: $(BUILD)/generated/calib.inc
 
 $(BUILD)/config: FORCE
@@ -44,7 +49,7 @@ $(BUILD)/config: FORCE
 	@rm -f $@.tmp
 
 $(BUILD)/%.o: src/%.cpp src/*.h $(BUILD)/config
-	@mkdir -p $(BUILD)
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCS) -MMD -c $< -o $@
 
 ifneq ($(OUT),tachyon)
@@ -69,7 +74,7 @@ $(BUILD)/kernel-test: tests/kernel_test.cpp $(BUILD)/cpu_backend.o $(BUILD)/mode
 $(BUILD)/quant-test: tests/quant_test.cpp $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
-$(BUILD)/text-test: tests/text_test.cpp $(BUILD)/tokenizer.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/sampler.o
+$(BUILD)/text-test: tests/text_test.cpp $(BUILD)/tokenizer.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/sampler.o $(TEMPLATE_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
 $(BUILD)/http-probe: tests/http_probe.cpp $(BUILD)/http.o $(BUILD)/https.o
@@ -109,3 +114,12 @@ clean:
 .PHONY: all clean test test-models test-cuda FORCE
 
 -include $(CORE_OBJS:.o=.d) $(BUILD)/client.d
+
+$(BUILD)/packed-probe: tests/packed_probe.cpp $(BUILD)/quant.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
+
+$(BUILD)/checkpoint-probe: tests/checkpoint_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/cuda_api.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
+
+$(BUILD)/template-probe: tests/template_probe.cpp $(BUILD)/json.o $(TEMPLATE_OBJS)
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^

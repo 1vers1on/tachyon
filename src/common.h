@@ -335,11 +335,14 @@ enum class QType : int {
     F16 = 1,
     Q8 = 2,   // symmetric int8, group 32, fp16 scale.  w = s*q
     Q4 = 3,   // asymmetric uint4, group 64, half2(scale,min). w = s*q + m
+    PQ2_0 = 5, PTQ1_0 = 6, Q4_0 = 7, Q8_0 = 8, Q4_K = 9, Q5_K = 10, Q6_K = 11, BF16 = 12,
     Q3 = 4,   // asymmetric 3-bit, group 64, half2(scale,min); 12-byte blocks of 32 (2-bit plane + 1-bit plane)
 };
 inline const char* qtype_name(QType t) {
-    switch (t) { case QType::F32: return "f32"; case QType::F16: return "f16"; case QType::Q8: return "q8"; case QType::Q4: return "q4"; case QType::Q3: return "q3"; }
-    return "?";
+    switch (t) { case QType::F32: return "f32"; case QType::F16: return "f16"; case QType::Q8: return "q8"; case QType::Q4: return "q4"; case QType::Q3: return "q3"; default: break; }
+    switch (t) { case QType::PQ2_0: return "pq2_0"; case QType::PTQ1_0: return "ptq1_0";
+    case QType::Q4_0: return "q4_0"; case QType::Q8_0: return "q8_0"; case QType::Q4_K: return "q4_k";
+    case QType::Q5_K: return "q5_k"; case QType::Q6_K: return "q6_k"; case QType::BF16: return "bf16"; default: return "?"; }
 }
 inline QType qtype_from_name(const std::string& s) {
     if (s == "f32") return QType::F32;
@@ -347,11 +350,15 @@ inline QType qtype_from_name(const std::string& s) {
     if (s == "q8") return QType::Q8;
     if (s == "q4") return QType::Q4;
     if (s == "q3") return QType::Q3;
+    for (int i = 5; i <= 12; i++) if (s == qtype_name((QType)i)) return (QType)i;
     die("unknown qtype %s", s.c_str());
 }
 constexpr int Q4_GROUP = 64;
 constexpr int Q8_GROUP = 32;
 constexpr int ACT_BLOCK = 32;  // activation int8 quant block
+
+#include "packed.h"
+inline bool qtype_packed(QType t) { return (int)t >= 5 && (int)t <= 11; }
 
 // Byte sizes for a [rows, cols] matrix in a given qtype.
 // Layout (row-major per matrix): data section then scale section.
@@ -360,12 +367,14 @@ constexpr int ACT_BLOCK = 32;  // activation int8 quant block
 //  Q3: data = rows*cols*3/8 bytes: per 32-block 3 words {L0, L1, H}: element e = 16w+4k+b has its low 2 bits
 //      at bit (8b+2k) of Lw and its high bit at bit (8b+i) of H where e = 4i+b; scales as Q4
 inline size_t qtype_data_bytes(QType t, size_t rows, size_t cols) {
+    if (qtype_packed(t)) return rows * (cols / packed_group((int)t)) * packed_bytes((int)t);
     switch (t) {
         case QType::F32: return rows * cols * 4;
-        case QType::F16: return rows * cols * 2;
+        case QType::BF16: case QType::F16: return rows * cols * 2;
         case QType::Q8: return rows * cols;
         case QType::Q4: return rows * cols / 2;
         case QType::Q3: return rows * cols * 3 / 8;
+        default: return 0;
     }
     return 0;
 }

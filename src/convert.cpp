@@ -4,6 +4,7 @@
 #include "safetensors.h"
 #include "model_file.h"
 #include "quant.h"
+#include "gguf.h"
 #include "threadpool.h"
 #include "file_validation.h"
 #include <thread>
@@ -51,6 +52,7 @@ static bool bytelevel_decode(const std::string& tok, const std::unordered_map<ui
 
 struct ConvertOptions {
     std::string in_dir, out_path;
+    std::string quant_recipe;
     QType wtype = QType::Q4;
     QType embed_type = QType::Q4;   // token embedding / lm head
     int threads = 0;
@@ -197,6 +199,9 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     else if (chat_template.find("<start_of_turn>") != std::string::npos) fmt = "gemma";
     else if (chat_template.find("<|turn>") != std::string::npos) fmt = "gemma4";
     else if (chat_template.find("<|user|>") != std::string::npos) fmt = "tulu";
+    if(chat_template.find("mimo_audio_start")!=std::string::npos || (chat_template.find("You are provided with the following tools:")!=std::string::npos && chat_template.find("render_assistant_message")!=std::string::npos))fmt="mimo";
+    if(chat_template.find("<|ifm|im_start|>")!=std::string::npos)fmt="ifm";
+    if(!chat_template.empty())t.set("template_engine","jinja");
     t.set("chat_format", fmt);
     t.set("thinking", chat_template.find("<think>") != std::string::npos);
     // Qwen3: thinking on unless disabled (empty block injected when disabled)
@@ -204,7 +209,9 @@ static Json build_tokenizer(const std::string& dir, ModelWriter& w, int vocab_si
     const bool think_opt_in = chat_template.find("enable_thinking is defined and enable_thinking is true") != std::string::npos;
     const bool think_opt_out = chat_template.find("enable_thinking is defined and enable_thinking is false") != std::string::npos;
     t.set("think_default", !think_opt_in);
+    if(fmt=="mimo"){t.set("think_open",false);t.set("tool_style","xml");}
     t.set("think_open", think_opt_in);
+    if(fmt=="ifm"){t.set("thinking",true);t.set("think_default",true);t.set("think_open",true);t.set("think_tag_open","<ifm|think>\n");t.set("think_tag_close","</ifm|think>");}
     t.set("think_disable_block", think_opt_in || think_opt_out);
     // reasoning delimiters
     if (chat_template.find("<|channel>") != std::string::npos) {
@@ -236,7 +243,7 @@ int convert_main(int argc, char** argv) {
         auto next = [&]() -> std::string { if (i + 1 >= argc) die("missing value for %s", a.c_str()); return argv[++i]; };
         if (a == "-i" || a == "--input") o.in_dir = next();
         else if (a == "-o" || a == "--output") o.out_path = next();
-        else if (a == "-q" || a == "--quant") { o.wtype = qtype_from_name(next()); o.embed_type = o.wtype == QType::Q3 ? QType::Q4 : o.wtype; }
+        else if (a == "-q" || a == "--quant") { auto q=next();if(q=="q4_k_m"){o.quant_recipe="tachyon-q4_k_m-v1";o.wtype=QType::Q4_K;o.embed_type=QType::Q6_K;}else{o.wtype=qtype_from_name(q);o.embed_type=o.wtype==QType::Q3?QType::Q4:o.wtype;} }
         else if (a == "--embed-quant") o.embed_type = qtype_from_name(next());
         else if (a == "--head-quant") o.head_type = qtype_from_name(next());
         else if (a == "-t" || a == "--threads") o.threads = atoi(next().c_str());
@@ -263,11 +270,13 @@ int convert_main(int argc, char** argv) {
     if (o.threads <= 0) o.threads = nthreads_default();
     double t0 = now_sec();
 
+    if (o.in_dir.size() >= 5 && o.in_dir.substr(o.in_dir.size()-5) == ".gguf") return convert_gguf(o.in_dir, o.out_path);
     Json hc_root = Json::parse(read_file(o.in_dir + "/config.json"));
     const Json& hc = hc_root.has("text_config") ? hc_root["text_config"] : hc_root;  // multimodal wrappers: text part
     std::string mt = hc.get_str("model_type", hc_root.get_str("model_type", "llama"));
     ModelConfig c;
     if (mt == "qwen3" || mt == "qwen3_moe") c.arch = "qwen3";
+    else if (mt == "k2_horizon" || mt == "mellum") c.arch=mt;
     else if (mt == "qwen2") c.arch = "qwen2";
     else if (mt == "llama" || mt == "mistral" || mt == "mixtral" || mt == "smollm3" || mt == "granite" || mt == "phi3") c.arch = "llama";
     else if (mt == "gemma") c.arch = "gemma";
@@ -289,6 +298,10 @@ int convert_main(int argc, char** argv) {
             size_t q = s.find("--");
             c.name = q == std::string::npos ? s : s.substr(q + 2);
         } else c.name = d.substr(d.rfind('/') + 1);
+    }
+    if(mt=="k2_horizon"){
+        if(hc.get_int("num_experts",0)||hc.get_int("mova_num_experts",0))die("K2 Horizon currently supports the dense path only");
+        c.norm_groups=hc.get_int("layernorm_num_groups",1);
     }
     const std::string A = c.arch;
     const bool gemma = A == "gemma" || A == "gemma3" || A == "gemma4";
@@ -373,7 +386,8 @@ int convert_main(int argc, char** argv) {
         L.n_heads = c.n_heads; L.n_kv_heads = c.n_kv_heads; L.head_dim = c.head_dim;
         L.rope_theta = c.rope_theta; L.rope_half = c.head_dim / 2; L.rope_rot = L.rope_half;
         L.ffn = c.ffn;
-        if (A == "qwen3") L.qk_norm = 1;
+        if (A == "qwen3" || A == "mellum") L.qk_norm = 1;
+        if(A=="k2_horizon")L.qk_norm=hc.get_bool("query_key_norm",false)?2:0;
         if (mt == "smollm3") {   // NoPE layers: no_rope_layers[i] == 0
             const Json& nr = hc["no_rope_layers"];
             if (i < (int)nr.arr.size() && nr.arr[i].as_int() == 0) L.rope_rot = 0;
@@ -436,7 +450,21 @@ int convert_main(int argc, char** argv) {
                 L.rope_rot = rot / 2;
             }
         }
-        if (mt == "qwen3_moe") {
+        if(A=="mellum") {
+            L.window=lt=="sliding_attention"?(int)hc.get_int("sliding_window",1024):0;
+            const auto& rpl=rp[lt];L.rope_theta=rpl.get_num("rope_theta",500000.0);
+            if(rpl.get_str("rope_type","default")=="yarn"){
+                float factor=rpl.get_num("factor",1),orig=rpl.get_num("original_max_position_embeddings",8192);
+                float fast=rpl.get_num("beta_fast",32),slow=rpl.get_num("beta_slow",1);int dim=L.head_dim;
+                if(factor<=0||orig<=0||fast<=0||slow<=0)die("invalid per-layer YaRN parameters");
+                float lo=std::max(0.f,floorf(dim*logf(orig/(fast*2*M_PI))/(2*logf(L.rope_theta))));
+                float hi=std::min((float)dim-1,ceilf(dim*logf(orig/(slow*2*M_PI))/(2*logf(L.rope_theta))));
+                if(lo==hi)hi+=0.001f;
+                for(int j=0;j<dim/2;j++){float f=powf(L.rope_theta,-2.f*j/dim),ramp=std::clamp((j-lo)/(hi-lo),0.f,1.f);L.rope_inv_freq.push_back(f*(1-ramp)+f/factor*ramp);}
+                L.rope_mscale=rpl.get_num("attention_factor",1+0.1f*logf(factor));
+            }else if(rpl.get_str("rope_type","default")!="default")die("unsupported Mellum per-layer RoPE");
+        }
+        if (mt == "qwen3_moe" || mt == "mellum") {
             // sparse layers: not in mlp_only_layers and (i + 1) % decoder_sparse_step == 0
             bool dense = false;
             for (auto& x : hc["mlp_only_layers"].arr) if (x.as_int() == i) dense = true;
@@ -505,6 +533,8 @@ int convert_main(int argc, char** argv) {
     // Write a matrix assembled from row sources
     auto write_matrix = [&](const std::string& name, QType qt, int64_t rows, int64_t cols,
                             const std::function<void(int64_t, float*)>& src_row) {
+        if(!o.quant_recipe.empty() && qt==QType::Q4_K && (name=="output" || name=="tok_embd" || name.find("wqkv")!=std::string::npos))qt=QType::Q6_K;
+        if(qtype_packed(qt) && cols%packed_group((int)qt))qt=cols%32?QType::F16:QType::Q8_0;
         if (qt != QType::F32) for (auto& ov : o.overrides) if (name.find(ov.first) != std::string::npos) qt = ov.second;
         if (qt == QType::Q3 && (name == "tok_embd" || name == "output")) qt = QType::Q4;  // no Q3 embedding kernels
         if ((qt == QType::Q4 || qt == QType::Q3) && cols % Q4_GROUP) qt = cols % Q8_GROUP ? QType::F16 : QType::Q8;
@@ -633,9 +663,11 @@ int convert_main(int argc, char** argv) {
             write_matrix(o_ + "dn_in", o.wtype, L.dn_in_rows(), H, [&](int64_t r, float* buf) {
                 if (r < cd) wqkv->to_float(buf, r * H, H);
                 else if (r < cd + vd) wz->to_float(buf, (r - cd) * H, H);
+                else if(qtype_packed(o.wtype))std::fill(buf,buf+H,0.f);
                 else if (r < cd + vd + nv) wb->to_float(buf, (r - cd - vd) * H, H);
                 else wa->to_float(buf, (r - cd - vd - nv) * H, H);
             });
+            if(qtype_packed(o.wtype))write_matrix(o_+"dn_ab",QType::F32,2*nv,H,[&](int64_t r,float* buf){(r<nv?wb:wa)->to_float(buf,(r%nv)*H,H);});
             write_vec(o_ + "dn_conv", need(dp + "conv1d.weight"));
             // store A = -exp(A_log) directly
             const STTensor* alog = need(dp + "A_log");
@@ -727,6 +759,8 @@ int convert_main(int argc, char** argv) {
     Json header = Json::object();
     header.set("format", "tachyon");
     header.set("version", 1);
+    header.set("source_config",hc_root);
+    if(!o.quant_recipe.empty())header.set("quantization_recipe",o.quant_recipe);
     header.set("config", c.to_json());
     header.set("tokenizer", tok);
     header.set("generation", gen_defaults);

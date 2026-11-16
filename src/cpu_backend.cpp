@@ -33,10 +33,20 @@ constexpr int CPU_ABLK = 64;  // activation quant block on CPU (== Q4 group)
 struct QMat {
     std::string name;
     QType t = QType::F32;
+    int hadamard_block=0; bool hadamard_inverse=false; const float* signs=nullptr;
     int rows = 0, cols = 0;
     const uint8_t* d = nullptr;
     const uint8_t* s = nullptr;
 };
+
+// Normalized Sylvester FWHT. Inverse lookup is H(x) * signs; matrix input is H(x * signs).
+void fwht(float* x,int n,int block,const float* signs,bool inverse=false) {
+    if(!block)return;
+    if(!inverse&&signs)for(int i=0;i<n;i++)x[i]*=signs[i];
+    float scale=1.f/sqrtf((float)block);
+    for(int off=0;off<n;off+=block){for(int step=1;step<block;step*=2)for(int base=0;base<block;base+=2*step)for(int j=0;j<step;j++){float a=x[off+base+j],b=x[off+base+j+step];x[off+base+j]=a+b;x[off+base+j+step]=a-b;}for(int i=0;i<block;i++)x[off+i]*=scale;}
+    if(inverse&&signs)for(int i=0;i<n;i++)x[i]*=signs[i];
+}
 
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm = nullptr, *k_norm = nullptr, *bqkv = nullptr;
@@ -398,6 +408,10 @@ inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
 template <int T>
 inline void dot_rows(const QMat& W, int r, const QAct& a, int m0, float* out) {
     const int K = W.cols;
+    if(qtype_packed(W.t)||W.t==QType::BF16){
+        std::vector<float> row(K);dequantize_row(W.t,W.d+(size_t)r*qtype_data_bytes(W.t,1,K),nullptr,K,row.data());
+        for(int t=0;t<T;t++)out[t]=dot_f32(row.data(),a.x+(size_t)(m0+t)*K,K);return;
+    }
     switch (W.t) {
         case QType::Q4:
             dot_q4<T>(W.d + (size_t)r * K / 2, (const uint16_t*)W.s + (size_t)r * (K / 64) * 2, K, a, m0, out);
@@ -438,7 +452,8 @@ void gemm_rows(const QMat& W, const QAct& a, float* y, int ldy, int r0, int r1) 
 }
 
 // out = x / rms(x) * w   (w may be null: unweighted). In-place allowed.
-void rmsnorm(const float* x, const float* w, float* out, int n, float eps) {
+void rmsnorm(const float* x, const float* w, float* out, int n, float eps,int groups=1) {
+    if(groups>1){int width=n/groups;for(int g=0;g<groups;g++)rmsnorm(x+g*width,w?w+g*width:nullptr,out+g*width,width,eps);return;}
     const float ss = dot_f32(x, x, n);
     const float sc = 1.f / sqrtf(ss / n + eps);
     for (int j = 0; j < n; j++) out[j] = x[j] * sc * (w ? w[j] : 1.f);
@@ -463,7 +478,7 @@ struct CLayer {
     const float *q_norm = nullptr, *k_norm = nullptr, *bqkv = nullptr;
     QMat wqkv, wo, wgu, wdown;
     QMat conv_in, conv_out; const float* conv_w = nullptr;
-    QMat dn_in, dn_out; const float *dn_conv = nullptr, *dn_A = nullptr, *dn_dt = nullptr, *dn_norm = nullptr;
+    QMat dn_in, dn_out, dn_ab; const float *dn_conv = nullptr, *dn_A = nullptr, *dn_dt = nullptr, *dn_norm = nullptr;
     QMat router, wgu_e, wdown_e; const float* expert_bias = nullptr;
     QMat ple_gate, ple_out; const float* ple_post_norm = nullptr;
     std::vector<float> inv_freq;
@@ -517,7 +532,7 @@ public:
                         const auto& fac = opt.ctx > c_.rope_orig_ctx ? c_.rope_long : c_.rope_short;
                         if (i < (int)fac.size()) f /= fac[i];
                     }
-                    L.inv_freq[i] = f;
+                    L.inv_freq[i] = lc.rope_inv_freq.empty()?f:lc.rope_inv_freq.at(i);
                 }
             } else if (lc.type == "conv") {
                 L.state = (int)state_.size();
@@ -550,6 +565,7 @@ public:
                 size_t ds = qtype_data_bytes(E.t, 1, H), ss = qtype_scale_bytes(E.t, 1, H);
                 float* x = x_.data() + (size_t)m * H;
                 dequantize_row(E.t, E.d + (size_t)tok * ds, E.s ? E.s + (size_t)tok * ss : nullptr, H, x);
+                if(E.hadamard_inverse)fwht(x,H,E.hadamard_block,E.signs,true);
                 if (c_.embed_scale != 1.f) for (int i = 0; i < H; i++) x[i] *= c_.embed_scale;
             }
         });
@@ -589,7 +605,7 @@ public:
         n_logits_ = (int)rows.size();
         if (rows.empty()) return;
         std::vector<float> xs((size_t)rows.size() * H);
-        for (size_t i = 0; i < rows.size(); i++) rmsnorm(x_.data() + (size_t)rows[i] * H, out_norm_, xs.data() + i * H, H, c_.rms_eps);
+        for (size_t i = 0; i < rows.size(); i++) rmsnorm(x_.data() + (size_t)rows[i] * H, out_norm_, xs.data() + i * H, H, c_.rms_eps,c_.norm_groups);
         act_o_.resize((int)rows.size(), H);
         act_o_.x = xs.data();
         for (size_t i = 0; i < rows.size(); i++)
@@ -698,7 +714,7 @@ private:
                 const int pos = batch[m].pos;
                 for (int i = 0; i < lc.rope_half; i++) {
                     float th = pos * L.inv_freq[i];
-                    const float ms = L.inv_freq[i] != 0.f ? c_.rope_mscale : 1.f;   // longrope attention factor
+                    const float ms = L.inv_freq[i] != 0.f ? c_.rope_mscale * lc.rope_mscale : 1.f;   // longrope attention factor
                     cs[i] = cosf(th) * ms; sn[i] = sinf(th) * ms;
                 }
                 auto rope = [&](float* v) {
@@ -808,6 +824,8 @@ private:
         const int DK = lc.dn_dk, DV = lc.dn_dv, KC = lc.dn_conv, R = lc.dn_in_rows();
         float* proj = big_.data();
         matmul(L.dn_in, act_h_, proj, R);
+        if(L.dn_ab.rows){std::vector<float> ab((size_t)M*2*NV);matmul(L.dn_ab,act_h_,ab.data(),2*NV);for(int m=0;m<M;m++)memcpy(proj+(size_t)m*R+CD+VD,ab.data()+(size_t)m*2*NV,2*NV*4);}
+
         // causal depthwise conv + SiLU over the qkv channels (in place)
         std::vector<float>& cst = state_[L.state];
         pool_->parallel_for(CD, [&](int64_t a, int64_t b) {
@@ -1000,7 +1018,7 @@ private:
         a.x = hn_.data();
         pool_->parallel_for(M, [&](int64_t s, int64_t e) {
             for (int64_t m = s; m < e; m++) {
-                rmsnorm(x_.data() + (size_t)m * H, w, hn_.data() + (size_t)m * H, H, c_.rms_eps);
+                rmsnorm(x_.data() + (size_t)m * H, w, hn_.data() + (size_t)m * H, H, c_.rms_eps,c_.norm_groups);
                 quantize_act_row(hn_.data() + (size_t)m * H, H, a.q + (size_t)m * H, a.d + (size_t)m * (H / CPU_ABLK), a.s + (size_t)m * (H / CPU_ABLK));
             }
         });
@@ -1016,7 +1034,11 @@ private:
     }
     void matmul(const QMat& W, const QAct& a, float* y, int ldy) {
         if (g_imatrix && a.x) g_imatrix->add(W.name, a.x, a.M, a.K);
-        pool_->parallel_for(W.rows, [&](int64_t r0, int64_t r1) { gemm_rows(W, a, y, ldy, (int)r0, (int)r1); }, 16);
+        if(W.hadamard_block){
+            std::vector<float> rotated(a.x,a.x+(size_t)a.M*a.K);for(int m=0;m<a.M;m++)fwht(rotated.data()+(size_t)m*a.K,a.K,W.hadamard_block,W.signs);
+            QAct b;b.resize(a.M,a.K);b.x=rotated.data();for(int m=0;m<a.M;m++)quantize_act_row(b.x+(size_t)m*a.K,a.K,b.q+(size_t)m*a.K,b.d+(size_t)m*(a.K/64),b.s+(size_t)m*(a.K/64));
+            pool_->parallel_for(W.rows,[&](int64_t r0,int64_t r1){gemm_rows(W,b,y,ldy,r0,r1);},16);
+        }else pool_->parallel_for(W.rows, [&](int64_t r0, int64_t r1) { gemm_rows(W, a, y, ldy, (int)r0, (int)r1); }, 16);
     }
 
     // Copy weights into anonymous (transparent-hugepage) memory: fewer TLB misses than the file mmap.
@@ -1045,7 +1067,7 @@ private:
         });
         auto mat = [&](const std::string& n) {
             const TensorInfo* t = mf.tensor(n);
-            QMat q; q.name = n; q.t = t->type; q.rows = (int)t->rows; q.cols = (int)t->cols;
+            QMat q; q.hadamard_block=t->hadamard_block;q.hadamard_inverse=t->hadamard_inverse;if(!t->hadamard_signs.empty())q.signs=(const float*)mf.blob(t->hadamard_signs)->data; q.name = n; q.t = t->type; q.rows = (int)t->rows; q.cols = (int)t->cols;
             q.d = ptrs_[n].first; q.s = ptrs_[n].second;
             if (q.t == QType::Q3) {
                 // CPU runs Q3 through the Q4 kernels (values 0..7 fit in nibbles; same scale format)
@@ -1108,7 +1130,7 @@ private:
             } else if (L.c.type == "conv") {
                 L.conv_in = mat(p + "conv_in"); L.conv_out = mat(p + "conv_out"); L.conv_w = vec(p + "conv_w");
             } else if (L.c.type == "deltanet") {
-                L.dn_in = mat(p + "dn_in"); L.dn_out = mat(p + "dn_out");
+                L.dn_in = mat(p + "dn_in"); L.dn_out = mat(p + "dn_out"); if(mf.tensor(p+"dn_ab",false))L.dn_ab=mat(p+"dn_ab");
                 L.dn_conv = vec(p + "dn_conv"); L.dn_A = vec(p + "dn_A"); L.dn_dt = vec(p + "dn_dt"); L.dn_norm = vec(p + "dn_norm");
             }
             if (c_.ple_dim) {

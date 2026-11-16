@@ -58,6 +58,7 @@ struct CatalogEntry {
     const char* quant;   // default quantization
     const char* about;
     bool is_default;     // the family's default tag (`qwen3` = `qwen3:8b`)
+    const char* file = nullptr;   // GGUF checkpoints: the single file imported without requantization (quant names its exact format)
 };
 
 const CatalogEntry kCatalog[] = {
@@ -104,6 +105,14 @@ const CatalogEntry kCatalog[] = {
     {"granite3.3:2b", "ibm-granite/granite-3.3-2b-instruct", "q4", "Granite 3.3 2B instruct", true},
     {"granite3.3:8b", "ibm-granite/granite-3.3-8b-instruct", "q4", "Granite 3.3 8B instruct", false},
     {"phi4-mini", "microsoft/Phi-4-mini-instruct", "q4", "Phi-4-mini instruct (3.8B)", true},
+    // RTX 3060 12 GB set. Exact weight formats, not interchangeable q4/q2 variants: GGUF entries are imported bit-for-bit.
+    {"bonsai2:9b", "prism-ml/Ternary-Bonsai-2-9B-gguf", "pq2_0", "Ternary Bonsai 2 9B (Prism PQ2_0, Gated DeltaNet hybrid), thinking, tools", true, "Ternary-Bonsai-2-9B-PQ2_0.gguf"},
+    {"bonsai2:9b-ptq1_0", "prism-ml/Ternary-Bonsai-2-9B-gguf", "ptq1_0", "Ternary Bonsai 2 9B (Prism PTQ1_0, 1.6-bit ternary), thinking, tools", false, "Ternary-Bonsai-2-9B-PTQ1_0.gguf"},
+    {"bonsai2:27b", "prism-ml/Ternary-Bonsai-2-27B-gguf", "ptq1_0", "Ternary Bonsai 2 27B (Prism PTQ1_0, qwen3_5 hybrid), thinking, tools", false, "Ternary-Bonsai-2-27B-PTQ1_0.gguf"},
+    {"mimo2.6:9b", "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B", "q6_k", "MiMo V2.6 Distill Qwen 9B (Q6_K), reasoning, tools", true},
+    {"gemma4:12b-qat", "google/gemma-4-12B-it-qat-q4_0-gguf", "q4_0", "Gemma 4 12B instruct, official QAT Q4_0 (imported exactly), thinking, tools", false, "gemma-4-12b-it-qat-q4_0.gguf"},
+    {"k2-horizon:7b", "IFM/K2-Horizon-7B", "q6_k", "K2 Horizon 7B dense (grouped RMSNorm, Q6_K), reasoning, tools", true},
+    {"mellum2.1:12b-a2.5b", "JetBrains/Mellum2.1-12B-A2.5B-Thinking", "q4_k_m", "Mellum 2.1 12B-A2.5B MoE thinking (64 experts, top-8; Q4_K_M)", true},
 };
 
 std::string lower(std::string s) { for (auto& c : s) c = tolower((unsigned char)c); return s; }
@@ -115,6 +124,7 @@ struct ModelRef {
     std::string repo;    // Hugging Face repo id
     std::string quant;   // q4 | q8 | q3
     bool known = false;  // catalog entry or explicit Hugging Face repo
+    std::string file;    // GGUF checkpoint file to import (empty: safetensors checkpoint)
 };
 
 ModelRef parse_ref(std::string s) {
@@ -140,6 +150,7 @@ ModelRef parse_ref(std::string s) {
         if (base == c.name) {
             r.repo = c.repo;
             r.quant = quant.empty() ? c.quant : quant;
+            if (c.file) r.file = c.file;
             r.name = base + (quant.empty() || quant == c.quant ? "" : "-" + quant);
             r.known = true;
             return r;
@@ -358,7 +369,7 @@ std::string hf_cache_dir(const std::string& repo) {
 
 struct HfFile { std::string path; size_t size = 0; };
 
-bool hf_list(const std::string& repo, std::vector<HfFile>& files, std::string& canonical, std::string& err) {
+bool hf_list(const std::string& repo, std::vector<HfFile>& files, std::string& canonical, std::string& err, const std::string& only_file = "") {
     std::string out;
     HttpGetResult r;
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -384,7 +395,11 @@ bool hf_list(const std::string& repo, std::vector<HfFile>& files, std::string& c
         HfFile hf;
         hf.path = f.get_str("path", "");
         hf.size = (size_t)(f["lfs"].is_obj() ? f["lfs"].get_num("size", 0) : f.get_num("size", 0));
-        if (want_file(hf.path)) files.push_back(hf);
+        if (only_file.empty() ? want_file(hf.path) : hf.path == only_file) files.push_back(hf);
+    }
+    if (!only_file.empty()) {
+        if (files.empty()) { err = canonical + " has no file " + only_file; return false; }
+        return true;
     }
     bool st = false, tk = false;
     for (auto& f : files) { st |= ends_with(f.path, ".safetensors"); tk |= f.path == "tokenizer.json"; }
@@ -492,14 +507,14 @@ int do_pull(const std::string& ref_str, bool keep_download, const std::string& d
     PullLock lock(ref.name);
     LocalModel lm;
     if (find_local(ref.name, lm)) { logi("%s is up to date (%s)", ref.name.c_str(), lm.path.c_str()); return 0; }
-    std::string hf_dir = hf_cache_dir(ref.repo), canonical = ref.repo, dl_dir;
+    std::string hf_dir = ref.file.empty() ? hf_cache_dir(ref.repo) : std::string(), canonical = ref.repo, dl_dir;
     if (!hf_dir.empty()) logi("using Hugging Face cache %s", hf_dir.c_str());
     else {
         std::vector<HfFile> files;
         std::string err;
         logi("pulling manifest for %s", ref.repo.c_str());
-        if (!hf_list(ref.repo, files, canonical, err)) { loge("%s", err.c_str()); return 1; }
-        hf_dir = hf_cache_dir(canonical);
+        if (!hf_list(ref.repo, files, canonical, err, ref.file)) { loge("%s", err.c_str()); return 1; }
+        hf_dir = ref.file.empty() ? hf_cache_dir(canonical) : std::string();
         if (hf_dir.empty()) {
             size_t total = 0;
             for (auto& f : files) total += f.size;
@@ -519,11 +534,25 @@ int do_pull(const std::string& ref_str, bool keep_download, const std::string& d
     }
     mkdirs(models_dir());
     const std::string out = models_dir() + "/" + slug(ref.name) + ".tach";
-    logi("converting %s -> %s (%s%s)", canonical.c_str(), out.c_str(), ref.quant.c_str(),
-         ref.quant == "q8" ? "" : " + importance matrix");
+    const bool kquant = ref.quant == "q4_k_m" || ref.quant == "q5_k" || ref.quant == "q6_k" || ref.quant == "q8_0";   // no importance-matrix pass: fixed recipes
+    if (!ref.file.empty()) {
+        logi("importing %s/%s -> %s (%s, no requantization)", canonical.c_str(), ref.file.c_str(), out.c_str(), ref.quant.c_str());
+    }
+    if (ref.file.empty()) logi("converting %s -> %s (%s%s)", canonical.c_str(), out.c_str(), ref.quant.c_str(),
+         ref.quant == "q8" || kquant ? "" : " + importance matrix");
     const double t0 = now_sec();
     int rc;
-    if (ref.quant == "q8") {
+    if (!ref.file.empty()) {
+        std::vector<std::string> a = {"-i", hf_dir + "/" + ref.file, "-o", out};
+        std::vector<char*> av;
+        for (auto& x : a) av.push_back((char*)x.c_str());
+        rc = convert_main((int)av.size(), av.data());
+    } else if (kquant) {
+        std::vector<std::string> a = {"-i", hf_dir, "-o", out, "-q", ref.quant};
+        std::vector<char*> av;
+        for (auto& x : a) av.push_back((char*)x.c_str());
+        rc = convert_main((int)av.size(), av.data());
+    } else if (ref.quant == "q8") {
         std::vector<std::string> a = {hf_dir, out, "-q", "q8"};
         std::vector<char*> av;
         for (auto& x : a) av.push_back((char*)x.c_str());

@@ -10,6 +10,8 @@ Json LayerCfg::to_json() const {
     j.set("type", type);
     if (type == "attn") {
         j.set("n_heads", n_heads); j.set("n_kv_heads", n_kv_heads); j.set("head_dim", head_dim);
+        if(!rope_inv_freq.empty()){Json f=Json::array();for(float v:rope_inv_freq)f.push((double)v);j.set("rope_inv_freq",f);}
+        j.set("rope_mscale",(double)rope_mscale);
         j.set("rope_theta", (double)rope_theta); j.set("rope_half", rope_half); j.set("rope_rot", rope_rot);
         if (rope_den) j.set("rope_den", rope_den);
         j.set("window", window); j.set("qk_norm", qk_norm); j.set("v_norm", v_norm); j.set("attn_gate", attn_gate);
@@ -35,6 +37,8 @@ LayerCfg LayerCfg::from_json(const Json& j) {
     l.n_heads = (int)j.get_int("n_heads", 0); l.n_kv_heads = (int)j.get_int("n_kv_heads", 0); l.head_dim = (int)j.get_int("head_dim", 0);
     l.rope_theta = (float)j.get_num("rope_theta", 10000); l.rope_half = (int)j.get_int("rope_half", l.head_dim / 2);
     l.rope_rot = (int)j.get_int("rope_rot", l.rope_half);
+    for(auto& v:j["rope_inv_freq"].arr)l.rope_inv_freq.push_back(v.as_num());
+    l.rope_mscale=j.get_num("rope_mscale",1.0);
     l.rope_den = (int)j.get_int("rope_den", 0);
     l.window = (int)j.get_int("window", 0); l.qk_norm = (int)j.get_int("qk_norm", 0); l.v_norm = j.get_bool("v_norm", false);
     l.attn_gate = j.get_bool("attn_gate", false); l.k_eq_v = j.get_bool("k_eq_v", false);
@@ -53,6 +57,7 @@ LayerCfg LayerCfg::from_json(const Json& j) {
 
 Json ModelConfig::to_json() const {
     Json j = Json::object();
+    j.set("norm_groups",norm_groups);
     j.set("arch", arch);
     j.set("name", name);
     j.set("n_layers", n_layers);
@@ -93,6 +98,7 @@ Json ModelConfig::to_json() const {
 
 ModelConfig ModelConfig::from_json(const Json& j) {
     ModelConfig c;
+    c.norm_groups=j.get_int("norm_groups",1);
     c.arch = j.get_str("arch", "llama");
     c.name = j.get_str("name", "model");
     c.n_layers = (int)j.get_int("n_layers", 0);
@@ -122,6 +128,7 @@ ModelConfig ModelConfig::from_json(const Json& j) {
     c.final_softcap = (float)j.get_num("final_softcap", 0);
     c.stateful = j.get_bool("stateful", false);
     c.ple_dim = (int)j.get_int("ple_dim", 0);
+    if(c.norm_groups<1||c.norm_groups>32||c.hidden%c.norm_groups)die("invalid grouped RMSNorm geometry");
     if (j["layers"].is_arr()) {
         for (auto& l : j["layers"].arr) c.layers.push_back(LayerCfg::from_json(l));
     } else {
@@ -182,6 +189,9 @@ void ModelFile::open(const std::string& p) {
     for (auto& t : header_["tensors"].arr) {
         TensorInfo ti;
         ti.name = t.get_str("name", "");
+        ti.hadamard_block = (int)t.get_int("hadamard_block", 0);
+        ti.hadamard_inverse = t.get_bool("hadamard_inverse", false);
+        ti.hadamard_signs = t.get_str("hadamard_signs", "");
         ti.type = qtype_from_name(t.get_str("type", "f32"));
         ti.rows = file_size_value(t["rows"], "tensor rows");
         ti.cols = file_size_value(t["cols"], "tensor cols");
@@ -194,6 +204,9 @@ void ModelFile::open(const std::string& p) {
         size_t n = file_product(ti.rows, ti.cols, "tensor");
         file_product(n, 4, "tensor");  // bound all weight format size calculations
         int group = ti.type == QType::Q8 ? Q8_GROUP : ti.type == QType::Q4 || ti.type == QType::Q3 ? Q4_GROUP : 1;
+        if (qtype_packed(ti.type)) group = packed_group((int)ti.type);
+        if (ti.hadamard_block < 0 || (ti.hadamard_block && ((ti.hadamard_block & (ti.hadamard_block - 1)) || ti.cols % ti.hadamard_block)))
+            die("invalid Hadamard geometry for %s", ti.name.c_str());
         if (ti.cols % group || ti.data_bytes != qtype_data_bytes(ti.type, ti.rows, ti.cols) ||
             ti.scale_bytes != qtype_scale_bytes(ti.type, ti.rows, ti.cols))
             die("tensor %s byte size does not match shape/format", ti.name.c_str());
@@ -213,6 +226,12 @@ void ModelFile::open(const std::string& p) {
         bi.data = base + data_start + bi.offset;
         if (!blobs.emplace(bi.name, bi).second) die("duplicate blob %s", bi.name.c_str());
     }
+    for (auto& [name, t] : tensors) if (!t.hadamard_signs.empty()) {
+        const auto* b = blob(t.hadamard_signs);
+        if (!t.hadamard_block || b->size != (size_t)t.cols * 4) die("invalid Hadamard sign blob");
+        for (int i = 0; i < t.cols; i++) { float v; memcpy(&v, b->data + 4 * i, 4); if (v != 1.f && v != -1.f) die("invalid Hadamard sign value"); }
+    }
+
 }
 
 void ModelFile::validate_inference() const {
@@ -339,6 +358,7 @@ void ModelWriter::finish(Json header) {
         Json j = Json::object();
         j.set("name", t.name);
         j.set("type", qtype_name(t.type));
+        if (t.hadamard_block) { j.set("hadamard_block", t.hadamard_block); j.set("hadamard_inverse", t.hadamard_inverse); j.set("hadamard_signs", t.hadamard_signs); }
         j.set("rows", (int64_t)t.rows);
         j.set("cols", (int64_t)t.cols);
         j.set("offset", (uint64_t)t.offset);

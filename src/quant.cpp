@@ -126,8 +126,34 @@ static void quant_group_q4(const float* w, int n, uint8_t* q, float& s_out, floa
     else quant_group_q4_impl<false>(w, n, q, s_out, m_out, a, qmax);
 }
 
+// GGUF K-quant block encoders. Tensor metadata records the exact format; mixed recipes live in the converter.
+static void quantize_k(QType type,const float* src,int64_t cols,uint8_t* dst,const float* importance) {
+    if(cols%256)die("K-quants require a row width divisible by 256");
+    for(int64_t off=0;off<cols;off+=256){
+        uint8_t* p=dst+(off/256)*packed_bytes((int)type);memset(p,0,packed_bytes((int)type));const float* w=src+off;
+        if(type==QType::Q6_K){
+            float scales[16],largest=0;
+            for(int g=0;g<16;g++){float lo=0,hi=0;for(int i=0;i<16;i++){lo=std::min(lo,w[16*g+i]);hi=std::max(hi,w[16*g+i]);}scales[g]=std::max(-lo/32.f,hi/31.f);largest=std::max(largest,scales[g]);}
+            uint16_t dh=f2h(largest/127.f);memcpy(p+208,&dh,2);float d=h2f(dh);
+            for(int g=0;g<16;g++)p[192+g]=(uint8_t)std::clamp(d>0?(int)lrintf(scales[g]/d):0,0,127);
+            for(int i=0;i<256;i++){float s=d*p[192+i/16];int q=std::clamp(s>0?(int)lrintf(w[i]/s):0,-32,31)+32;int h=i/128,t=(i%128)/32,l=i%32;p[h*64+(t&1)*32+l]|=(q&15)<<(t<2?0:4);p[128+h*32+l]|=(q>>4)<<(2*t);}
+        }else if(type==QType::Q4_K){
+            float scales[8],mins[8],sd=0,md=0;
+            for(int g=0;g<8;g++){uint8_t q[32];float s,m;quant_group_q4(w+g*32,32,q,s,m,importance?importance+off+g*32:nullptr);scales[g]=s;mins[g]=std::max(0.f,-m);sd=std::max(sd,s);md=std::max(md,mins[g]);}
+            uint16_t h=f2h(sd/63.f);memcpy(p,&h,2);float d=h2f(h);h=f2h(md/63.f);memcpy(p+2,&h,2);float dm=h2f(h);uint8_t* codes=p+4;
+            for(int g=0;g<8;g++){int sc=std::clamp(d>0?(int)lrintf(scales[g]/d):0,0,63),mn=std::clamp(dm>0?(int)lrintf(mins[g]/dm):0,0,63);
+                if(g<4){codes[g]|=sc;codes[g+4]|=mn;}else{codes[g+4]|=(sc&15)|((mn&15)<<4);codes[g-4]|=(sc>>4)<<6;codes[g]|=(mn>>4)<<6;}
+                float s=d*sc,m=dm*mn;for(int j=0;j<32;j++){int i=32*g+j,q=std::clamp(s>0?(int)lrintf((w[i]+m)/s):0,0,15);p[16+(i/64)*32+i%32]|=q<<(i%64<32?0:4);}}
+        }
+    }
+}
+
 void quantize_row(QType t, const float* src, int64_t cols, uint8_t* dst, uint8_t* scales, const float* imp) {
+    if(t==QType::Q4_K||t==QType::Q6_K){quantize_k(t,src,cols,dst,imp);return;}
+    if(t==QType::Q8_0){for(int64_t off=0;off<cols;off+=32){uint8_t* p=dst+off/32*34;float peak=0;for(int i=0;i<32;i++)peak=std::max(peak,fabsf(src[off+i]));uint16_t h=f2h(peak/127.f);memcpy(p,&h,2);float d=h2f(h);for(int i=0;i<32;i++)p[2+i]=(uint8_t)(int8_t)std::clamp(d>0?(int)lrintf(src[off+i]/d):0,-127,127);}return;}
+    if(qtype_packed(t))die("format %s is import-only; do not requantize ternary or QAT checkpoints",qtype_name(t));
     switch (t) {
+        case QType::BF16: for(int64_t i=0;i<cols;i++){uint32_t u;memcpy(&u,src+i,4);((uint16_t*)dst)[i]=(u+0x7fff+((u>>16)&1))>>16;}break;
         case QType::F32: memcpy(dst, src, cols * 4); break;
         case QType::F16: {
             uint16_t* d = (uint16_t*)dst;
@@ -192,8 +218,10 @@ void quantize_row(QType t, const float* src, int64_t cols, uint8_t* dst, uint8_t
 }
 
 void dequantize_row(QType t, const uint8_t* data, const uint8_t* scales, int64_t cols, float* dst) {
+    if (qtype_packed(t)) { for (int64_t i = 0; i < cols; i++) dst[i] = packed_value((int)t, data, i); return; }
     switch (t) {
         case QType::F32: memcpy(dst, data, cols * 4); break;
+        case QType::BF16: for(int64_t i=0;i<cols;i++)dst[i]=bf2f(((const uint16_t*)data)[i]);break;
         case QType::F16: for (int64_t i = 0; i < cols; i++) dst[i] = h2f(((const uint16_t*)data)[i]); break;
         case QType::Q8: {
             const uint16_t* sc = (const uint16_t*)scales;
@@ -228,6 +256,7 @@ void dequantize_row(QType t, const uint8_t* data, const uint8_t* scales, int64_t
 void quantize_matrix(QType t, int64_t rows, int64_t cols,
                      const std::function<void(int64_t, float*)>& src_row,
                      std::vector<uint8_t>& data, std::vector<uint8_t>& scales, ThreadPool& pool, const float* imp) {
+    if(qtype_packed(t)&&cols%packed_group((int)t))die("invalid row width for %s",qtype_name(t));
     if ((t == QType::Q4 || t == QType::Q3) && cols % Q4_GROUP) die("q4 needs cols %% %d == 0 (got %lld)", Q4_GROUP, (long long)cols);
     if (t == QType::Q8 && cols % Q8_GROUP) die("q8 needs cols %% %d == 0", Q8_GROUP);
     size_t row_data = qtype_data_bytes(t, 1, cols), row_scale = qtype_scale_bytes(t, 1, cols);

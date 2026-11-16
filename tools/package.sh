@@ -61,6 +61,7 @@ done
 cp -LR "$cuda/include" "$stage/cuda/include"
 cp "$license" "$stage/share/licenses/CUDA-EULA.${license##*.}"
 cp LICENSE.txt "$stage/share/licenses/Tachyon-MIT.txt"
+cp src/vendor/jinja/LICENSE "$stage/share/licenses/Jinja-MIT.txt"
 cp README.md "$stage/README.md"
 printf '%s\n' "$version" > "$stage/VERSION"
 printf '%s\n' "$revision" > "$stage/COMMIT"

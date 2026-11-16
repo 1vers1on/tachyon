@@ -26,6 +26,7 @@ enum class ToolFormat {
     Lfm2,      // LFM2 / LFM2.5: <|tool_call_start|>[name(k='v', n=1)]<|tool_call_end|>
     Gemma4,    // <|tool_call>call:NAME{k:<|"|>v<|"|>}<tool_call|>
     Mistral,   // [TOOL_CALLS] [{"name": .., "arguments": ..}]
+    Ifm,       // K2 Horizon: <ifm|tool_calls> with XML arguments
     Generic,   // models without a native format: Hermes-style instructions in the system prompt
 };
 
@@ -82,6 +83,7 @@ private:
     bool thinking_ = false;
     std::string chat_format_ = "chatml";
     std::string chat_prefix_;
+    std::string native_template_;
     std::string tool_style_ = "json";
     ToolFormat tool_format_ = ToolFormat::Hermes;
     std::string render_generic_tools(const std::vector<ChatMessage>& msgs, bool add_gen, bool enable_thinking,

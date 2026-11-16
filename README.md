@@ -188,9 +188,13 @@ not supported. Other Ollama runtime options do not change the backend's server c
 | Qwen3 (dense and MoE) | `qwen3:0.6b` … `qwen3:14b`, `qwen3:32b`, `qwen3:30b-a3b` |
 | Qwen3.5 (Gated DeltaNet hybrid) | `qwen3.5:0.8b`, `2b`, `4b`, `9b` |
 | Qwen2 / Qwen2.5 | `qwen2.5:0.5b` … `32b`, `qwen2.5-coder:7b` … `32b`, `deepseek-r1:1.5b`, `7b` |
-| Gemma 3 / Gemma 4 | `gemma3:270m`, `gemma4:e2b`, `e4b`, `12b` |
+| Gemma 3 / Gemma 4 | `gemma3:270m`, `gemma4:e2b`, `e4b`, `12b`, `gemma4:12b-qat` (official QAT Q4_0, imported unchanged) |
 | Gemma (first generation) | `gemma:2b`, `gemma:7b` (gated) |
 | LFM2 / LFM2.5 (short-conv hybrid, MoE) | `lfm2.5:350m` … `2.6b`, `lfm2.5:8b-a1b` |
+| Ternary Bonsai 2 (Prism, Qwen3.5 hybrid) | `bonsai2:9b` (PQ2_0), `bonsai2:9b-ptq1_0`, `bonsai2:27b` (PTQ1_0); weights stay packed in VRAM |
+| MiMo V2.6 Distill Qwen | `mimo2.6:9b` (Q6_K; Qwen3.5 backend, MiMo template and `<tool_call><function=...>` tools) |
+| K2 Horizon (dense, grouped RMSNorm) | `k2-horizon:7b` (Q6_K); the MoE/MoVA members of the family are not supported |
+| Mellum 2.1 (MoE, 64 experts top-8) | `mellum2.1:12b-a2.5b` (Q4_K_M; 3 sliding + 1 global YaRN layer pattern) |
 | OLMoE | `olmoe:1b-7b` |
 | Llama / Mistral | `mistral:7b` (Llama 3.x is wired in but untested) |
 | Mixtral | `mixtral:8x7b`, `mixtral:8x22b` (large MoE models; require substantial system RAM) |
