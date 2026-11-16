@@ -68,7 +68,7 @@ printf '%s\n' "$version" > "$stage/VERSION"
 printf '%s\n' "$revision" > "$stage/COMMIT"
 
 # Record the actual glibc floor of this build, including bundled CUDA libraries.
-floor=$(find "$stage/bin" "$stage/libexec" "$stage/cuda/lib64" -type f -exec objdump -T {} + |
+floor=$(find "$stage/bin/tachyon" "$stage/bin/tachyon-client" "$stage/libexec" "$stage/cuda/lib64" -type f -exec objdump -T {} + |
     sed -n 's/.*(GLIBC_\([0-9][0-9.]*\)).*/\1/p' | sort -Vu | tail -1)
 [[ -n $floor ]] || { echo 'Cannot determine glibc requirement' >&2; exit 1; }
 printf '%s\n' "$floor" > "$stage/GLIBC_MIN"
