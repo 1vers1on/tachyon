@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include <stdexcept>
+#include <charconv>
 
 namespace {
 struct Parser {
@@ -65,7 +66,12 @@ struct Parser {
                             uint32_t lo;
                             if (!hex4(lo)) return false;
                             if (lo >= 0xDC00 && lo < 0xE000) cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                            else { put_utf8(o, 0xFFFD); cp = lo; }
+                            else {
+                                // Recover this high surrogate separately; the next escape
+                                // may itself begin a valid surrogate pair.
+                                p -= 6;
+                                cp = 0xFFFD;
+                            }
                         } else cp = 0xFFFD;
                     } else if (cp >= 0xDC00 && cp < 0xE000) cp = 0xFFFD;
                     put_utf8(o, cp);
@@ -165,7 +171,13 @@ void dump_num(std::string& o, double d) {
     if (std::isnan(d) || std::isinf(d)) { o += "null"; return; }
     char buf[64];
     if (fabs(d) < 9.007199254740992e15 && d == (double)(int64_t)d) snprintf(buf, sizeof buf, "%lld", (long long)d);
-    else snprintf(buf, sizeof buf, "%.9g", d);
+    else {
+        // The shortest representation that round-trips to the same double.
+        // Unlike printf, to_chars also ignores the process numeric locale.
+        auto result = std::to_chars(buf, buf + sizeof buf, d, std::chars_format::general);
+        o.append(buf, result.ptr - buf);
+        return;
+    }
     o += buf;
 }
 

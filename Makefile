@@ -77,10 +77,14 @@ $(BUILD)/quant-test: tests/quant_test.cpp $(BUILD)/quant.o
 $(BUILD)/text-test: tests/text_test.cpp $(BUILD)/tokenizer.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/sampler.o $(TEMPLATE_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
+$(BUILD)/json-test: tests/json_test.cpp $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
+
 $(BUILD)/http-probe: tests/http_probe.cpp $(BUILD)/http.o $(BUILD)/https.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
 
-test: tachyon $(CLIENT_OUT) $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/quant-test $(BUILD)/text-test $(BUILD)/http-probe
+test: tachyon $(CLIENT_OUT) $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/quant-test $(BUILD)/text-test $(BUILD)/http-probe $(BUILD)/json-test
+	$(BUILD)/json-test
 	python3 tests/file_test.py $(BUILD)/file-probe
 	$(BUILD)/kernel-test
 	$(BUILD)/quant-test
