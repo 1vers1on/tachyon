@@ -1,7 +1,12 @@
-// Tachyon - CPU backend (AVX-512 VNNI on Zen4 / Ice Lake+, with AVX2 fallbacks)
+// Tachyon - CPU backend (AVX-512 VNNI on Zen4 / Ice Lake+, AVX2 + FMA + F16C everywhere else)
 //
 // Weights: Q4 (asymmetric 4-bit, group 64) or Q8; activations are quantized on the fly to int8 with one
 // scale per 64 values, so the inner loop is u8 x s8 VPDPBUSD (4-bit weight nibbles are unsigned 0..15).
+// Without AVX-512 VNNI the same dot product is built from VPMADDUBSW + VPMADDWD.
+//
+// The instruction set is chosen at compile time from the -march flags (the default is -march=native), so a
+// binary runs only on CPUs that have what it was built for. To get the AVX2 path on an AVX-512 machine, add
+// -mno-avx512f to OPT, e.g. `make OPT="-O3 -march=native -mno-avx512f"`.
 #include "backend.h"
 #include "threadpool.h"
 #include "quant.h"
@@ -9,8 +14,12 @@
 #include <algorithm>
 #include <memory>
 
-#if !defined(__AVX512F__) || !defined(__AVX512VNNI__) || !defined(__AVX512BW__)
-#error "CPU backend currently requires AVX-512 (F/BW/VL/VNNI). Build with -march=native on a supported CPU."
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+#define TACH_AVX512 1
+#elif defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#define TACH_AVX512 0
+#else
+#error "CPU backend needs AVX2, FMA and F16C (Haswell / Zen 1 or newer); it uses AVX-512 VNNI when available. Build with -march=native."
 #endif
 
 namespace {
@@ -45,6 +54,25 @@ struct QAct {
         q = qbuf.data(); d = dbuf.data(); s = sbuf.data();
     }
 };
+
+inline float hsum(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+// 8 x int32 of sum(u[4i..4i+3] * s[4i..4i+3]), u unsigned 8-bit and s signed 8-bit
+inline __m256i dot_u8s8(__m256i u, __m256i s) {
+#if TACH_AVX512
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), u, s);
+#else
+    // VPMADDUBSW saturates its int16 pair sums, which cannot happen here: |u| <= 128 (|w| of a Q8 weight, or a
+    // Q4 nibble <= 15) and |s| <= 127 (quantized activations), so a pair sums to at most 128 * 127 * 2 = 32512.
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1));
+#endif
+}
+
+#if TACH_AVX512
 
 inline float hsum(__m512 v) { return _mm512_reduce_add_ps(v); }
 
@@ -101,6 +129,83 @@ inline void dot_q4(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, 
     for (int t = 0; t < T; t++) out[t] = hsum(acc[t]) + macc[t];
 }
 
+#else  // AVX2
+
+// quantize one row of K floats to int8 blocks of 64 (bit-identical to the AVX-512 version)
+void quantize_act_row(const float* x, int K, int8_t* q, float* d, float* s) {
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256i unscramble = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (int g = 0; g < K / CPU_ABLK; g++) {
+        const float* xp = x + g * CPU_ABLK;
+        __m256 v[8];
+        for (int j = 0; j < 8; j++) v[j] = _mm256_loadu_ps(xp + 8 * j);
+        __m256 m = _mm256_and_ps(v[0], abs_mask);
+        for (int j = 1; j < 8; j++) m = _mm256_max_ps(m, _mm256_and_ps(v[j], abs_mask));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+        float amax = _mm_cvtss_f32(m4);
+        float dd = amax / 127.f;
+        float inv = amax > 0 ? 127.f / amax : 0.f;
+        const __m256 vi = _mm256_set1_ps(inv);
+        __m256i iv[8];
+        for (int j = 0; j < 8; j++) iv[j] = _mm256_cvtps_epi32(_mm256_mul_ps(v[j], vi));
+        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(_mm256_add_epi32(iv[0], iv[1]), _mm256_add_epi32(iv[2], iv[3])),
+                                       _mm256_add_epi32(_mm256_add_epi32(iv[4], iv[5]), _mm256_add_epi32(iv[6], iv[7])));
+        __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(sum), _mm256_extracti128_si256(sum, 1));
+        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, _MM_SHUFFLE(1, 0, 3, 2)));
+        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, _MM_SHUFFLE(2, 3, 0, 1)));
+        int isum = _mm_cvtsi128_si32(s4);
+        // saturating narrow 32 -> 16 -> 8 bits; the 256-bit pack works per 128-bit lane, so put the dwords back in order
+        for (int h = 0; h < 2; h++) {
+            __m256i a = _mm256_packs_epi32(iv[4 * h], iv[4 * h + 1]);
+            __m256i b = _mm256_packs_epi32(iv[4 * h + 2], iv[4 * h + 3]);
+            __m256i c = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(a, b), unscramble);
+            _mm256_storeu_si256((__m256i*)(q + g * 64 + 32 * h), c);
+        }
+        d[g] = dd;
+        s[g] = dd * isum;
+    }
+}
+
+// ---- Q4 x int8 dot products for T tokens against one weight row ----
+template <int T>
+inline void dot_q4(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, int m0, float* out) {
+    const int G = K / 64;
+    __m256 acc[T];
+    float macc[T];
+    for (int t = 0; t < T; t++) { acc[t] = _mm256_setzero_ps(); macc[t] = 0; }
+    const __m256i mask = _mm256_set1_epi8(0x0F);
+    alignas(64) float sc[2 * 1024];
+    // convert half2 (scale,min) to float pairs
+    int g2 = 0;
+    for (; g2 + 8 <= 2 * G; g2 += 8) _mm256_store_ps(sc + g2, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(ws + g2))));
+    for (; g2 < 2 * G; g2++) sc[g2] = h2f(ws[g2]);
+    for (int g = 0; g < G; g++) {
+        // 32 bytes = two 32-element blocks; in each, byte j holds element j (low nibble) and j + 16 (high nibble)
+        __m256i v = _mm256_loadu_si256((const __m256i*)(wq + g * 32));
+        __m256i lo = _mm256_and_si256(v, mask);
+        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask);
+        __m256i w0 = _mm256_permute2x128_si256(lo, hi, 0x20);  // elements 0..31
+        __m256i w1 = _mm256_permute2x128_si256(lo, hi, 0x31);  // elements 32..63
+        const float sw = sc[2 * g], mw = sc[2 * g + 1];
+        for (int t = 0; t < T; t++) {
+            const int m = m0 + t;
+            const int8_t* xp = a.q + (size_t)m * K + g * 64;
+            __m256i x0 = _mm256_loadu_si256((const __m256i*)xp);
+            __m256i x1 = _mm256_loadu_si256((const __m256i*)(xp + 32));
+            // nibble (<= 15) x |x| (<= 127) pair sums are far below the int16 limit, so adding two of them is safe
+            __m256i p = _mm256_add_epi16(_mm256_maddubs_epi16(w0, x0), _mm256_maddubs_epi16(w1, x1));
+            __m256i is = _mm256_madd_epi16(p, _mm256_set1_epi16(1));
+            acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(is), _mm256_set1_ps(sw * a.d[(size_t)m * G + g]), acc[t]);
+            macc[t] += mw * a.s[(size_t)m * G + g];
+        }
+    }
+    for (int t = 0; t < T; t++) out[t] = hsum(acc[t]) + macc[t];
+}
+
+#endif
+
 template <int T>
 inline void dot_q8(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, int m0, float* out) {
     const int G = K / 32, GA = K / 64;
@@ -114,16 +219,14 @@ inline void dot_q8(const uint8_t* wq, const uint16_t* ws, int K, const QAct& a, 
             const int m = m0 + t;
             __m256i x = _mm256_loadu_si256((const __m256i*)(a.q + (size_t)m * K + g * 32));
             __m256i sx = _mm256_sign_epi8(x, w);
-            __m256i is = _mm256_dpbusd_epi32(_mm256_setzero_si256(), aw, sx);
+            __m256i is = dot_u8s8(aw, sx);
             acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(is), _mm256_set1_ps(sw * a.d[(size_t)m * GA + g / 2]), acc[t]);
         }
     }
-    for (int t = 0; t < T; t++) {
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc[t]), _mm256_extractf128_ps(acc[t], 1));
-        s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
-        out[t] = _mm_cvtss_f32(s);
-    }
+    for (int t = 0; t < T; t++) out[t] = hsum(acc[t]);
 }
+
+#if TACH_AVX512
 
 inline float dot_f16(const uint16_t* w, const float* x, int K) {
     __m512 acc = _mm512_setzero_ps();
@@ -152,6 +255,38 @@ inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
     }
     for (; i < n; i++) out[i] += scale * h2f(v[i]);
 }
+
+#else  // AVX2
+
+inline float dot_f16(const uint16_t* w, const float* x, int K) {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= K; i += 8)
+        acc = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(w + i))), _mm256_loadu_ps(x + i), acc);
+    float sum = hsum(acc);
+    for (; i < K; i++) sum += h2f(w[i]) * x[i];
+    return sum;
+}
+inline float dot_f32(const float* w, const float* x, int K) {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= K; i += 8) acc = _mm256_fmadd_ps(_mm256_loadu_ps(w + i), _mm256_loadu_ps(x + i), acc);
+    float sum = hsum(acc);
+    for (; i < K; i++) sum += w[i] * x[i];
+    return sum;
+}
+
+inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
+    const __m256 p = _mm256_set1_ps(scale);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 value = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(v + i)));
+        _mm256_storeu_ps(out + i, _mm256_fmadd_ps(p, value, _mm256_loadu_ps(out + i)));
+    }
+    for (; i < n; i++) out[i] += scale * h2f(v[i]);
+}
+
+#endif
 
 template <int T>
 inline void dot_rows(const QMat& W, int r, const QAct& a, int m0, float* out) {
@@ -197,11 +332,7 @@ void gemm_rows(const QMat& W, const QAct& a, float* y, int ldy, int r0, int r1) 
 
 // out = x / rms(x) * w   (w may be null: unweighted). In-place allowed.
 void rmsnorm(const float* x, const float* w, float* out, int n, float eps) {
-    __m512 acc = _mm512_setzero_ps();
-    int i = 0;
-    for (; i + 16 <= n; i += 16) { __m512 v = _mm512_loadu_ps(x + i); acc = _mm512_fmadd_ps(v, v, acc); }
-    float ss = hsum(acc);
-    for (; i < n; i++) ss += x[i] * x[i];
+    const float ss = dot_f32(x, x, n);
     const float sc = 1.f / sqrtf(ss / n + eps);
     for (int j = 0; j < n; j++) out[j] = x[j] * sc * (w ? w[j] : 1.f);
 }

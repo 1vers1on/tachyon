@@ -1,6 +1,6 @@
 # Tachyon
 
-A from-scratch LLM inference engine and server in C++, with hand-written CUDA and AVX-512 kernels.
+A from-scratch LLM inference engine and server in C++, with hand-written CUDA, AVX-512 and AVX2 kernels.
 
 Tachyon takes a Hugging Face checkpoint, quantizes it to its own `.tach` format, and serves it over
 OpenAI- and Anthropic-compatible HTTP APIs, with tool calling, so coding agents such as Claude Code can
@@ -35,8 +35,12 @@ repository.
 - Linux x86-64 (native or WSL2).
 - To build: `g++` 15 or newer (the CUDA kernels and calibration text are embedded with `#embed`) and the CUDA
   toolkit headers (`cuda.h`, `nvrtc.h`). Nothing is linked beyond the C/C++ runtime; `nvcc` is not used.
-- A CPU with AVX-512 (F/BW/VL/VNNI), such as Zen 4 or Ice Lake and newer. The CPU backend is always
-  compiled, so the build currently needs this even if you only use the GPU.
+- A CPU with AVX2, FMA and F16C (Haswell / Zen 1 or newer). The CPU backend is always compiled, so the build
+  needs this even if you only use the GPU. With AVX-512 (F/BW/VL/VNNI, such as Zen 4 or Ice Lake and newer) the
+  CPU backend uses the faster VNNI kernels; otherwise it uses AVX2 kernels. The choice is made at build time
+  from the compiler's `-march` (the Makefile default is `-march=native`), so a binary only runs on CPUs with the
+  instructions it was built for. To force the AVX2 kernels on an AVX-512 machine, for example to build a binary
+  that also runs on AVX2-only CPUs: `make OPT="-O3 -march=haswell"`.
 
 At runtime, everything else is optional and loaded only when used:
 
@@ -206,7 +210,7 @@ HF checkpoint ──convert──▶ .tach (Q4/Q8/Q3 weights, tokenizer, chat te
 HTTP (OpenAI / Anthropic) ─▶ server ─▶ engine (continuous batching, prefix cache, speculation)
                                               │
                                               ▼
-                                  backend: CUDA (NVRTC kernels) or CPU (AVX-512)
+                                  backend: CUDA (NVRTC kernels) or CPU (AVX-512 / AVX2)
 ```
 
 - **Decode** uses int8 activations and `dp4a` GEMVs, with RMSNorm, RoPE, SiLU and quantization fused into
@@ -243,7 +247,7 @@ need `torch` and `transformers`.
 
 ## Limitations
 
-- Linux only. The CUDA backend needs an Ampere-or-newer NVIDIA GPU, and the build needs an AVX-512 CPU.
+- Linux only. The CUDA backend needs an Ampere-or-newer NVIDIA GPU, and the build needs an AVX2 CPU (AVX-512 is faster).
 - There is no grammar-constrained decoding, so a model can still emit a malformed tool call. It is then
   returned as text.
 - Image inputs, logprobs and `n > 1` aren't supported.
