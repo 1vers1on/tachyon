@@ -6,11 +6,10 @@
 #include "backend.h"
 #include "quant.h"
 #include "cpu_moe.h"
-#include <cuda.h>
+#include "cuda_api.h"
 #include <deque>
 #include <thread>
 #include <atomic>
-#include <nvrtc.h>
 #include <map>
 #include <set>
 #include <memory>
@@ -19,12 +18,14 @@
 
 namespace {
 
+const CudaApi& dcu = cuda_api();
+
 static const char kKernelSource[] = {
 #embed "kernels/kernels.cu"
     , 0};
 
-#define CU(x) do { CUresult _e = (x); if (_e != CUDA_SUCCESS) { const char* s = nullptr; cuGetErrorString(_e, &s); die("CUDA error %s at %s:%d: %s", s ? s : "?", __FILE__, __LINE__, #x); } } while (0)
-#define NVRTC(x) do { nvrtcResult _e = (x); if (_e != NVRTC_SUCCESS) die("NVRTC error %s at %s:%d", nvrtcGetErrorString(_e), __FILE__, __LINE__); } while (0)
+#define CU(x) do { CUresult _e = (x); if (_e != CUDA_SUCCESS) { const char* s = nullptr; dcu.cuGetErrorString(_e, &s); die("CUDA error %s at %s:%d: %s", s ? s : "?", __FILE__, __LINE__, #x); } } while (0)
+#define NVRTC(x) do { nvrtcResult _e = (x); if (_e != NVRTC_SUCCESS) die("NVRTC error %s at %s:%d", dcu.nvrtcGetErrorString(_e), __FILE__, __LINE__); } while (0)
 
 constexpr int MAX_DEC = 16;     // max tokens on the GEMV (decode) path
 constexpr int MAX_LOGITS = 64;  // max logits rows per forward
@@ -79,40 +80,41 @@ public:
     const char* name() const override { return "cuda"; }
     ~CudaBackend() override {
         if (ctx_) {
-            cuCtxSynchronize();
-            for (auto& g : graphs_) if (g.second) cuGraphExecDestroy(g.second);
-            if (module_) cuModuleUnload(module_);
-            for (auto p : allocs_) cuMemFree(p);
-            if (h_batch_) cuMemFreeHost(h_batch_);
-            if (h_out_) cuMemFreeHost(h_out_);
-            if (h_moe_) cuMemFreeHost(h_moe_);
+            dcu.cuCtxSynchronize();
+            for (auto& g : graphs_) if (g.second) dcu.cuGraphExecDestroy(g.second);
+            if (module_) dcu.cuModuleUnload(module_);
+            for (auto p : allocs_) dcu.cuMemFree(p);
+            if (h_batch_) dcu.cuMemFreeHost(h_batch_);
+            if (h_out_) dcu.cuMemFreeHost(h_out_);
+            if (h_moe_) dcu.cuMemFreeHost(h_moe_);
             if (cm_thread_.joinable()) { cm_stop_ = true; cm_thread_.join(); }
-            if (stage_bytes_) for (auto& r : cmoe_->regions()) cuMemHostUnregister(r.first);
-            if (cm_hdr_) cuMemFreeHost((void*)cm_hdr_);
-            if (cm_buf_) cuMemFreeHost(cm_buf_);
-            cuDevicePrimaryCtxRelease(dev_);
+            if (stage_bytes_) for (auto& r : cmoe_->regions()) dcu.cuMemHostUnregister(r.first);
+            if (cm_hdr_) dcu.cuMemFreeHost((void*)cm_hdr_);
+            if (cm_buf_) dcu.cuMemFreeHost(cm_buf_);
+            dcu.cuDevicePrimaryCtxRelease(dev_);
         }
     }
 
     bool probe() {
-        if (cuInit(0) != CUDA_SUCCESS) return false;
+        if (!dcu.ok) return false;
+        if (dcu.cuInit(0) != CUDA_SUCCESS) return false;
         int n = 0;
-        if (cuDeviceGetCount(&n) != CUDA_SUCCESS || n == 0) return false;
+        if (dcu.cuDeviceGetCount(&n) != CUDA_SUCCESS || n == 0) return false;
         return true;
     }
 
     void init(const ModelFile& mf, const BackendOptions& o) override {
         opt = o;
         c_ = mf.config;
-        CU(cuDeviceGet(&dev_, o.device));
-        CU(cuDevicePrimaryCtxRetain(&ctx_, dev_));
-        CU(cuCtxSetCurrent(ctx_));
-        CU(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING));
+        CU(dcu.cuDeviceGet(&dev_, o.device));
+        CU(dcu.cuDevicePrimaryCtxRetain(&ctx_, dev_));
+        CU(dcu.cuCtxSetCurrent(ctx_));
+        CU(dcu.cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING));
         char name[256];
-        cuDeviceGetName(name, sizeof name, dev_);
-        CU(cuDeviceGetAttribute(&cc_major_, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev_));
-        CU(cuDeviceGetAttribute(&cc_minor_, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev_));
-        CU(cuDeviceGetAttribute(&n_sm_, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev_));
+        dcu.cuDeviceGetName(name, sizeof name, dev_);
+        CU(dcu.cuDeviceGetAttribute(&cc_major_, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev_));
+        CU(dcu.cuDeviceGetAttribute(&cc_minor_, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev_));
+        CU(dcu.cuDeviceGetAttribute(&n_sm_, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev_));
         if (cc_major_ < 8) die("CUDA backend needs compute capability >= 8.0 (got %d.%d)", cc_major_, cc_minor_);
         for (auto& l : c_.layers) {
             if (l.is_attn()) {
@@ -121,14 +123,14 @@ public:
             }
         }
         size_t free_b, total_b;
-        cuMemGetInfo(&free_b, &total_b);
+        dcu.cuMemGetInfo(&free_b, &total_b);
         logi("cuda: %s (sm_%d%d, %d SMs, %.1f/%.1f GB free)", name, cc_major_, cc_minor_, n_sm_, free_b / 1e9, total_b / 1e9);
         upload_weights(mf);
         alloc_caches();
         alloc_activations();
         compile_kernels();
         if (cmoe_) { cpu_moe_start(); stream_setup(); }
-        CU(cuStreamSynchronize(stream_));
+        CU(dcu.cuStreamSynchronize(stream_));
         if (getenv("TACH_KBENCH")) {
             int M = atoi(getenv("TACH_KBENCH")); if (M < 1) M = 1;
             int pos = getenv("TACH_KBENCH_POS") ? atoi(getenv("TACH_KBENCH_POS")) : 512;
@@ -141,7 +143,7 @@ public:
 
     void bind() {
         thread_local CUcontext bound = nullptr;
-        if (bound != ctx_) { CU(cuCtxSetCurrent(ctx_)); bound = ctx_; }
+        if (bound != ctx_) { CU(dcu.cuCtxSetCurrent(ctx_)); bound = ctx_; }
     }
 
     void forward(const std::vector<BatchToken>& batch) override {
@@ -158,7 +160,7 @@ public:
         // upload batch descriptor (pinned staging ring -> device). A staging buffer is reused only after the
         // async copy that last read it has completed.
         stage_ = (stage_ + 1) % NSTAGE;
-        CU(cuEventSynchronize(stage_ev_[stage_]));
+        CU(dcu.cuEventSynchronize(stage_ev_[stage_]));
         int* hb = h_batch_ + (size_t)stage_ * 4 * cap_;
         for (int i = 0; i < M; i++) {
             hb[i] = batch[i].token;
@@ -166,8 +168,8 @@ public:
             hb[2 * cap_ + i] = batch[i].slot;
         }
         for (int i = 0; i < n_logits_; i++) hb[3 * cap_ + i] = lrows_[i];
-        CU(cuMemcpyHtoDAsync(d_batch_, hb, 4 * cap_ * sizeof(int), stream_));
-        CU(cuEventRecord(stage_ev_[stage_], stream_));
+        CU(dcu.cuMemcpyHtoDAsync(d_batch_, hb, 4 * cap_ * sizeof(int), stream_));
+        CU(dcu.cuEventRecord(stage_ev_[stage_], stream_));
         if (prof_ && ++prof_count_ % prof_every_ == 0) prof_report();
         if (M <= MAX_DEC) {
             const bool graphable = opt.use_graphs && n_logits_ == M && !prof_;
@@ -175,16 +177,16 @@ public:
                 auto it = graphs_.find(M);
                 if (it == graphs_.end()) {
                     CUgraph g;
-                    CU(cuStreamBeginCapture(stream_, CU_STREAM_CAPTURE_MODE_RELAXED));
+                    CU(dcu.cuStreamBeginCapture(stream_, CU_STREAM_CAPTURE_MODE_RELAXED));
                     decode_pass(M);
-                    CU(cuStreamEndCapture(stream_, &g));
+                    CU(dcu.cuStreamEndCapture(stream_, &g));
                     CUgraphExec ge;
-                    CU(cuGraphInstantiate(&ge, g, 0));
-                    cuGraphDestroy(g);
+                    CU(dcu.cuGraphInstantiate(&ge, g, 0));
+                    dcu.cuGraphDestroy(g);
                     graphs_[M] = ge;
                     it = graphs_.find(M);
                 }
-                CU(cuGraphLaunch(it->second, stream_));
+                CU(dcu.cuGraphLaunch(it->second, stream_));
             } else {
                 decode_pass(M);
             }
@@ -198,16 +200,16 @@ public:
 
     void get_logits(int i, float* dst) override {
         bind();
-        CU(cuMemcpyDtoHAsync(h_out_, logits_ + (size_t)i * c_.vocab * 4, (size_t)c_.vocab * 4, stream_));
-        CU(cuStreamSynchronize(stream_));
+        CU(dcu.cuMemcpyDtoHAsync(h_out_, logits_ + (size_t)i * c_.vocab * 4, (size_t)c_.vocab * 4, stream_));
+        CU(dcu.cuStreamSynchronize(stream_));
         memcpy(dst, h_out_, (size_t)c_.vocab * 4);
     }
 
     void argmax_all(int* out) override {
         bind();
         launch(f_argmax_, D3(n_logits_), D3(1024), 0, logits_, c_.vocab, logit_rows(), d_argmax_);
-        CU(cuMemcpyDtoHAsync(h_out_, d_argmax_, n_logits_ * 4, stream_));
-        CU(cuStreamSynchronize(stream_));
+        CU(dcu.cuMemcpyDtoHAsync(h_out_, d_argmax_, n_logits_ * 4, stream_));
+        CU(dcu.cuStreamSynchronize(stream_));
         memcpy(out, h_out_, n_logits_ * 4);
     }
 
@@ -219,9 +221,9 @@ public:
         int* hc = (int*)h_out_;
         struct F2 { float x, y; };
         F2* hv = (F2*)(h_out_ + 64);
-        CU(cuMemcpyDtoHAsync(hc, d_ccount_, n * 4, stream_));
-        CU(cuMemcpyDtoHAsync(hv, d_cand_, (size_t)n * cap * 8, stream_));
-        CU(cuStreamSynchronize(stream_));
+        CU(dcu.cuMemcpyDtoHAsync(hc, d_ccount_, n * 4, stream_));
+        CU(dcu.cuMemcpyDtoHAsync(hv, d_cand_, (size_t)n * cap * 8, stream_));
+        CU(dcu.cuStreamSynchronize(stream_));
         out.assign(n, {});
         for (int r = 0; r < n; r++) {
             int k = std::min(hc[r], cap);
@@ -252,11 +254,11 @@ public:
             const LayerCfg& lc = L.c;
             if (lc.type == "conv") {
                 const size_t per = (size_t)(lc.conv_k - 1) * c_.hidden * 4;
-                CU(cuMemcpyDtoDAsync(L.st0 + slot * per, L.snap0 + row * per, per, stream_));
+                CU(dcu.cuMemcpyDtoDAsync(L.st0 + slot * per, L.snap0 + row * per, per, stream_));
             } else if (lc.type == "deltanet") {
                 const size_t p0 = (size_t)(lc.dn_conv - 1) * lc.dn_conv_dim() * 4, p1 = (size_t)lc.dn_nv * lc.dn_dk * lc.dn_dv * 4;
-                CU(cuMemcpyDtoDAsync(L.st0 + slot * p0, L.snap0 + row * p0, p0, stream_));
-                CU(cuMemcpyDtoDAsync(L.st1 + slot * p1, L.snap1 + row * p1, p1, stream_));
+                CU(dcu.cuMemcpyDtoDAsync(L.st0 + slot * p0, L.snap0 + row * p0, p0, stream_));
+                CU(dcu.cuMemcpyDtoDAsync(L.st1 + slot * p1, L.snap1 + row * p1, p1, stream_));
             }
         }
     }
@@ -267,8 +269,8 @@ public:
         for (auto& L : layers_) {
             const LayerCfg& lc = L.c;
             auto cp = [&](CUdeviceptr live, CUdeviceptr bak, size_t per) {
-                if (save) CU(cuMemcpyDtoDAsync(bak + slot * per, live + slot * per, per, stream_));
-                else CU(cuMemcpyDtoDAsync(live + slot * per, bak + slot * per, per, stream_));
+                if (save) CU(dcu.cuMemcpyDtoDAsync(bak + slot * per, live + slot * per, per, stream_));
+                else CU(dcu.cuMemcpyDtoDAsync(live + slot * per, bak + slot * per, per, stream_));
             };
             if (lc.type == "conv") cp(L.st0, L.bak0, (size_t)(lc.conv_k - 1) * c_.hidden * 4);
             else if (lc.type == "deltanet") {
@@ -283,16 +285,16 @@ public:
     void imat_flush() override {
         if (!g_imatrix) return;
         bind();
-        CU(cuStreamSynchronize(stream_));
+        CU(dcu.cuStreamSynchronize(stream_));
         for (auto& kv : imat_) {
             std::vector<float> h(kv.second.second);
-            CU(cuMemcpyDtoH(h.data(), kv.second.first, h.size() * 4));
+            CU(dcu.cuMemcpyDtoH(h.data(), kv.second.first, h.size() * 4));
             std::lock_guard<std::mutex> lk(g_imatrix->mu);
             auto& e = g_imatrix->acc[kv.first];
             if (e.first.empty()) e.first.assign(h.size(), 0.0);
             for (size_t i = 0; i < h.size(); i++) e.first[i] += h[i];
             e.second += imat_rows_;
-            CU(cuMemsetD8(kv.second.first, 0, h.size() * 4));
+            CU(dcu.cuMemsetD8(kv.second.first, 0, h.size() * 4));
         }
         imat_rows_ = 0;
     }
@@ -301,7 +303,7 @@ private:
     // ---------------------------------------------------------------------------------------------
     CUdeviceptr alloc(size_t n) {
         CUdeviceptr p;
-        CU(cuMemAlloc(&p, std::max<size_t>(n, 256)));
+        CU(dcu.cuMemAlloc(&p, std::max<size_t>(n, 256)));
         allocs_.push_back(p);
         return p;
     }
@@ -318,23 +320,23 @@ private:
         }
         if (prof_) {
             CUevent e0, e1;
-            cuEventCreate(&e0, 0); cuEventCreate(&e1, 0);
-            cuEventRecord(e0, stream_);
-            CU(cuLaunchKernel(f, g.x, g.y, g.z, b.x, b.y, b.z, smem, stream_, p, nullptr));
-            cuEventRecord(e1, stream_);
+            dcu.cuEventCreate(&e0, 0); dcu.cuEventCreate(&e1, 0);
+            dcu.cuEventRecord(e0, stream_);
+            CU(dcu.cuLaunchKernel(f, g.x, g.y, g.z, b.x, b.y, b.z, smem, stream_, p, nullptr));
+            dcu.cuEventRecord(e1, stream_);
             prof_events_.push_back({f, {e0, e1}});
             return;
         }
-        CU(cuLaunchKernel(f, g.x, g.y, g.z, b.x, b.y, b.z, smem, stream_, p, nullptr));
+        CU(dcu.cuLaunchKernel(f, g.x, g.y, g.z, b.x, b.y, b.z, smem, stream_, p, nullptr));
     }
     void prof_report() {
-        cuStreamSynchronize(stream_);
+        dcu.cuStreamSynchronize(stream_);
         std::map<CUfunction, std::pair<double, int>> agg;
         double tot = 0;
         for (auto& e : prof_events_) {
-            float ms; cuEventElapsedTime(&ms, e.second.first, e.second.second);
+            float ms; dcu.cuEventElapsedTime(&ms, e.second.first, e.second.second);
             agg[e.first].first += ms; agg[e.first].second++; tot += ms;
-            cuEventDestroy(e.second.first); cuEventDestroy(e.second.second);
+            dcu.cuEventDestroy(e.second.first); dcu.cuEventDestroy(e.second.second);
         }
         prof_events_.clear();
         std::map<CUfunction, std::string> names;
@@ -367,20 +369,20 @@ private:
             }
         }
         CUgraph g; CUgraphExec ge;
-        CU(cuStreamBeginCapture(stream_, CU_STREAM_CAPTURE_MODE_RELAXED));
+        CU(dcu.cuStreamBeginCapture(stream_, CU_STREAM_CAPTURE_MODE_RELAXED));
         decode_pass(M);
-        CU(cuStreamEndCapture(stream_, &g));
-        CU(cuGraphInstantiate(&ge, g, 0));
+        CU(dcu.cuStreamEndCapture(stream_, &g));
+        CU(dcu.cuGraphInstantiate(&ge, g, 0));
         if (!kskip_.empty()) fprintf(stderr, "[kbench] skipped %d kernels, kept %d\n", kskipped_, klaunched_);
-        for (int i = 0; i < 5; i++) CU(cuGraphLaunch(ge, stream_));
-        CU(cuStreamSynchronize(stream_));
-        CUevent e0, e1; cuEventCreate(&e0, 0); cuEventCreate(&e1, 0);
-        cuEventRecord(e0, stream_);
+        for (int i = 0; i < 5; i++) CU(dcu.cuGraphLaunch(ge, stream_));
+        CU(dcu.cuStreamSynchronize(stream_));
+        CUevent e0, e1; dcu.cuEventCreate(&e0, 0); dcu.cuEventCreate(&e1, 0);
+        dcu.cuEventRecord(e0, stream_);
         const int R = 100;
-        for (int i = 0; i < R; i++) CU(cuGraphLaunch(ge, stream_));
-        cuEventRecord(e1, stream_);
-        CU(cuEventSynchronize(e1));
-        float ms; cuEventElapsedTime(&ms, e0, e1);
+        for (int i = 0; i < R; i++) CU(dcu.cuGraphLaunch(ge, stream_));
+        dcu.cuEventRecord(e1, stream_);
+        CU(dcu.cuEventSynchronize(e1));
+        float ms; dcu.cuEventElapsedTime(&ms, e0, e1);
         ms /= R;
         fprintf(stderr, "[kbench] M=%d pos=%d full decode step: %.3f ms (%.1f tok/s)\n", M, pos, ms, M * 1000.f / ms);
         fprintf(stderr, "  weights %.0f MB -> effective %.0f GB/s\n", weight_bytes_ / 1e6, weight_bytes_ / 1e6 / ms);
@@ -407,7 +409,7 @@ private:
         int ncpu = opt.cpu_moe;
         if (ncpu < 0) {
             size_t free_b, total_b;
-            cuMemGetInfo(&free_b, &total_b);
+            dcu.cuMemGetInfo(&free_b, &total_b);
             size_t per_tok = 0, fixed = 0;
             for (auto& lc : c_.layers) {
                 if (!lc.is_attn() || lc.kv_src >= 0) continue;
@@ -449,15 +451,15 @@ private:
         CUdeviceptr base = alloc(total);
         size_t chunk = 64 << 20;
         void* pinned;
-        CU(cuMemAllocHost(&pinned, chunk));
+        CU(dcu.cuMemAllocHost(&pinned, chunk));
         size_t off = 0;
         auto up = [&](const uint8_t* src, size_t n) -> CUdeviceptr {
             CUdeviceptr dst = base + off;
             for (size_t done = 0; done < n; done += chunk) {
                 size_t k = std::min(chunk, n - done);
-                CU(cuStreamSynchronize(stream_));
+                CU(dcu.cuStreamSynchronize(stream_));
                 memcpy(pinned, src + done, k);
-                CU(cuMemcpyHtoDAsync(dst + done, pinned, k, stream_));
+                CU(dcu.cuMemcpyHtoDAsync(dst + done, pinned, k, stream_));
             }
             off += align_up(n, 256);
             return dst;
@@ -470,8 +472,8 @@ private:
             CUdeviceptr s = t.scale_bytes ? up(t.scales, t.scale_bytes) : 0;
             ptr[t.name] = {d, s};
         }
-        CU(cuStreamSynchronize(stream_));
-        cuMemFreeHost(pinned);
+        CU(dcu.cuStreamSynchronize(stream_));
+        dcu.cuMemFreeHost(pinned);
         weight_bytes_ = total;
         auto mat = [&](const std::string& n, bool req = true) {
             DMat m;
@@ -544,7 +546,7 @@ private:
     void alloc_caches() {
         // KV caches per attention layer (shared when kv_src >= 0), recurrent states per stateful layer
         size_t free_b, total_b;
-        cuMemGetInfo(&free_b, &total_b);
+        dcu.cuMemGetInfo(&free_b, &total_b);
         const size_t kv_elt = opt.kv_int8 ? 1 : 2;
         size_t per_tok = 0, state_bytes = 0, snap_bytes = 0;
         size_t ring_bytes = 0;  // sliding-window layers: fixed-size ring, independent of ctx
@@ -603,13 +605,13 @@ private:
                     L.kv_cap = lc.window > 0 ? std::min(opt.ctx, lc.window + opt.max_batch) : opt.ctx;
                     size_t n = (size_t)opt.n_slots * lc.n_kv_heads * L.kv_cap * lc.head_dim;
                     L.kc = alloc(n * kv_elt); L.vc = alloc(n * kv_elt);
-                    CU(cuMemsetD8Async(L.kc, 0, n * kv_elt, stream_));
-                    CU(cuMemsetD8Async(L.vc, 0, n * kv_elt, stream_));
+                    CU(dcu.cuMemsetD8Async(L.kc, 0, n * kv_elt, stream_));
+                    CU(dcu.cuMemsetD8Async(L.vc, 0, n * kv_elt, stream_));
                     if (opt.kv_int8) {
                         size_t ns = n / lc.head_dim;
                         L.ksc = alloc(ns * 4); L.vsc = alloc(ns * 4);
-                        CU(cuMemsetD8Async(L.ksc, 0, ns * 4, stream_));
-                        CU(cuMemsetD8Async(L.vsc, 0, ns * 4, stream_));
+                        CU(dcu.cuMemsetD8Async(L.ksc, 0, ns * 4, stream_));
+                        CU(dcu.cuMemsetD8Async(L.vsc, 0, ns * 4, stream_));
                     }
                 }
                 // rope table: pairs (i, i + rope_half); first rope_rot frequencies rotate
@@ -633,19 +635,19 @@ private:
                     inv[i] = f;
                 }
                 L.inv_freq = alloc(inv.size() * 4);
-                CU(cuMemcpyHtoD(L.inv_freq, inv.data(), inv.size() * 4));
+                CU(dcu.cuMemcpyHtoD(L.inv_freq, inv.data(), inv.size() * 4));
             } else if (lc.type == "conv") {
                 size_t n = (size_t)opt.n_slots * (lc.conv_k - 1) * c_.hidden * 4;
                 L.st0 = alloc(n);
-                CU(cuMemsetD8Async(L.st0, 0, n, stream_));
+                CU(dcu.cuMemsetD8Async(L.st0, 0, n, stream_));
                 if (opt.state_rollback) L.snap0 = alloc(SNAP_ROWS * (n / opt.n_slots));
                 if (opt.state_rollback || opt.state_backup) L.bak0 = alloc(n);
             } else {
                 size_t n0 = (size_t)opt.n_slots * (lc.dn_conv - 1) * lc.dn_conv_dim() * 4;
                 size_t n1 = (size_t)opt.n_slots * lc.dn_nv * lc.dn_dk * lc.dn_dv * 4;
                 L.st0 = alloc(n0); L.st1 = alloc(n1);
-                CU(cuMemsetD8Async(L.st0, 0, n0, stream_));
-                CU(cuMemsetD8Async(L.st1, 0, n1, stream_));
+                CU(dcu.cuMemsetD8Async(L.st0, 0, n0, stream_));
+                CU(dcu.cuMemsetD8Async(L.st1, 0, n1, stream_));
                 if (opt.state_rollback) { L.snap0 = alloc(SNAP_ROWS * (n0 / opt.n_slots)); L.snap1 = alloc(SNAP_ROWS * (n1 / opt.n_slots)); }
                 if (opt.state_rollback || opt.state_backup) { L.bak0 = alloc(n0); L.bak1 = alloc(n1); }
             }
@@ -688,7 +690,7 @@ private:
         part_o_ = alloc(parts * std::max(1, maxHD_) * 4);
         part_ml_ = alloc(parts * 8);
         counters_ = alloc((size_t)std::max(MAX_DEC, cap_) * std::max(1, maxNH_) * 4);
-        CU(cuMemsetD8(counters_, 0, (size_t)std::max(MAX_DEC, cap_) * std::max(1, maxNH_) * 4));
+        CU(dcu.cuMemsetD8(counters_, 0, (size_t)std::max(MAX_DEC, cap_) * std::max(1, maxNH_) * 4));
         logits_ = alloc((size_t)MAX_LOGITS * c_.vocab * 4);
         d_argmax_ = alloc(MAX_LOGITS * 4);
         d_rmax_ = alloc(MAX_LOGITS * 4);
@@ -718,14 +720,14 @@ private:
             moe_w_ = alloc(P * 4);
             moe_rows_ = alloc(P * 4);
             moe_rw_ = alloc(P * 4);
-            CU(cuMemAllocHost((void**)&h_moe_, P * 16 + 4096));
+            CU(dcu.cuMemAllocHost((void**)&h_moe_, P * 16 + 4096));
         }
-        CU(cuMemAllocHost((void**)&h_batch_, NSTAGE * 4 * cap_ * sizeof(int)));
+        CU(dcu.cuMemAllocHost((void**)&h_batch_, NSTAGE * 4 * cap_ * sizeof(int)));
         for (int i = 0; i < NSTAGE; i++) {
-            CU(cuEventCreate(&stage_ev_[i], CU_EVENT_DISABLE_TIMING));
-            CU(cuEventRecord(stage_ev_[i], stream_));
+            CU(dcu.cuEventCreate(&stage_ev_[i], CU_EVENT_DISABLE_TIMING));
+            CU(dcu.cuEventRecord(stage_ev_[i], stream_));
         }
-        CU(cuMemAllocHost((void**)&h_out_, std::max((size_t)c_.vocab * 4, (size_t)MAX_DEC * CAND_CAP * 8) + 4096));
+        CU(dcu.cuMemAllocHost((void**)&h_out_, std::max((size_t)c_.vocab * 4, (size_t)MAX_DEC * CAND_CAP * 8) + 4096));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -770,9 +772,9 @@ private:
             "--gpu-architecture=sm_" + std::to_string(cc_major_) + std::to_string(cc_minor_),
             "-std=c++17", "-default-device", "--extra-device-vectorization",
             getenv("TACH_PTXAS_V") ? "--ptxas-options=-v" : "-DTACH_NOP",
-            "-I/usr/local/cuda/include",
             "-DHID=" + std::to_string(H), "-DEPS=" + std::to_string(c_.rms_eps) + "f", "-DEQ=" + std::to_string(qt_code(embd_.t)),
         };
+        if (!dcu.cuda_dir.empty()) opts.push_back("-I" + dcu.cuda_dir + "/include");   // cuda_fp16.h if NVRTC lacks it built in
         if (c_.act == "gelu") opts.push_back("-DACT_GELU=1");
         if (opt.kv_int8) opts.push_back("-DKV8=1");
         if (getenv("TACH_GEMM_F16ACC")) opts.push_back("-DGEMM_F16ACC=1");
@@ -839,7 +841,7 @@ private:
         for (auto& o : opts) key += "|" + o;
         for (auto& n : names) key += "|" + n;
         int nv_major = 0, nv_minor = 0;
-        nvrtcVersion(&nv_major, &nv_minor);
+        dcu.nvrtcVersion(&nv_major, &nv_minor);
         key += "|nvrtc" + std::to_string(nv_major) + "." + std::to_string(nv_minor);
         char hash[32];
         snprintf(hash, sizeof hash, "%016llx", (unsigned long long)fnv1a64(key.data(), key.size()));
@@ -858,54 +860,54 @@ private:
         } else {
             double t0 = now_sec();
             nvrtcProgram prog;
-            NVRTC(nvrtcCreateProgram(&prog, kKernelSource, "kernels.cu", 0, nullptr, nullptr));
-            for (auto& n : names) NVRTC(nvrtcAddNameExpression(prog, n.c_str()));
+            NVRTC(dcu.nvrtcCreateProgram(&prog, kKernelSource, "kernels.cu", 0, nullptr, nullptr));
+            for (auto& n : names) NVRTC(dcu.nvrtcAddNameExpression(prog, n.c_str()));
             std::vector<const char*> co;
             for (auto& o : opts) co.push_back(o.c_str());
-            nvrtcResult r = nvrtcCompileProgram(prog, (int)co.size(), co.data());
+            nvrtcResult r = dcu.nvrtcCompileProgram(prog, (int)co.size(), co.data());
             size_t logn;
-            nvrtcGetProgramLogSize(prog, &logn);
+            dcu.nvrtcGetProgramLogSize(prog, &logn);
             if (logn > 1) {
                 std::string log(logn, '\0');
-                nvrtcGetProgramLog(prog, &log[0]);
+                dcu.nvrtcGetProgramLog(prog, &log[0]);
                 if (r != NVRTC_SUCCESS || g_log_level >= 2) fprintf(stderr, "%s\n", log.c_str());
             }
             if (r != NVRTC_SUCCESS) die("kernel compilation failed");
             size_t n;
-            NVRTC(nvrtcGetCUBINSize(prog, &n));
+            NVRTC(dcu.nvrtcGetCUBINSize(prog, &n));
             cubin.resize(n);
-            NVRTC(nvrtcGetCUBIN(prog, &cubin[0]));
+            NVRTC(dcu.nvrtcGetCUBIN(prog, &cubin[0]));
             Json nj = Json::object();
             for (auto& nm : names) {
                 const char* low;
-                NVRTC(nvrtcGetLoweredName(prog, nm.c_str(), &low));
+                NVRTC(dcu.nvrtcGetLoweredName(prog, nm.c_str(), &low));
                 lowered[nm] = low;
                 nj.set(nm, std::string(low));
             }
-            nvrtcDestroyProgram(&prog);
+            dcu.nvrtcDestroyProgram(&prog);
             FILE* f = fopen(cubin_path.c_str(), "wb");
             if (f) { fwrite(cubin.data(), 1, cubin.size(), f); fclose(f); }
             f = fopen(names_path.c_str(), "wb");
             if (f) { std::string s = nj.dump(); fwrite(s.data(), 1, s.size(), f); fclose(f); }
             logi("cuda: compiled %zu kernel instantiations in %.1fs (cached)", names.size(), now_sec() - t0);
         }
-        CU(cuModuleLoadData(&module_, cubin.data()));
+        CU(dcu.cuModuleLoadData(&module_, cubin.data()));
         auto fn = [&](const std::string& n) {
             CUfunction f;
             auto it = lowered.find(n);
-            CU(cuModuleGetFunction(&f, module_, it != lowered.end() ? it->second.c_str() : n.c_str()));
+            CU(dcu.cuModuleGetFunction(&f, module_, it != lowered.end() ? it->second.c_str() : n.c_str()));
             return f;
         };
         int max_pro_smem = 8 * H + 8 * (H / 32) * 8;
         for (auto& n : names) {
             CUfunction f = fn(n);
             funcs_[n] = f;
-            if (n.rfind("gemm<", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gemm_smem()));
-            if (n.rfind("gemv_tc", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, TC_SMEM));
-            if (n.rfind("gemv2", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_pro_smem));
-            if (n.rfind("dn_prep", 0) == 0) CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DN_PREP_SMEM));
+            if (n.rfind("gemm<", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gemm_smem()));
+            if (n.rfind("gemv_tc", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, TC_SMEM));
+            if (n.rfind("gemv2", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_pro_smem));
+            if (n.rfind("dn_prep", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DN_PREP_SMEM));
             if (n.rfind("flash_", 0) == 0)
-                CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, flash_smem(atoi(n.c_str() + n.find('<') + 1))));
+                CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, flash_smem(atoi(n.c_str() + n.find('<') + 1))));
         }
         f_embed_ = fn("embed");
         f_rms_q8_ = fn("rmsnorm_q8");
@@ -955,7 +957,7 @@ private:
         auto it = occ_.find(key);
         if (it != occ_.end()) return it->second;
         int nb = 1;
-        CU(cuOccupancyMaxActiveBlocksPerMultiprocessor(&nb, f, threads, smem));
+        CU(dcu.cuOccupancyMaxActiveBlocksPerMultiprocessor(&nb, f, threads, smem));
         if (nb < 1) nb = 1;
         occ_[key] = nb;
         return nb;
@@ -979,7 +981,7 @@ private:
         if (epi != 2) {
             const int nch = K / 256;
             while (tiles * nsplit < 2 * slots && nsplit * 2 <= nch) nsplit *= 2;
-            if (epi == 0 && nsplit > 1) CU(cuMemsetD32Async(y, 0, (size_t)M * N, stream_));
+            if (epi == 0 && nsplit > 1) CU(dcu.cuMemsetD32Async(y, 0, (size_t)M * N, stream_));
         }
         const int units = tiles * nsplit;
         launch(f, D3(std::min(units, slots)), D3(128), TC_SMEM, W.d, W.s, N, M, nsplit, xq, xds, y, bias, oq, ods);
@@ -1010,7 +1012,7 @@ private:
             if (getenv("TACH_GEMV_LOG")) {
                 static std::set<std::pair<CUfunction, int>> seen;
                 if (seen.insert({f, N}).second) {
-                    int regs = 0; cuFuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, f);
+                    int regs = 0; dcu.cuFuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, f);
                     fprintf(stderr, "[gemv] q%d K=%d N=%d M=%d pro=%d epi=%d: regs %d occ %d blk/SM, rows/warp %d, grid %d\n", qt_code(W.t), K, N, mm, pro, epi, regs, occupancy(f, smem), rpw, (wtot + 7) / 8);
                 }
             }
@@ -1191,15 +1193,15 @@ private:
         cm_out_off_ = align_up(P * 8 + (size_t)cap_ * H * 2, 256);
         const size_t bytes = cm_out_off_ + (size_t)cap_ * H * 4;
         void* hp;
-        CU(cuMemHostAlloc(&hp, 4096, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
+        CU(dcu.cuMemHostAlloc(&hp, 4096, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
         memset(hp, 0, 4096);
         cm_hdr_ = (volatile int*)hp;
-        CU(cuMemHostGetDevicePointer(&cm_hdr_d_, hp, 0));
-        CU(cuMemHostAlloc(&hp, bytes, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
+        CU(dcu.cuMemHostGetDevicePointer(&cm_hdr_d_, hp, 0));
+        CU(dcu.cuMemHostAlloc(&hp, bytes, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
         cm_buf_ = (uint8_t*)hp;
-        CU(cuMemHostGetDevicePointer(&cm_buf_d_, hp, 0));
+        CU(dcu.cuMemHostGetDevicePointer(&cm_buf_d_, hp, 0));
         cm_counter_ = alloc(4);
-        CU(cuMemsetD32(cm_counter_, 0, 1));
+        CU(dcu.cuMemsetD32(cm_counter_, 0, 1));
         cm_thread_ = std::thread([this] {
             int last = 0;
             double idle_since = now_sec();
@@ -1240,43 +1242,43 @@ private:
         }
         size_t pinned = 0;
         for (auto& r : cmoe_->regions()) {
-            if (cuMemHostRegister(r.first, r.second, CU_MEMHOSTREGISTER_PORTABLE) != CUDA_SUCCESS) {
+            if (dcu.cuMemHostRegister(r.first, r.second, CU_MEMHOSTREGISTER_PORTABLE) != CUDA_SUCCESS) {
                 logi("cuda: could not page-lock expert memory; prefill computes RAM-resident experts on the CPU");
-                for (auto& r2 : cmoe_->regions()) { if (r2.first == r.first) break; cuMemHostUnregister(r2.first); }
+                for (auto& r2 : cmoe_->regions()) { if (r2.first == r.first) break; dcu.cuMemHostUnregister(r2.first); }
                 stream_experts_ = false;
                 return;
             }
             pinned += r.second;
         }
         size_t free_b, total_b;
-        cuMemGetInfo(&free_b, &total_b);
+        dcu.cuMemGetInfo(&free_b, &total_b);
         if (free_b < 2 * need + (256ull << 20)) {
             logi("cuda: no VRAM left for expert streaming buffers; prefill computes RAM-resident experts on the CPU");
-            for (auto& r : cmoe_->regions()) cuMemHostUnregister(r.first);
+            for (auto& r : cmoe_->regions()) dcu.cuMemHostUnregister(r.first);
             stream_experts_ = false;
             return;
         }
         stage_bytes_ = need;
         for (int i = 0; i < 2; i++) {
             xstage_[i] = alloc(need);
-            CU(cuEventCreate(&stage_ready_[i], CU_EVENT_DISABLE_TIMING));
-            CU(cuEventCreate(&stage_free_[i], CU_EVENT_DISABLE_TIMING));
-            CU(cuEventRecord(stage_free_[i], stream_));
+            CU(dcu.cuEventCreate(&stage_ready_[i], CU_EVENT_DISABLE_TIMING));
+            CU(dcu.cuEventCreate(&stage_free_[i], CU_EVENT_DISABLE_TIMING));
+            CU(dcu.cuEventRecord(stage_free_[i], stream_));
         }
-        CU(cuStreamCreate(&cstream_, CU_STREAM_NON_BLOCKING));
+        CU(dcu.cuStreamCreate(&cstream_, CU_STREAM_NON_BLOCKING));
         logi("cuda: prefill streams RAM-resident experts (2 x %.0f MB staging, %.1f GB page-locked)", need / 1e6, pinned / 1e9);
     }
     // enqueue the copy of layer l's experts into staging buffer b (after its previous user finished)
     void stage_issue(int b, int l) {
         const DLayer& L = layers_[l];
-        CU(cuStreamWaitEvent(cstream_, stage_free_[b], 0));
+        CU(dcu.cuStreamWaitEvent(cstream_, stage_free_[b], 0));
         size_t off = 0;
         for (int w = 0; w < 2; w++) {
             auto h = cmoe_->mat(L.cpu_moe, w);
-            CU(cuMemcpyHtoDAsync(xstage_[b] + off, h.d, h.db, cstream_)); off += align_up(h.db, 256);
-            CU(cuMemcpyHtoDAsync(xstage_[b] + off, h.s, h.sb, cstream_)); off += align_up(h.sb, 256);
+            CU(dcu.cuMemcpyHtoDAsync(xstage_[b] + off, h.d, h.db, cstream_)); off += align_up(h.db, 256);
+            CU(dcu.cuMemcpyHtoDAsync(xstage_[b] + off, h.s, h.sb, cstream_)); off += align_up(h.sb, 256);
         }
-        CU(cuEventRecord(stage_ready_[b], cstream_));
+        CU(dcu.cuEventRecord(stage_ready_[b], cstream_));
         stage_layer_[b] = l;
     }
     int next_cpu_moe_layer(int after) const {
@@ -1294,7 +1296,7 @@ private:
     }
     void moe_streamed(const DLayer& L, int l, int M, const std::string& bp) {
         const int b = stage_layer_[0] == l ? 0 : 1;
-        CU(cuStreamWaitEvent(stream_, stage_ready_[b], 0));
+        CU(dcu.cuStreamWaitEvent(stream_, stage_ready_[b], 0));
         DLayer S = L;
         size_t off = 0;
         auto h0 = cmoe_->mat(L.cpu_moe, 0), h1 = cmoe_->mat(L.cpu_moe, 1);
@@ -1303,7 +1305,7 @@ private:
         S.wdown_e.t = h1.t; S.wdown_e.rows = h1.rows; S.wdown_e.cols = h1.cols; S.wdown_e.d = xstage_[b] + off; off += align_up(h1.db, 256);
         S.wdown_e.s = xstage_[b] + off;
         moe_prefill(S, M, bp);
-        CU(cuEventRecord(stage_free_[b], stream_));
+        CU(dcu.cuEventRecord(stage_free_[b], stream_));
         // refill this buffer with the layer after the one in the other buffer
         const int nxt = next_cpu_moe_layer(std::max(stage_layer_[0], stage_layer_[1]));
         if (nxt >= 0) stage_issue(b, nxt); else stage_layer_[b] = -1;
@@ -1360,7 +1362,7 @@ private:
         auto it = imat_.find(name);
         if (it == imat_.end()) {
             CUdeviceptr p = alloc((size_t)K * 4);
-            CU(cuMemsetD8Async(p, 0, (size_t)K * 4, stream_));
+            CU(dcu.cuMemsetD8Async(p, 0, (size_t)K * 4, stream_));
             it = imat_.emplace(name, std::make_pair(p, K)).first;
         }
         launch(f_colsq_, D3((K + 255) / 256), D3(256), 0, A, M, K, it->second.first);
@@ -1471,9 +1473,9 @@ private:
                L.expert_bias, lc.norm_topk ? 1 : 0, lc.routed_scale, moe_ids_, moe_w_);
         int* hid = (int*)h_moe_;
         float* hw = (float*)(h_moe_ + (size_t)M * K * 4);
-        CU(cuMemcpyDtoHAsync(hid, moe_ids_, (size_t)M * K * 4, stream_));
-        CU(cuMemcpyDtoHAsync(hw, moe_w_, (size_t)M * K * 4, stream_));
-        CU(cuStreamSynchronize(stream_));
+        CU(dcu.cuMemcpyDtoHAsync(hid, moe_ids_, (size_t)M * K * 4, stream_));
+        CU(dcu.cuMemcpyDtoHAsync(hw, moe_w_, (size_t)M * K * 4, stream_));
+        CU(dcu.cuStreamSynchronize(stream_));
         std::vector<std::vector<std::pair<int, float>>> per(E);
         for (int m = 0; m < M; m++)
             for (int k = 0; k < K; k++) per[hid[m * K + k]].push_back({m, hw[m * K + k]});
@@ -1485,11 +1487,11 @@ private:
             spans[e] = {off, (int)per[e].size()};
             for (auto& t : per[e]) { hrows[off] = t.first; hrw[off] = t.second; off++; }
         }
-        CU(cuMemcpyHtoDAsync(moe_rows_, hrows, (size_t)off * 4, stream_));
-        CU(cuMemcpyHtoDAsync(moe_rw_, hrw, (size_t)off * 4, stream_));
+        CU(dcu.cuMemcpyHtoDAsync(moe_rows_, hrows, (size_t)off * 4, stream_));
+        CU(dcu.cuMemcpyHtoDAsync(moe_rw_, hrw, (size_t)off * 4, stream_));
         // gathered normalized activations [pairs][H] (fp16), expert outputs accumulate into tmp_ (zeroed)
         launch(f_gather_, D3(off), D3(256), 0, ha_, moe_rows_, H, hb_);
-        CU(cuMemsetD32Async(tmp_, 0, (size_t)M * H, stream_));
+        CU(dcu.cuMemsetD32Async(tmp_, 0, (size_t)M * H, stream_));
         const size_t gu_bytes = (size_t)off * F_ * 2;
         CUdeviceptr act = ha_ + 0;  // reuse ha_ after gather: [pairs][F] fp16 (ha_ is sized for pairs x max K)
         (void)gu_bytes;
@@ -1550,6 +1552,14 @@ private:
 };
 
 }  // namespace
+
+std::string cuda_backend_error() {
+    if (!dcu.ok) return dcu.error;
+    int n = 0;
+    if (CUresult r = dcu.cuInit(0); r != CUDA_SUCCESS) { const char* m = nullptr; dcu.cuGetErrorString(r, &m); return std::string("cuInit failed: ") + (m ? m : "?"); }
+    if (dcu.cuDeviceGetCount(&n) != CUDA_SUCCESS || n == 0) return "no CUDA device found";
+    return "";
+}
 
 Backend* create_cuda_backend() {
     auto* b = new CudaBackend();

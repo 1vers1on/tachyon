@@ -56,4 +56,5 @@ public:
 };
 
 Backend* create_cpu_backend();
-Backend* create_cuda_backend();
+Backend* create_cuda_backend();   // nullptr when no usable driver/NVRTC/device
+std::string cuda_backend_error(); // why create_cuda_backend() returned nullptr

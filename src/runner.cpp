@@ -9,6 +9,7 @@
 #include "json.h"
 #include "http.h"
 #include "model_file.h"
+#include "https.h"
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -23,6 +24,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <glob.h>
+#include <ftw.h>
 #include <map>
 #include <mutex>
 #include <condition_variable>
@@ -266,33 +268,34 @@ std::string self_exe() {
     ssize_t n = readlink("/proc/self/exe", b, sizeof b - 1);
     if (n <= 0) return "tachyon";
     b[n] = 0;
-    return b;
+    // the binary was replaced (rebuilt / upgraded) while this process runs: use the new file at the same path
+    std::string p = b;
+    if (ends_with(p, " (deleted)") && is_file(p.substr(0, p.size() - 10))) p.resize(p.size() - 10);
+    return p;
 }
 
-// run a program (no shell); returns exit status. Output goes to `out` when given, else inherited.
-int run_prog(const std::vector<std::string>& argv, std::string* out = nullptr) {
-    int pipefd[2] = {-1, -1};
-    if (out && pipe(pipefd) != 0) return -1;
+// run a program (no shell) with stdout and stderr redirected to the file `log`; returns its exit status
+int run_prog(const std::vector<std::string>& argv, const std::string& log) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        if (out) { dup2(pipefd[1], 1); close(pipefd[0]); close(pipefd[1]); }
+        int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) _exit(127);
+        dup2(fd, 1); dup2(fd, 2); close(fd);
         std::vector<char*> av;
         for (auto& a : argv) av.push_back((char*)a.c_str());
         av.push_back(nullptr);
-        execvp(av[0], av.data());
+        execv(av[0], av.data());
         _exit(127);
-    }
-    if (out) {
-        close(pipefd[1]);
-        char buf[65536];
-        ssize_t n;
-        while ((n = read(pipefd[0], buf, sizeof buf)) > 0) out->append(buf, n);
-        close(pipefd[0]);
     }
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+// rm -rf
+void remove_tree(const std::string& dir) {
+    nftw(dir.c_str(), [](const char* p, const struct stat*, int, struct FTW*) { return remove(p); }, 16, FTW_DEPTH | FTW_PHYS);
 }
 
 // ------------------------------------------------------------------------------------------------ Hugging Face
@@ -315,23 +318,12 @@ std::string hf_token() {
     return "";
 }
 
-// curl header file holding the token (keeps it out of the process list)
-struct AuthHeader {
-    std::string path;
-    AuthHeader() {
-        std::string t = hf_token();
-        if (t.empty()) return;
-        mkdirs(home_dir());
-        path = home_dir() + "/.hf-auth-" + std::to_string(getpid());
-        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0) { path.clear(); return; }
-        std::string h = "Authorization: Bearer " + t + "\n";
-        if (write(fd, h.data(), h.size()) != (ssize_t)h.size()) {}
-        close(fd);
-    }
-    ~AuthHeader() { if (!path.empty()) unlink(path.c_str()); }
-    void add(std::vector<std::string>& a) const { if (!path.empty()) { a.push_back("-H"); a.push_back("@" + path); } }
-};
+HttpGetOptions hf_opts() {
+    HttpGetOptions o;
+    std::string t = hf_token();
+    if (!t.empty()) o.auth = "Bearer " + t;   // sent to huggingface.co only, not to the CDN it redirects to
+    return o;
+}
 
 bool want_file(const std::string& f) {
     if (f.find('/') != std::string::npos) return false;
@@ -364,15 +356,15 @@ std::string hf_cache_dir(const std::string& repo) {
 struct HfFile { std::string path; size_t size = 0; };
 
 bool hf_list(const std::string& repo, std::vector<HfFile>& files, std::string& canonical, std::string& err) {
-    AuthHeader auth;
     std::string out;
-    std::vector<std::string> a = {"curl", "-sSL", "--retry", "3", "-w", "\n%{http_code}"};
-    auth.add(a);
-    a.push_back("https://huggingface.co/api/models/" + repo);
-    if (run_prog(a, &out) != 0) { err = "cannot reach huggingface.co (is curl installed and the network up?)"; return false; }
-    size_t nl = out.rfind('\n');
-    int code = atoi(out.c_str() + nl + 1);
-    out.resize(nl);
+    HttpGetResult r;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        r = http_get_string("https://huggingface.co/api/models/" + repo, hf_opts(), out);
+        if (r.status > 0 && r.status < 500) break;
+        sleep(1 + attempt);
+    }
+    if (r.status < 0) { err = "cannot reach huggingface.co: " + r.error; return false; }
+    int code = r.status;
     if (code == 401 || code == 404) { err = "model " + repo + " not found on Hugging Face (or private: set HF_TOKEN)"; return false; }
     if (code != 200) { err = "Hugging Face API returned HTTP " + std::to_string(code); return false; }
     Json j = Json::parse(out);
@@ -381,11 +373,8 @@ bool hf_list(const std::string& repo, std::vector<HfFile>& files, std::string& c
         if (hf_token().empty()) { err = canonical + " is gated: accept its license on https://huggingface.co/" + canonical + " and set HF_TOKEN"; return false; }
     }
     // sizes come from the tree listing
-    out.clear();
-    a = {"curl", "-sSfL", "--retry", "3"};
-    auth.add(a);
-    a.push_back("https://huggingface.co/api/models/" + canonical + "/tree/main");
-    if (run_prog(a, &out) != 0) { err = "cannot list files of " + canonical + " (gated? accept the license and set HF_TOKEN)"; return false; }
+    r = http_get_string("https://huggingface.co/api/models/" + canonical + "/tree/main", hf_opts(), out);
+    if (r.status != 200) { err = "cannot list files of " + canonical + " (gated? accept the license and set HF_TOKEN)"; return false; }
     Json t = Json::parse(out);
     for (auto& f : t.arr) {
         if (f.get_str("type", "") != "file") continue;
@@ -401,25 +390,73 @@ bool hf_list(const std::string& repo, std::vector<HfFile>& files, std::string& c
     return true;
 }
 
+// one file to dst + ".part" (resumed when present), with retries; renamed to dst when complete
+bool hf_fetch(const std::string& url, const std::string& dst, size_t expect, std::string& err) {
+    const std::string part = dst + ".part";
+    const bool tty = isatty(2);
+    bool ok = false;
+    for (int attempt = 0; attempt < 6 && !ok; attempt++) {
+        if (attempt) { fprintf(stderr, "retrying (%s)\n", err.c_str()); sleep(2 * attempt); }
+        HttpGetOptions o = hf_opts();
+        o.range_from = (int64_t)file_size(part);
+        if (expect && (size_t)o.range_from == expect) { ok = true; break; }   // complete from an earlier run
+        if (expect && (size_t)o.range_from > expect) { unlink(part.c_str()); o.range_from = 0; }
+        FILE* f = nullptr;
+        std::string werr;
+        size_t have = 0, start = 0;
+        double t0 = now_sec(), last = 0;
+        auto progress = [&](bool final) {
+            double t = now_sec();
+            if (!tty || !f || (!final && t - last < 0.25)) return;
+            double rate = (have - start) / std::max(t - t0, 1e-3);
+            if (expect) fprintf(stderr, "\r  %5.1f%%  %s / %s  %s/s   ", 100.0 * have / expect, human((double)have).c_str(), human((double)expect).c_str(), human(rate).c_str());
+            else fprintf(stderr, "\r  %s  %s/s   ", human((double)have).c_str(), human(rate).c_str());
+            if (final) fprintf(stderr, "\n");
+            last = t;
+        };
+        HttpGetResult r = http_get(url, o, [&](const char* p, size_t n) {
+            if (!f) return true;   // error page: ignore the body
+            if (fwrite(p, 1, n, f) != n) { werr = "cannot write " + part; return false; }
+            have += n;
+            progress(false);
+            return true;
+        }, [&](const HttpGetResult& h) {
+            const bool resumed = o.range_from > 0 && h.status == 206;
+            if (h.status == 200 || resumed) {   // a 200 to a range request means the server restarted from 0
+                f = fopen(part.c_str(), resumed ? "ab" : "wb");
+                if (!f) werr = "cannot write " + part;
+                have = start = resumed ? (size_t)o.range_from : 0;
+            }
+        });
+        progress(true);
+        if (f && fclose(f) != 0) werr = "cannot write " + part;
+        if (!werr.empty()) { err = werr; return false; }   // local disk problem: retrying will not help
+        if (r.status == 401 || r.status == 403 || r.status == 404) { err = "HTTP " + std::to_string(r.status) + " for " + url; return false; }
+        if (r.status == 416 && expect && file_size(part) == expect) { ok = true; break; }   // nothing left to fetch
+        if (!r.error.empty()) err = r.error;
+        else if (r.status != 200 && r.status != 206) err = "HTTP " + std::to_string(r.status) + " for " + url;
+        else if (expect && file_size(part) != expect) err = "incomplete download (" + human((double)file_size(part)) + " of " + human((double)expect) + ")";
+        else ok = true;
+    }
+    if (!ok) return false;
+    if (rename(part.c_str(), dst.c_str()) != 0) { err = "cannot write " + dst; return false; }
+    return true;
+}
+
 bool hf_download(const std::string& repo, const std::vector<HfFile>& files, const std::string& dir, std::string& err) {
-    AuthHeader auth;
     mkdirs(dir);
     size_t total = 0;
     for (auto& f : files) total += f.size;
-    size_t done = 0;
     for (size_t i = 0; i < files.size(); i++) {
         const HfFile& f = files[i];
         std::string dst = dir + "/" + f.path;
-        if (is_file(dst) && (f.size == 0 || file_size(dst) == f.size)) { done += f.size; continue; }
+        if (is_file(dst) && (f.size == 0 || file_size(dst) == f.size)) continue;
         fprintf(stderr, "pulling %s (%zu/%zu, %s)\n", f.path.c_str(), i + 1, files.size(), human((double)f.size).c_str());
-        std::vector<std::string> a = {"curl", "-fL", "--retry", "5", "--retry-delay", "2", "-C", "-", "-o", dst + ".part"};
-        a.push_back(isatty(2) ? "--progress-bar" : "-sS");
-        auth.add(a);
-        a.push_back("https://huggingface.co/" + repo + "/resolve/main/" + f.path);
-        int rc = run_prog(a);
-        if (rc != 0) { err = "download of " + f.path + " failed (curl exit " + std::to_string(rc) + ")"; return false; }
-        if (rename((dst + ".part").c_str(), dst.c_str()) != 0) { err = "cannot write " + dst; return false; }
-        done += f.size;
+        std::string e;
+        if (!hf_fetch("https://huggingface.co/" + repo + "/resolve/main/" + f.path, dst, f.size, e)) {
+            err = "download of " + f.path + " failed: " + e;
+            return false;
+        }
     }
     fprintf(stderr, "downloaded %s\n", human((double)total).c_str());
     return true;
@@ -492,7 +529,7 @@ int do_pull(const std::string& ref_str, bool keep_download, const std::string& d
     }
     if (rc != 0 || !is_file(out)) { fprintf(stderr, "error: conversion failed\n"); return 1; }
     write_manifest(ref.name, out, canonical, ref.quant);
-    if (!dl_dir.empty() && !keep_download) run_prog({"rm", "-rf", dl_dir});
+    if (!dl_dir.empty() && !keep_download) remove_tree(dl_dir);
     fprintf(stderr, "success: %s (%s) ready in %.0fs\n", ref.name.c_str(), human((double)file_size(out)).c_str(), now_sec() - t0);
     return 0;
 }
@@ -691,7 +728,7 @@ private:
             logi("pulling %s", name.c_str());
             std::string log = home_dir() + "/logs/pull-" + slug(parse_ref(name).name) + ".log";
             mkdirs(home_dir() + "/logs");
-            int rc = run_prog({"sh", "-c", "exec \"$0\" pull \"$1\" > \"$2\" 2>&1", self_exe(), name, log});
+            int rc = run_prog({self_exe(), "pull", name}, log);
             if (rc == 0 && find_local(name, m)) return true;
             err = "pulling " + name + " failed: " + tail_file(log, 400);
             return false;
@@ -893,7 +930,7 @@ private:
             Json st = Json::object();
             st.set("status", "pulling " + name);
             c.chunk(st.dump() + "\n");
-            int rc = run_prog({"sh", "-c", "exec \"$0\" pull \"$1\" > \"$2\" 2>&1", self_exe(), name, log});
+            int rc = run_prog({self_exe(), "pull", name}, log);
             Json fin = Json::object();
             if (rc == 0) fin.set("status", "success");
             else fin.set("error", tail_file(log, 600));

@@ -1,19 +1,18 @@
 # Tachyon build. Host code is plain C++ (g++). CUDA kernels are compiled at runtime by NVRTC,
 # so no nvcc / host-compiler compatibility is needed.
-comma    := ,
 CXX      ?= g++
 CUDA     ?= /usr/local/cuda
 OPT      ?= -O3 -march=native -mtune=native
 CXXFLAGS ?= $(OPT) -std=gnu++23 -g -Wall -Wno-unused-function -Wno-sign-compare -Wno-unused-variable -Wno-array-bounds -fno-math-errno -pthread
-INCS     := -I$(CUDA)/include -Isrc
-# WSL2 keeps libcuda in /usr/lib/wsl/lib; add it only when present
-WSLLIB   := $(wildcard /usr/lib/wsl/lib)
-LDCUDA   := -L$(CUDA)/lib64 $(addprefix -L,$(WSLLIB)) -Wl,-rpath,$(CUDA)/lib64 $(addprefix -Wl$(comma)-rpath$(comma),$(WSLLIB)) -lcuda -lnvrtc
+INCS     := -I$(CUDA)/include -Isrc -DTACH_CUDA_DIR='"$(CUDA)"'
+# libcuda and libnvrtc are loaded at runtime (src/cuda_api.cpp): only the CUDA headers are needed to build, and the
+# binary runs on the CPU backend where no NVIDIA driver is installed
+LDCUDA   := -ldl
 
 BUILD ?= build
 OUT ?= tachyon
-CORE_SRCS := src/json.cpp src/http.cpp src/chat.cpp src/runner.cpp src/model_file.cpp src/safetensors.cpp src/quant.cpp src/convert.cpp src/tokenizer.cpp \
-             src/cpu_backend.cpp src/cuda_backend.cpp src/sampler.cpp src/engine.cpp src/server.cpp src/main.cpp
+CORE_SRCS := src/json.cpp src/http.cpp src/https.cpp src/chat.cpp src/runner.cpp src/model_file.cpp src/safetensors.cpp src/quant.cpp src/convert.cpp src/tokenizer.cpp \
+             src/cpu_backend.cpp src/cuda_api.cpp src/cuda_backend.cpp src/sampler.cpp src/engine.cpp src/server.cpp src/main.cpp
 CORE_OBJS := $(CORE_SRCS:src/%.cpp=$(BUILD)/%.o)
 
 all: tachyon tachyon-client
@@ -45,7 +44,7 @@ test: $(BUILD)/file-probe $(BUILD)/kernel-test
 	python3 tests/file_test.py $(BUILD)/file-probe
 	$(BUILD)/kernel-test
 
-$(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
+$(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/cuda_api.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
 
 # Optional reference tests: needs torch, transformers, numpy and safetensors (no downloads).

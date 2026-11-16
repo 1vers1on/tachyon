@@ -16,7 +16,7 @@ void Engine::load(const std::string& path, const EngineOptions& o) {
         if (b) { be.reset(b); dev = "cuda"; }
     } else if (dev == "cuda") {
         Backend* b = create_cuda_backend();
-        if (!b) die("CUDA backend unavailable");
+        if (!b) die("CUDA backend unavailable: %s", cuda_backend_error().c_str());
         be.reset(b);
     }
     if (dev == "cpu") be.reset(create_cpu_backend());

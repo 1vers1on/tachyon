@@ -33,12 +33,18 @@ repository.
 ## Requirements
 
 - Linux x86-64 (native or WSL2).
-- `g++` 15 or newer (the CUDA kernels and calibration text are embedded with `#embed`).
-- CUDA toolkit headers, `libcuda` and `libnvrtc` (developed with CUDA 12.6). `nvcc` is not used. On WSL2 the Makefile also picks up `/usr/lib/wsl/lib`.
-- An NVIDIA GPU with compute capability 8.0 or higher (Ampere or newer) for the CUDA backend.
+- To build: `g++` 15 or newer (the CUDA kernels and calibration text are embedded with `#embed`) and the CUDA
+  toolkit headers (`cuda.h`, `nvrtc.h`). Nothing is linked beyond the C/C++ runtime; `nvcc` is not used.
 - A CPU with AVX-512 (F/BW/VL/VNNI), such as Zen 4 or Ice Lake and newer. The CPU backend is always
   compiled, so the build currently needs this even if you only use the GPU.
-- `curl` for `tachyon pull`.
+
+At runtime, everything else is optional and loaded only when used:
+
+- **GPU inference:** the NVIDIA driver (`libcuda`), `libnvrtc` from a CUDA toolkit (developed with 12.6), and a
+  GPU with compute capability 8.0 or higher (Ampere or newer). Without them, `--device auto` uses the CPU.
+  Set `CUDA_PATH` or `TACHYON_NVRTC=/path/to/libnvrtc.so` if `libnvrtc` isn't on the library path.
+- **`tachyon pull`:** the system OpenSSL library (`libssl.so.3` or `1.1`), present on virtually every
+  distribution, for HTTPS. Certificates are verified against the system CA bundle (`SSL_CERT_FILE` overrides it).
 
 ## Build
 
