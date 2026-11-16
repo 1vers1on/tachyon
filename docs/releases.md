@@ -49,9 +49,11 @@ official glibc 2.28 baseline:
 ```bash
 docker run --rm -v "$PWD:/src" -w /src \
   nvidia/cuda:12.6.3-devel-rockylinux8 \
-  bash -lc 'dnf install -y git gcc-toolset-12-gcc-c++ gcc-toolset-12-libstdc++-devel make python3.11 tar gzip binutils findutils &&
+  bash -lc 'dnf install -y git gcc-toolset-12-gcc-c++ gcc-toolset-12-libstdc++-devel make python3.11 tar gzip binutils findutils curl &&
     ln -sf /usr/bin/python3.11 /usr/local/bin/python3 &&
-    source /opt/rh/gcc-toolset-12/enable && tools/package.sh'
+    source /opt/rh/gcc-toolset-12/enable && mkdir -p build &&
+    curl -fsSL https://docs.nvidia.com/cuda/archive/12.6.3/eula/index.html -o build/CUDA-EULA.html &&
+    CUDA_EULA=build/CUDA-EULA.html tools/package.sh'
 ```
 
 Use a clean checkout when building published assets; `COMMIT` records the checkout's HEAD.
