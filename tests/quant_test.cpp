@@ -6,6 +6,22 @@
 int g_log_level = 0;
 
 int main() {
+    // Exhaust every base-3 byte value at every PTQ layout position, including
+    // the four-trit tail, negative/zero/subnormal scales and adjacent blocks.
+    std::vector<uint8_t> ptq(256 * 28), pq(256 * 34);
+    for (int b = 0; b < 256; b++) {
+        for (int j = 0; j < 26; j++) ptq[b*28+j] = uint8_t(b + j*37);
+        uint16_t scale = b % 3 == 0 ? 0x8001 : b % 3 == 1 ? 0x3800 : 0x8000;
+        memcpy(ptq.data()+b*28+26, &scale, 2);
+    }
+    repack_ptq1_to_pq2(ptq.data(), pq.data(), 256);
+    float a[128], b[128];
+    for (int i=0;i<256;i++) {
+        dequantize_row(QType::PTQ1_0, ptq.data()+i*28, nullptr, 128, a);
+        dequantize_row(QType::PQ2_0, pq.data()+i*34, nullptr, 128, b);
+        assert(memcmp(a,b,sizeof a)==0);
+        assert(memcmp(ptq.data()+i*28+26,pq.data()+i*34,2)==0);
+    }
     constexpr int rows = 37, cols = 128;
     std::vector<float> weights(rows * cols), importance(cols);
     uint32_t state = 0x12345678;

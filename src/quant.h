@@ -30,3 +30,7 @@ struct IMatrix {
     static std::map<std::string, std::vector<float>> load(const std::string& path);
 };
 extern IMatrix* g_imatrix;
+
+// Lossless layout conversion: blocks of 128 weights, 28-byte PTQ1 -> 34-byte PQ2.
+// src/dst must not overlap. Scales are copied bit for bit.
+void repack_ptq1_to_pq2(const uint8_t* src, uint8_t* dst, size_t blocks);

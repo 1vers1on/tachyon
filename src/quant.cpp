@@ -1,6 +1,7 @@
 #include "quant.h"
 #include "threadpool.h"
 #include <atomic>
+#include <array>
 #include <algorithm>
 
 // Asymmetric 4-bit quantization of one group with least-squares refinement of (scale, min).
@@ -341,4 +342,29 @@ std::map<std::string, std::vector<float>> IMatrix::load(const std::string& path)
         r[name] = v;
     }
     return r;
+}
+
+void repack_ptq1_to_pq2(const uint8_t* src, uint8_t* dst, size_t blocks) {
+    // Five trits in separate bytes allow four source bytes to be packed together.
+    static const auto table = [] {
+        std::array<uint64_t, 256> t{};
+        for (int v = 0; v < 256; v++) {
+            int factor = 1;
+            for (int k = 0; k < 5; k++, factor *= 3)
+                t[v] |= uint64_t((((v * factor) & 255) * 3) >> 8) << (8 * k);
+        }
+        return t;
+    }();
+    for (size_t b = 0; b < blocks; b++, src += 28, dst += 34) {
+        dst[0] = src[26]; dst[1] = src[27];
+        for (int g = 0; g < 6; g++) {
+            uint64_t codes = table[src[4*g]] | (table[src[4*g+1]] << 2) |
+                             (table[src[4*g+2]] << 4) | (table[src[4*g+3]] << 6);
+            for (int k = 0; k < 5; k++)
+                dst[2 + (g < 4 ? g + 4*k : 20 + g-4 + 2*k)] = uint8_t(codes >> (8*k));
+        }
+        uint64_t tail = table[src[24]] | (table[src[25]] << 2);
+        dst[32] = uint8_t(tail & 15) | uint8_t((tail >> 4) & 240);
+        dst[33] = uint8_t((tail >> 16) & 15) | uint8_t((tail >> 20) & 240);
+    }
 }

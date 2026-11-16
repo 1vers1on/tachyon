@@ -1184,7 +1184,8 @@ struct AttnArgs {
 };
 // G = query heads handled per CTA (a divisor of the GQA ratio, <= 4) to bound shared memory / registers.
 // blockIdx.x = kv_head * (gqa / G) + sub-group.
-template <int HD, int GQA, int SPLITS, int OUT_F16>
+// OUT_TYPE: 0 int8 plus scales, 1 fp16, 2 fp32 (oh points to float storage).
+template <int HD, int GQA, int SPLITS, int OUT_TYPE>
 __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
     const int gqa_full = a.nh / a.nkv;
     const int ngroups = gqa_full / GQA;
@@ -1364,7 +1365,9 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
         const int head = head0 + g;
         if (a.gate) v *= 1.f / (1.f + __expf(-a.gate[(size_t)m * a.nrows + head * a.qstride + HD + d]));
         const int col = head * HD + d;
-        if (OUT_F16) {
+        if (OUT_TYPE == 2) {
+            ((float*)a.oh)[(size_t)m * QD + col] = v;
+        } else if (OUT_TYPE == 1) {
             a.oh[(size_t)m * QD + col] = __float2half(v);
         } else {
             const float amax = warp_max(fabsf(v));
@@ -2270,7 +2273,7 @@ extern "C" __global__ void __launch_bounds__(256) moe_route(const float* __restr
 }
 
 // Indirect GEMV over expert matrices: pair p uses expert ids[p] (rows [e*N, (e+1)*N)) and activation row
-// p / act_div. y[p][row] = W_e[row] . act. grid (ceil(N/8), P), block 256 (one warp per row)
+// p / act_div. y[p][row] = W_e[row] . act. grid (ceil(N/32), P), block 256 (four rows per warp)
 template <int QT, int K>
 __global__ void __launch_bounds__(256) gemv_ind(const uint8_t* __restrict__ W, const void* __restrict__ S, int N, const int* __restrict__ ids,
                                                 int act_div, const int8_t* __restrict__ xq, const float2* __restrict__ xds, float* __restrict__ y) {
@@ -2462,18 +2465,81 @@ extern "C" __global__ void packed_prepare(const float* x,const float* norm,const
         __syncthreads();
     }
 }
+// Keep the first five butterfly stages in warp registers. Higher stages
+// exchange through shared memory; the operation order matches the scalar FWHT.
+__device__ void packed_butterfly(float* v, int K, int B) {
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float a = v[i];
+        for (int stride = 1; stride < 32; stride *= 2) {
+            float b = __shfl_xor_sync(0xffffffff, a, stride);
+            a = (i & stride) ? b - a : a + b;
+        }
+        v[i] = a;
+    }
+    __syncthreads();
+    for (int stride = 32; stride < B; stride *= 2) {
+        for (int pair = threadIdx.x; pair < K / 2; pair += blockDim.x) {
+            int i = (pair / stride) * (2 * stride) + pair % stride;
+            float a = v[i], b = v[i + stride];
+            v[i] = a + b; v[i + stride] = a - b;
+        }
+        __syncthreads();
+    }
+}
 extern "C" __global__ void packed_fwht(const void* input,void* output,int K,int B,const float* signs,
         int input_half,int output_half,int inverse) {
     extern __shared__ float v[];
     const int off=blockIdx.x*B;const size_t base=(size_t)blockIdx.y*K+off;
     for(int i=threadIdx.x;i<B;i+=blockDim.x){float x=input_half?__half2float(((const half*)input)[base+i]):((const float*)input)[base+i];v[i]=x*(!inverse&&signs?signs[off+i]:1.f);}
     __syncthreads();
-    for(int stride=1;stride<B;stride*=2){
+    if (B >= 32) packed_butterfly(v, B, B);
+    else for(int stride=1;stride<B;stride*=2){
         for(int pair=threadIdx.x;pair<B/2;pair+=blockDim.x){int i=(pair/stride)*(2*stride)+pair%stride;float a=v[i],b=v[i+stride];v[i]=a+b;v[i+stride]=a-b;}
         __syncthreads();
     }
     float scale=rsqrtf(float(B));
     for(int i=threadIdx.x;i<B;i+=blockDim.x){float x=v[i]*scale*(inverse&&signs?signs[off+i]:1.f);if(output_half)((half*)output)[base+i]=__float2half_rn(x);else((float*)output)[base+i]=x;}
+}
+// One CTA per token combines input preparation and all independent rotations.
+// The host limits K so this shared buffer fits without opt-in shared memory.
+extern "C" __global__ void packed_prepare_fwht(const float* x,const float* norm,const int* rows,
+        const int8_t* xq,const float2* ds,float* out,int K,int pro,int B,const float* signs,int inverse) {
+    extern __shared__ float v[];
+    __shared__ float reduction[8];
+    const int m=blockIdx.x,r=rows?rows[m]:m,width=K/NORM_GROUPS;
+    if (pro) {
+        for (int g=0;g<NORM_GROUPS;g++) {
+            float sum=0;
+            for(int j=threadIdx.x;j<width;j+=blockDim.x){float a=x[(size_t)r*K+g*width+j];sum+=a*a;}
+            sum=warp_sum(sum);if(threadIdx.x%32==0)reduction[threadIdx.x/32]=sum;__syncthreads();
+            float inv=0;for(int i=0;i<8;i++)inv+=reduction[i];inv=rsqrtf(inv/width+EPS);
+            for(int j=threadIdx.x;j<width;j+=blockDim.x){int i=g*width+j;v[i]=x[(size_t)r*K+i]*inv*(norm?norm[i]:1.f);}
+            __syncthreads();
+        }
+    } else {
+        for(int i=threadIdx.x;i<K;i+=blockDim.x)v[i]=float(xq[(size_t)m*K+i])*ds[(size_t)m*(K/32)+i/32].x;
+        __syncthreads();
+    }
+    if(!inverse&&signs)for(int i=threadIdx.x;i<K;i+=blockDim.x)v[i]*=signs[i];
+    __syncthreads();
+    packed_butterfly(v,K,B);
+    float scale=rsqrtf(float(B));
+    for(int i=threadIdx.x;i<K;i+=blockDim.x)out[(size_t)m*K+i]=v[i]*scale*(inverse&&signs?signs[i]:1.f);
+}
+// Fuse gate activation with the following down-projection rotation.
+extern "C" __global__ void packed_act_fwht(const float* gu, float* out, int K, int B,
+                                          const float* signs, int inverse) {
+    extern __shared__ float v[];
+    const int off = blockIdx.x * B;
+    const size_t base = (size_t)blockIdx.y * K + off;
+    for (int i=threadIdx.x;i<B;i+=blockDim.x) {
+        float a=act_fn(gu[2*(base+i)])*gu[2*(base+i)+1];
+        v[i]=a*(!inverse&&signs?signs[off+i]:1.f);
+    }
+    __syncthreads();
+    packed_butterfly(v,B,B);
+    float scale=rsqrtf(float(B));
+    for(int i=threadIdx.x;i<B;i+=blockDim.x)out[base+i]=v[i]*scale*(inverse&&signs?signs[off+i]:1.f);
 }
 template<int QT>
 __global__ void packed_mv(const uint8_t* weights,int unused_qt,const void* input,int input_half,
@@ -2502,7 +2568,7 @@ __device__ __forceinline__ float u2f(unsigned v, float bias) { return __uint_as_
 // R output rows per warp share each activation load (the activation vector re-read per row was the bottleneck).
 // w0 = first row, rb = row stride in bytes, nr = valid rows (<= R; surplus rows alias the last valid one and are not stored)
 template <int QT, int MB, int R>
-__device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, int nr, const float* __restrict__ X, int K, int lane, float (&acc)[R][MB]) {
+__device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, int nr, const float* __restrict__ X, int K, int M, int lane, float (&acc)[R][MB]) {
 #define PROW(r) (w0 + (size_t)min(r, nr - 1) * rb)
     if constexpr (QT == 7) {                       // Q4_0: 18-byte blocks of 32, 4 lanes per block
         const int nb = K / 32, t = lane & 3;
@@ -2510,7 +2576,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
         for (int b = lane >> 2; b < nb; b += 8) {
             float4 a[MB], c[MB];
 #pragma unroll
-            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 32; a[m] = ld_x4(x + 4 * t); c[m] = ld_x4(x + 16 + 4 * t); }
+            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + (size_t)b * 32; a[m] = ld_x4(x + 4 * t); c[m] = ld_x4(x + 16 + 4 * t); }
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 const uint8_t* p = PROW(r) + (size_t)b * 18;
@@ -2532,7 +2598,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
         for (int b = lane >> 2; b < nb; b += 8) {
             float4 a[MB], c[MB];
 #pragma unroll
-            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 32 + 8 * t; a[m] = ld_x4(x); c[m] = ld_x4(x + 4); }
+            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + (size_t)b * 32 + 8 * t; a[m] = ld_x4(x); c[m] = ld_x4(x + 4); }
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 const uint8_t* p = PROW(r) + (size_t)b * 34;
@@ -2555,7 +2621,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
             float4 xv[MB][4];
 #pragma unroll
             for (int m = 0; m < MB; m++) {
-                const float* x = X + (size_t)m * K + (size_t)b * 128 + 16 * t;
+                const float* x = X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + (size_t)b * 128 + 16 * t;
 #pragma unroll
                 for (int j = 0; j < 4; j++) xv[m][j] = ld_x4(x + 4 * j);
             }
@@ -2585,7 +2651,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
             float xv[MB][5];
 #pragma unroll
             for (int m = 0; m < MB; m++) {
-                const float* x = X + (size_t)m * K + (size_t)b * 128 + base;
+                const float* x = X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + (size_t)b * 128 + base;
 #pragma unroll
                 for (int k = 0; k < 5; k++) xv[m][k] = (lane < 26 && k < cnt) ? x[step * k] : 0.f;
             }
@@ -2615,7 +2681,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
         for (int b = 0; b < nb; b++) {
             float4 a[MB], h[MB];
 #pragma unroll
-            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 256 + 64 * c + j; a[m] = ld_x4(x); h[m] = ld_x4(x + 32); }
+            for (int m = 0; m < MB; m++) { const float* x = X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + (size_t)b * 256 + 64 * c + j; a[m] = ld_x4(x); h[m] = ld_x4(x + 32); }
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 const uint8_t* p = PROW(r) + (size_t)b * BS;
@@ -2657,7 +2723,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
             for (int h = 0; h < 2; h++) {
                 float xv[MB][4];
 #pragma unroll
-                for (int m = 0; m < MB; m++) { const float* x = X + (size_t)m * K + (size_t)b * 256 + h * 128 + lane; xv[m][0] = x[0]; xv[m][1] = x[32]; xv[m][2] = x[64]; xv[m][3] = x[96]; }
+                for (int m = 0; m < MB; m++) { const float* x = X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + (size_t)b * 256 + h * 128 + lane; xv[m][0] = x[0]; xv[m][1] = x[32]; xv[m][2] = x[64]; xv[m][3] = x[96]; }
 #pragma unroll
                 for (int r = 0; r < R; r++) {
                     const uint8_t* p = PROW(r) + (size_t)b * 210;
@@ -2677,7 +2743,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
         for (int k = lane * 4; k < K; k += 128) {
             float4 a[MB];
 #pragma unroll
-            for (int m = 0; m < MB; m++) a[m] = ld_x4(X + (size_t)m * K + k);
+            for (int m = 0; m < MB; m++) a[m] = ld_x4(X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + k);
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 const float4 wv = *(const float4*)(PROW(r) + (size_t)k * 4);
@@ -2689,7 +2755,7 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
         for (int k = lane * 4; k < K; k += 128) {
             float4 a[MB];
 #pragma unroll
-            for (int m = 0; m < MB; m++) a[m] = ld_x4(X + (size_t)m * K + k);
+            for (int m = 0; m < MB; m++) a[m] = ld_x4(X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + k);
 #pragma unroll
             for (int r = 0; r < R; r++) {
                 const uint2 u = *(const uint2*)(PROW(r) + (size_t)k * 2);
@@ -2722,7 +2788,7 @@ __global__ void __launch_bounds__(256) pmv2(const uint8_t* __restrict__ W, const
 #pragma unroll
         for (int m = 0; m < MB; m++) acc[r][m] = 0.f;
     const size_t rb = packed_row_bytes(QT, K);
-    pdot<QT, MB, R>(W + (size_t)row0 * rb, rb, nr, X, K, lane, acc);
+    pdot<QT, MB, R>(W + (size_t)row0 * rb, rb, nr, X, K, M, lane, acc);
 #pragma unroll
     for (int r = 0; r < R; r++)
 #pragma unroll
@@ -2744,7 +2810,7 @@ __global__ void __launch_bounds__(256) pmv_ind(const uint8_t* __restrict__ W, co
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r][0] = 0.f;
     const size_t rb = packed_row_bytes(QT, K);
-    pdot<QT, 1, R>(W + ((size_t)ids[p] * N + row0) * rb, rb, nr, X + (size_t)(p / act_div) * K, K, lane, acc);
+    pdot<QT, 1, R>(W + ((size_t)ids[p] * N + row0) * rb, rb, nr, X + (size_t)(p / act_div) * K, K, 1, lane, acc);
 #pragma unroll
     for (int r = 0; r < R; r++) {
         const float v = warp_sum(acc[r][0]);

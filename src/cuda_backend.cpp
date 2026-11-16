@@ -141,6 +141,14 @@ public:
         dcu.cuMemGetInfo(&free_b, &total_b);
         logi("cuda: %s (sm_%d%d, %d SMs, %.1f/%.1f GB free)", name, cc_major_, cc_minor_, n_sm_, free_b / 1e9, total_b / 1e9);
         upload_weights(mf);
+        // Small fully packed MoE prefills use the same fp32 arithmetic as verify.
+        // Mixed and CPU-expert models retain the standard decode limit.
+        if (!g_imatrix && !c_.stateful && !c_.ple_dim && precise_format(out_.t) &&
+            !layers_.empty() && std::all_of(layers_.begin(), layers_.end(), [&](const DLayer& l) {
+                return l.c.is_attn() && l.c.n_experts && l.cpu_moe < 0 &&
+                       precise_format(l.wqkv.t) && precise_format(l.wo.t) &&
+                       precise_format(l.wgu_e.t) && precise_format(l.wdown_e.t);
+            })) decode_limit_ = MAX_LOGITS;
         alloc_caches();
         alloc_activations();
         compile_kernels();
@@ -186,7 +194,7 @@ public:
         CU(dcu.cuMemcpyHtoDAsync(d_batch_, hb, 4 * cap_ * sizeof(int), stream_));
         CU(dcu.cuEventRecord(stage_ev_[stage_], stream_));
         if (prof_ && ++prof_count_ % prof_every_ == 0) prof_report();
-        if (M <= MAX_DEC) {
+        if (M <= decode_limit_) {
             const bool graphable = opt.use_graphs && n_logits_ == M && !prof_;
             if (graphable) {
                 auto it = graphs_.find(M);
@@ -465,6 +473,17 @@ private:
         };
         size_t total = 0;
         for (auto& kv : mf.tensors) if (!on_cpu(kv.first)) total += align_up(kv.second.data_bytes, 256) + align_up(kv.second.scale_bytes, 256);
+        size_t expanded = 0;
+        for (auto& kv : mf.tensors) if (!on_cpu(kv.first)) {
+            const auto& t = kv.second;
+            expanded += align_up(t.type == QType::PTQ1_0 ? t.data_bytes / 28 * 34 : t.data_bytes, 256) + align_up(t.scale_bytes, 256);
+        }
+        size_t free_b, total_b;
+        CU(dcu.cuMemGetInfo(&free_b, &total_b));
+        const size_t reserve = (2ull << 30) + opt.reserve_bytes;
+        const bool repack = !getenv("TACH_NO_PTQ_REPACK") && free_b > reserve && expanded <= free_b - reserve;
+        if (repack && expanded != total) logi("cuda: losslessly expanding PTQ1 to PQ2 (+%.2f GB)", (expanded-total)/1e9);
+        if (repack) total = expanded;
         CUdeviceptr base = alloc(total);
         size_t chunk = 64 << 20;
         void* pinned;
@@ -485,7 +504,18 @@ private:
         for (auto& kv : mf.tensors) {
             const TensorInfo& t = kv.second;
             if (on_cpu(kv.first)) continue;
-            CUdeviceptr d = up(t.data, t.data_bytes);
+            CUdeviceptr d;
+            if (repack && t.type == QType::PTQ1_0) {
+                d = base + off;
+                const size_t blocks = t.data_bytes / 28, batch = chunk / 34;
+                for (size_t done = 0; done < blocks; done += batch) {
+                    size_t count = std::min(batch, blocks - done);
+                    CU(dcu.cuStreamSynchronize(stream_));
+                    repack_ptq1_to_pq2(t.data + done*28, (uint8_t*)pinned, count);
+                    CU(dcu.cuMemcpyHtoDAsync(d + done*34, pinned, count*34, stream_));
+                }
+                off += align_up(blocks*34, 256);
+            } else d = up(t.data, t.data_bytes);
             CUdeviceptr s = t.scale_bytes ? up(t.scales, t.scale_bytes) : 0;
             ptr[t.name] = {d, s};
         }
@@ -499,7 +529,7 @@ private:
             if (c_.norm_groups>1 || qtype_packed(t->type) || t->type==QType::BF16 || t->type==QType::F16 || t->type==QType::F32 || t->hadamard_block) packed_weights_ = true;
             m.hadamard_block=t->hadamard_block; m.hadamard_inverse=t->hadamard_inverse;
             if(!t->hadamard_signs.empty()){auto* b=mf.blob(t->hadamard_signs);m.signs=alloc(b->size);CU(dcu.cuMemcpyHtoD(m.signs,b->data,b->size));}
-            m.t = t->type; m.rows = (int)t->rows; m.cols = (int)t->cols;
+            m.t = repack && t->type == QType::PTQ1_0 ? QType::PQ2_0 : t->type; m.rows = (int)t->rows; m.cols = (int)t->cols;
             m.d = ptr[n].first; m.s = ptr[n].second;
             return m;
         };
@@ -693,24 +723,24 @@ private:
         maxRows = std::max(maxRows, 2 * maxF);
         const size_t P = (size_t)cap_ * maxP;     // MoE (token, expert) pairs
         x_ = alloc((size_t)cap_ * H * 4);
-        proj_ = alloc(std::max<size_t>((size_t)std::max<size_t>(cap_, MAX_DEC * maxP) * maxRows, P * H) * 4);
-        tmp_ = alloc((size_t)std::max<size_t>(cap_, MAX_DEC * maxP) * std::max<size_t>(H, maxK) * 4);
+        proj_ = alloc(std::max<size_t>((size_t)std::max<size_t>(cap_, decode_limit_ * maxP) * maxRows, P * H) * 4);
+        tmp_ = alloc((size_t)std::max<size_t>(cap_, decode_limit_ * maxP) * std::max<size_t>(H, maxK) * 4);
         qf_ = alloc((size_t)cap_ * std::max<size_t>(maxQ, 32) * 4);
         qh_ = alloc((size_t)cap_ * std::max<size_t>(maxQ, 32) * 2);
-        xq_ = alloc((size_t)std::max<size_t>({(size_t)MAX_DEC, (size_t)MAX_LOGITS}) * maxK + 64);
-        xds_ = alloc((size_t)std::max<size_t>({(size_t)MAX_DEC, (size_t)MAX_LOGITS}) * (maxK / 32 + 1) * 8);
-        fq_ = alloc((size_t)MAX_DEC * maxP * maxK + 64);
-        fds_ = alloc((size_t)MAX_DEC * maxP * (maxK / 32 + 1) * 8);
+        xq_ = alloc((size_t)std::max<size_t>({(size_t)decode_limit_, (size_t)MAX_LOGITS}) * maxK + 64);
+        xds_ = alloc((size_t)std::max<size_t>({(size_t)decode_limit_, (size_t)MAX_LOGITS}) * (maxK / 32 + 1) * 8);
+        fq_ = alloc((size_t)decode_limit_ * maxP * maxK + 64);
+        fds_ = alloc((size_t)decode_limit_ * maxP * (maxK / 32 + 1) * 8);
         tcq_ = alloc((size_t)8 * maxK + 64);
         tcds_ = alloc((size_t)8 * (maxK / 32 + 1) * 8);
         if(packed_weights_) { rot_h_=alloc(P * std::max<size_t>(maxK,H) * 2); rot_f_=alloc(std::max<size_t>(P,MAX_LOGITS) * std::max<size_t>(maxK,H) * 4); }
         ha_ = alloc(P * std::max<size_t>(maxK, H) * 2);
         hb_ = alloc(P * std::max<size_t>(maxK, H) * 2);
-        const size_t parts = std::max<size_t>((size_t)MAX_DEC * SPLITS, (size_t)cap_) * std::max(1, maxNH_);
+        const size_t parts = std::max<size_t>((size_t)decode_limit_ * SPLITS, (size_t)cap_) * std::max(1, maxNH_);
         part_o_ = alloc(parts * std::max(1, maxHD_) * 4);
         part_ml_ = alloc(parts * 8);
-        counters_ = alloc((size_t)std::max(MAX_DEC, cap_) * std::max(1, maxNH_) * 4);
-        CU(dcu.cuMemsetD8(counters_, 0, (size_t)std::max(MAX_DEC, cap_) * std::max(1, maxNH_) * 4));
+        counters_ = alloc((size_t)std::max(decode_limit_, cap_) * std::max(1, maxNH_) * 4);
+        CU(dcu.cuMemsetD8(counters_, 0, (size_t)std::max(decode_limit_, cap_) * std::max(1, maxNH_) * 4));
         logits_ = alloc((size_t)MAX_LOGITS * c_.vocab * 4);
         d_argmax_ = alloc(MAX_LOGITS * 4);
         d_rmax_ = alloc(MAX_LOGITS * 32 * 4);
@@ -766,7 +796,7 @@ private:
     std::string ind_name(QType t, int K) { return "gemv_ind<" + I(qt_code(t)) + "," + I(K) + ">"; }
     std::string grp_name(QType t, int K) { return "gemv_grp<" + I(qt_code(t)) + "," + I(K) + ">"; }
     std::string rope_name(int hd, int f16) { return "rope_t<" + I(hd) + "," + I(f16) + ">"; }
-    std::string attn_name(int hd, int g, int splits, int f16) { return "attn_decode<" + I(hd) + "," + I(g) + "," + I(splits) + "," + I(f16) + ">"; }
+    std::string attn_name(int hd, int g, int splits, int out) { return "attn_decode<" + I(hd) + "," + I(g) + "," + I(splits) + "," + I(out) + ">"; }
     // query heads per attention CTA: largest divisor of the GQA ratio that is <= 4
     static int attn_group(const LayerCfg& lc) {
         const int gqa = lc.n_heads / lc.n_kv_heads;
@@ -824,8 +854,11 @@ private:
                 names.insert(rope_name(lc.head_dim, 1));
                 const int g = attn_group(lc);
                 names.insert(attn_name(lc.head_dim, g, SPLITS, 0));
+                if ((c_.arch == "gemma4" || c_.norm_groups > 1 || L.c.n_experts) && precise_format(L.wo.t) && !L.wo.hadamard_block)
+                    names.insert(attn_name(lc.head_dim, g, SPLITS, 2));
                 if (flash_ok(lc.head_dim) && !no_flash_wide(lc.head_dim)) names.insert(flash_name(lc.head_dim));
-                else names.insert(attn_name(lc.head_dim, g, 1, 1));
+                // Also used for short precision-sensitive prefills.
+                names.insert(attn_name(lc.head_dim, g, 1, 1));
             } else if (lc.type == "conv") {
                 add_in(L.conv_in, 0);
                 add_out(L.conv_out);
@@ -863,9 +896,9 @@ private:
         names.insert("causal_conv<2>");
         if(!precise_format(out_.t)) for (int M = 1; M <= 8; M++) names.insert(gemv2_name(out_.t, out_.cols, M, 1, 0));
         if (tc_ok(out_.t) && out_.cols % 256 == 0) names.insert(tc_name(out_.t, out_.cols, 0));
-        for(auto n:{"packed_prepare","packed_fwht","packed_gate","packed_act_rows"})names.insert(n);
-        auto packed_register=[&](const DMat& m){if(m.valid()&&precise_format(m.t)){names.insert(packed_mv_name(m.t));names.insert(pmv2_name(m.t,1));names.insert(pmv2_name(m.t,4));names.insert(pmv2_name(m.t,8));names.insert(pmv_ind_name(m.t));}};
-        packed_register(out_);for(auto& l:layers_)for(auto* m:{&l.wqkv,&l.wo,&l.wgu,&l.wdown,&l.dn_in,&l.dn_out,&l.dn_ab,&l.wgu_e,&l.wdown_e})packed_register(*m);
+        for(auto n:{"packed_prepare","packed_prepare_fwht","packed_act_fwht","packed_fwht","packed_gate","packed_act_rows"})names.insert(n);
+        auto packed_register=[&](const DMat& m){if(m.valid()&&precise_format(m.t)){names.insert(packed_mv_name(m.t));names.insert(pmv2_name(m.t,1));names.insert(pmv2_name(m.t,2));names.insert(pmv2_name(m.t,4));names.insert(pmv2_name(m.t,8));names.insert(pmv_ind_name(m.t));}};
+        packed_register(out_);if(c_.ple_dim)packed_register(ple_proj_);for(auto& l:layers_)for(auto* m:{&l.wqkv,&l.wo,&l.wgu,&l.wdown,&l.dn_in,&l.dn_out,&l.dn_ab,&l.wgu_e,&l.wdown_e,&l.ple_gate,&l.ple_out})packed_register(*m);
         std::string source=kKernelSource; auto marker=source.find("// TACH_PACKED_SOURCE"); source.insert(marker,kPackedSource);
         std::string key = source;
         for (auto& o : opts) key += "|" + o;
@@ -1025,9 +1058,21 @@ private:
         const int K = W.cols, N = W.rows;
         for (int m0 = 0; m0 < M; m0 += 8) {
             const int mm = std::min(8, M - m0);
-            const int mb = mm == 1 ? 1 : mm <= 4 ? 4 : 8;
+            const int mb = mm <= 2 ? mm : mm <= 4 ? 4 : 8;
             launch(F(pmv2_name(W.t, mb)), D3((N + 8 * pmv_rows(W.t, mb) - 1) / (8 * pmv_rows(W.t, mb))), D3(256), 0, W.d, (CUdeviceptr)(X + (size_t)m0 * K * 4), K, N, mm,
                    (CUdeviceptr)(y + (size_t)m0 * stride * 4), stride, offset, add, bias);
+        }
+    }
+
+    void packed_input(const DMat& W, int M, CUdeviceptr x, CUdeviceptr nw, CUdeviceptr rows,
+                      CUdeviceptr xq, CUdeviceptr xds, int pro) {
+        const int K = W.cols, B = W.hadamard_block;
+        if (B >= 32 && K <= 8192) {
+            launch(F("packed_prepare_fwht"), D3(M), D3(256), K * 4, x, nw, rows, xq, xds,
+                   rot_f_, K, pro, B, W.signs, W.hadamard_inverse ? 1 : 0);
+        } else {
+            launch(F("packed_prepare"), D3(M), D3(256), 0, x, nw, rows, xq, xds, rot_f_, K, pro);
+            if (B) launch(F("packed_fwht"), D3(K / B, M), D3(256), B * 4, rot_f_, rot_f_, K, B, W.signs, 0, 0, W.hadamard_inverse ? 1 : 0);
         }
     }
 
@@ -1035,8 +1080,7 @@ private:
               CUdeviceptr xq, CUdeviceptr xds, CUdeviceptr y, CUdeviceptr bias = 0) {
         const int K = W.cols, N = W.rows;
         if(qtype_packed(W.t) || W.t==QType::F32 || W.t==QType::F16 || W.t==QType::BF16) {
-            launch(F("packed_prepare"),D3(M),D3(256),0,x,nw,rows,xq,xds,rot_f_,K,pro);
-            if(W.hadamard_block) launch(F("packed_fwht"),D3(K/W.hadamard_block,M),D3(256),W.hadamard_block*4,rot_f_,rot_f_,K,W.hadamard_block,W.signs,0,0,W.hadamard_inverse?1:0);
+            packed_input(W, M, x, nw, rows, xq, xds, pro);
             pmv(W,rot_f_,M,y,N,0,epi,bias);
             return;
         }
@@ -1076,11 +1120,17 @@ private:
         }
     }
 
-    // down projection of the fp32 activation left in rot_f_ by gemv_gu (packed formats)
+    // Consume gate/up pairs from gemv_gu; fuse their activation with rotation when possible.
     void gemv_down_f(const DMat& W, int M, int epi, CUdeviceptr y) {
         const int K = W.cols;
+        if (precise_format(W.t) && W.hadamard_block >= 32) {
+            launch(F("packed_act_fwht"), D3(K / W.hadamard_block, M), D3(256), W.hadamard_block * 4,
+                   proj_, rot_f_, K, W.hadamard_block, W.signs, W.hadamard_inverse ? 1 : 0);
+        } else {
+            launch(F("packed_act_rows"), D3(M), D3(256), 0, proj_, K, rot_f_);
+            if (precise_format(W.t) && W.hadamard_block) launch(F("packed_fwht"), D3(K / W.hadamard_block, M), D3(256), W.hadamard_block * 4, rot_f_, rot_f_, K, W.hadamard_block, W.signs, 0, 0, W.hadamard_inverse ? 1 : 0);
+        }
         if (precise_format(W.t)) {
-            if (W.hadamard_block) launch(F("packed_fwht"), D3(K / W.hadamard_block, M), D3(256), W.hadamard_block * 4, rot_f_, rot_f_, K, W.hadamard_block, W.signs, 0, 0, W.hadamard_inverse ? 1 : 0);
             pmv(W, rot_f_, M, y, W.rows, 0, epi);
         } else {
             launch(f_quant_, D3(M), D3(256), 0, rot_f_, K, fq_, fds_);
@@ -1091,11 +1141,9 @@ private:
     // gate/up GEMV with RMS prologue, act(gate)*up, int8 output (decode)
     void gemv_gu(const DMat& W, int M, CUdeviceptr x, CUdeviceptr nw, CUdeviceptr oq, CUdeviceptr ods) {
         const int H = c_.hidden, F2 = W.rows, F_ = F2 / 2;
-        if (precise_format(W.t)) {   // packed formats: fp32 gate/up, activation stays fp32 in rot_f_ (consumed by gemv_down_f)
-            launch(F("packed_prepare"), D3(M), D3(256), 0, x, nw, (CUdeviceptr)0, (CUdeviceptr)0, (CUdeviceptr)0, rot_f_, H, 1);
-            if (W.hadamard_block) launch(F("packed_fwht"), D3(H / W.hadamard_block, M), D3(256), W.hadamard_block * 4, rot_f_, rot_f_, H, W.hadamard_block, W.signs, 0, 0, W.hadamard_inverse ? 1 : 0);
+        if (precise_format(W.t)) {   // packed formats: leave fp32 gate/up pairs in proj_ for gemv_down_f
+            packed_input(W, M, x, nw, 0, 0, 0, 1);
             pmv(W, rot_f_, M, proj_, F2, 0, 0);
-            launch(F("packed_act_rows"), D3(M), D3(256), 0, proj_, F_, rot_f_);
             return;
         }
         for (int m0 = 0; m0 < M; m0 += 8) {
@@ -1176,8 +1224,11 @@ private:
             if (g_imatrix) imat_acc("ple_proj", ha_, M, H);
             gemm(ple_proj_, ha_, M, ple_tmp_, 0, 0);
         } else {
-            launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
-            gemv(ple_proj_, 0, 0, M, 0, 0, 0, xq_, xds_, ple_tmp_);
+            if (precise_format(ple_proj_.t) && !ple_proj_.hadamard_block) pmv(ple_proj_, x_, M, ple_tmp_, ple_proj_.rows, 0, 0);
+            else {
+                launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
+                gemv(ple_proj_, 0, 0, M, 0, 0, 0, xq_, xds_, ple_tmp_);
+            }
         }
         launch(f_embrows_, D3(M), D3(256), 0, ple_embd_.d, ple_embd_.s, qt_code(ple_embd_.t), tok_ptr(), W, 1.f, ple_tmp2_);
         launch(f_plecomb_, D3(M, NL), D3(D), 0, ple_tmp_, ple_tmp2_, ple_proj_norm_, D, NL, ple_buf_);
@@ -1195,11 +1246,17 @@ private:
             if (g_imatrix) imat_acc(bp + "ple_out", hb_, M, D);
             gemm(L.ple_out, hb_, M, tmp_, 0, 0);
         } else {
-            launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
-            gemv(L.ple_gate, 0, 0, M, 0, 0, 0, xq_, xds_, proj_);
+            if (precise_format(L.ple_gate.t) && !L.ple_gate.hadamard_block) pmv(L.ple_gate, x_, M, proj_, D, 0, 0);
+            else {
+                launch(f_quant_, D3(M), D3(256), 0, x_, H, xq_, xds_);
+                gemv(L.ple_gate, 0, 0, M, 0, 0, 0, xq_, xds_, proj_);
+            }
             launch(f_plemul_, D3(M), D3(D), 0, proj_, ple_buf_, l, D, W);
-            launch(f_quant_, D3(M), D3(256), 0, proj_, D, xq_, xds_);
-            gemv(L.ple_out, 0, 0, M, 0, 0, 0, xq_, xds_, tmp_);
+            if (precise_format(L.ple_out.t) && !L.ple_out.hadamard_block) pmv(L.ple_out, proj_, M, tmp_, H, 0, 0);
+            else {
+                launch(f_quant_, D3(M), D3(256), 0, proj_, D, xq_, xds_);
+                gemv(L.ple_out, 0, 0, M, 0, 0, 0, xq_, xds_, tmp_);
+            }
         }
         residual(M, tmp_, L.ple_post_norm, L.c.layer_scalar);
     }
@@ -1223,9 +1280,13 @@ private:
                 full_qk_norm(L, M);
                 RopeArgs ra = rope_args(L, M, qf_);
                 launch(F(rope_name(lc.head_dim, 0)), D3(M, (lc.n_heads + lc.n_kv_heads + 3) / 4), D3(128), 0, ra);
-                AttnArgs aa = attn_args(L, qf_, xq_, xds_, 0);
-                launch(F(attn_name(lc.head_dim, attn_group(lc), SPLITS, 0)), D3(lc.n_heads / attn_group(lc), SPLITS, M), D3(128), 0, aa);
-                gemv(L.wo, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
+                // Sandwich/grouped norms and expert routing amplify int8 output error.
+                // Keep the packed projection input in fp32, as its FFN already does.
+                const bool exact = (c_.arch == "gemma4" || c_.norm_groups > 1 || L.c.n_experts) && precise_format(L.wo.t) && !L.wo.hadamard_block;
+                AttnArgs aa = attn_args(L, qf_, exact ? 0 : xq_, exact ? 0 : xds_, exact ? rot_f_ : 0);
+                launch(F(attn_name(lc.head_dim, attn_group(lc), SPLITS, exact ? 2 : 0)), D3(lc.n_heads / attn_group(lc), SPLITS, M), D3(128), 0, aa);
+                if (exact) pmv(L.wo, rot_f_, M, dadd ? x_ : tmp_, H, 0, dadd ? 1 : 0);
+                else gemv(L.wo, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
             } else if (lc.type == "conv") {
                 gemv(L.conv_in, 1, 0, M, x_, L.attn_norm, 0, 0, 0, proj_);
                 launch(F("causal_conv<2>"), D3((H + 127) / 128), D3(128), 0, proj_, 3 * H, H, lc.conv_k, L.conv_w, L.st0,
@@ -1426,7 +1487,7 @@ private:
             launch(f_actq_, D3(P), D3(256), 0, proj_, F_, fq_, fds_);
             launch(F(grp_name(L.wdown_e.t, F_)), D3((H + 31) / 32, lc.n_experts), D3(256), 0, L.wdown_e.d, L.wdown_e.s, H, moe_ids_, P, 1, fq_, fds_, proj_);
         } else {
-            launch(F(ind_name(L.wgu_e.t, H)), D3((2 * F_ + 8 * pmv_rows(L.wgu_e.t, 1) - 1) / (8 * pmv_rows(L.wgu_e.t, 1)), P), D3(256), 0, L.wgu_e.d, L.wgu_e.s, 2 * F_, moe_ids_, K, xq_, xds_, proj_);
+            launch(F(ind_name(L.wgu_e.t, H)), D3((2 * F_ + 31) / 32, P), D3(256), 0, L.wgu_e.d, L.wgu_e.s, 2 * F_, moe_ids_, K, xq_, xds_, proj_);
             launch(f_actq_, D3(P), D3(256), 0, proj_, F_, fq_, fds_);
             launch(F(ind_name(L.wdown_e.t, F_)), D3((H + 31) / 32, P), D3(256), 0, L.wdown_e.d, L.wdown_e.s, H, moe_ids_, 1, fq_, fds_, proj_);
         }
@@ -1480,7 +1541,9 @@ private:
                 gemm(L.wqkv, ha_, M, proj_, 0, 0, L.bqkv);
                 full_qk_norm(L, M);
                 const int qd = lc.q_dim();
-                if (flash_ok(lc.head_dim) && !no_flash_wide(lc.head_dim)) {
+                const bool precise_short = M <= 64 && precise_format(L.wo.t) &&
+                                           (c_.norm_groups > 1 || lc.n_experts);
+                if (flash_ok(lc.head_dim) && !no_flash_wide(lc.head_dim) && !precise_short) {
                     RopeArgs ra = rope_args(L, M, qh_);
                     launch(F(rope_name(lc.head_dim, 1)), D3(M, (lc.n_heads + lc.n_kv_heads + 3) / 4), D3(128), 0, ra);
                     const int qr = flash_qrows(lc.head_dim);
@@ -1622,6 +1685,7 @@ private:
     DMat embd_, out_;
     CUdeviceptr out_norm_ = 0;
     std::vector<DLayer> layers_;
+    int decode_limit_ = MAX_DEC;
     int cap_ = 0, maxHD_ = 0, maxNH_ = 0, maxNKV_ = 0;
     bool has_moe_ = false;
     CUdeviceptr x_ = 0, proj_ = 0, tmp_ = 0, qf_ = 0, qh_ = 0, xq_ = 0, xds_ = 0, fq_ = 0, fds_ = 0, tcq_ = 0, tcds_ = 0, ha_ = 0, hb_ = 0;
