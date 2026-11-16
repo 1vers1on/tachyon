@@ -13,18 +13,17 @@ repository.
 
 ## Highlights
 
-- **Fast single-GPU inference.** Qwen3-8B (Q4) decodes at about 68 tok/s on an RTX 3060, which is about
-  97% of the card's measured memory bandwidth. With a draft model, that rises to about 110 tok/s on prose
-  and 180 tok/s on code.
-- **Continuous batching** over KV slots, with prefix caching, chunked prefill and an 8-bit KV cache. Eight
-  concurrent streams of the 8B model reach about 430 tok/s in total.
+- **Fast single-GPU inference.** Decode is memory-bandwidth bound, and the kernels get close to the
+  card's bandwidth: Qwen3-8B (Q4) reaches about 97% of it on the reference RTX 3060 (see
+  [Performance](#performance)). A draft model raises that by roughly 1.6x on prose and 2.6x on code.
+- **Continuous batching** over KV slots, with prefix caching, chunked prefill and an 8-bit KV cache.
 - **Speculative decoding**, either from n-grams (prompt lookup) or from a small draft model. This also
   works for recurrent and hybrid models (Qwen3.5, LFM2), whose state is rolled back when drafts are
   rejected.
 - **Importance-weighted 4-bit quantization** (imatrix from calibration text), plus Q8 and an experimental
   Q3 format. Perplexity is checked against Hugging Face transformers for each supported family.
-- **MoE models larger than VRAM**: experts that don't fit stay in system RAM and run on the CPU. For
-  example, Qwen3-30B-A3B runs at about 50 tok/s on a 12 GB card.
+- **MoE models larger than VRAM**: experts that don't fit stay in system RAM and run on the CPU, so
+  models such as Qwen3-30B-A3B run on cards with far less memory than their weights.
 - **Agent-ready API**: OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`, both with streaming,
   tool calls in each model's native format, reasoning/thinking blocks and `tool_choice`. A request is
   cancelled when its client disconnects.
@@ -33,9 +32,9 @@ repository.
 
 ## Requirements
 
-- Linux (developed on WSL2).
+- Linux x86-64 (native or WSL2).
 - `g++` 15 or newer (the CUDA kernels and calibration text are embedded with `#embed`).
-- CUDA toolkit headers, `libcuda` and `libnvrtc` (developed with CUDA 12.6). `nvcc` is not used.
+- CUDA toolkit headers, `libcuda` and `libnvrtc` (developed with CUDA 12.6). `nvcc` is not used. On WSL2 the Makefile also picks up `/usr/lib/wsl/lib`.
 - An NVIDIA GPU with compute capability 8.0 or higher (Ampere or newer) for the CUDA backend.
 - A CPU with AVX-512 (F/BW/VL/VNNI), such as Zen 4 or Ice Lake and newer. The CPU backend is always
   compiled, so the build currently needs this even if you only use the GPU.
@@ -102,9 +101,9 @@ curl localhost:28657/v1/chat/completions \
 
 | Family | Examples in the catalog |
 |---|---|
-| Qwen3 (dense and MoE) | `qwen3:0.6b` … `qwen3:14b`, `qwen3:30b-a3b` |
+| Qwen3 (dense and MoE) | `qwen3:0.6b` … `qwen3:14b`, `qwen3:32b`, `qwen3:30b-a3b` |
 | Qwen3.5 (Gated DeltaNet hybrid) | `qwen3.5:0.8b`, `2b`, `4b`, `9b` |
-| Qwen2 / Qwen2.5 | `qwen2.5:0.5b` … `7b`, `qwen2.5-coder:7b`, `deepseek-r1:1.5b`, `7b` |
+| Qwen2 / Qwen2.5 | `qwen2.5:0.5b` … `32b`, `qwen2.5-coder:7b` … `32b`, `deepseek-r1:1.5b`, `7b` |
 | Gemma 3 / Gemma 4 | `gemma3:270m`, `gemma4:e2b`, `e4b`, `12b` |
 | Gemma (first generation) | `gemma:2b`, `gemma:7b` (gated) |
 | LFM2 / LFM2.5 (short-conv hybrid, MoE) | `lfm2.5:350m` … `2.6b`, `lfm2.5:8b-a1b` |
@@ -115,7 +114,9 @@ curl localhost:28657/v1/chat/completions \
 | Granite 3.x | `granite3.3:2b`, `8b` |
 | Phi-3 / Phi-4-mini | `phi4-mini` |
 
-Run `./tachyon catalog` for the full list. Each family's perplexity was checked against Hugging Face
+Run `./tachyon catalog` for the full list. Dense models need their quantized weights plus KV cache to fit
+in VRAM, so the 14B models want roughly 10 GB and the 32B models roughly 20-24 GB (MoE models can spill
+experts to system RAM). Each family's perplexity was checked against Hugging Face
 transformers, or CPU against CUDA for MoE models that are too large for a reference run.
 
 Gemma (first generation) and Mixtral are validated with tiny random checkpoints against Transformers
@@ -124,8 +125,9 @@ have not been measured for these additions. Mistral/Mixtral sliding-attention wi
 
 ## Performance
 
-Measured on an RTX 3060 12 GB with a Ryzen 7 7700X under WSL2. Models are Q4 + imatrix unless noted,
-with greedy decoding.
+Reference numbers from one machine (RTX 3060 12 GB, Ryzen 7 7700X, WSL2), with greedy decoding and
+Q4 + imatrix models unless noted. Decode speed scales roughly with memory bandwidth, so expect different
+numbers on other hardware.
 
 | Model | Decode tok/s (single stream) | Prefill tok/s (2048 tokens) |
 |---|---|---|

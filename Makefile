@@ -1,11 +1,14 @@
 # Tachyon build. Host code is plain C++ (g++). CUDA kernels are compiled at runtime by NVRTC,
 # so no nvcc / host-compiler compatibility is needed.
+comma    := ,
 CXX      ?= g++
 CUDA     ?= /usr/local/cuda
 OPT      ?= -O3 -march=native -mtune=native
 CXXFLAGS ?= $(OPT) -std=gnu++23 -g -Wall -Wno-unused-function -Wno-sign-compare -Wno-unused-variable -Wno-array-bounds -fno-math-errno -pthread
 INCS     := -I$(CUDA)/include -Isrc
-LDCUDA   := -L$(CUDA)/lib64 -L/usr/lib/wsl/lib -Wl,-rpath,$(CUDA)/lib64 -Wl,-rpath,/usr/lib/wsl/lib -lcuda -lnvrtc
+# WSL2 keeps libcuda in /usr/lib/wsl/lib; add it only when present
+WSLLIB   := $(wildcard /usr/lib/wsl/lib)
+LDCUDA   := -L$(CUDA)/lib64 $(addprefix -L,$(WSLLIB)) -Wl,-rpath,$(CUDA)/lib64 $(addprefix -Wl$(comma)-rpath$(comma),$(WSLLIB)) -lcuda -lnvrtc
 
 BUILD ?= build
 OUT ?= tachyon

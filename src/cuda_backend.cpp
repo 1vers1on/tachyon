@@ -1176,7 +1176,7 @@ private:
     }
 
     // Experts in system RAM: route + normalize on the GPU, then a request through host-mapped memory to a CPU server
-    // thread (polled on both sides: host callbacks cost ~1 ms per round trip under WSL2), output copied back.
+    // thread (polled on both sides: host callbacks can cost ~1 ms per round trip, e.g. under WSL2), output copied back.
     // All of it is ordinary kernels, so decode stays one CUDA graph.
     volatile int* cm_hdr_ = nullptr;   // host view of the header
     CUdeviceptr cm_hdr_d_ = 0, cm_buf_d_ = 0, cm_counter_ = 0;
