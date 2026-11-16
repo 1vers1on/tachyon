@@ -20,8 +20,9 @@ rm -rf "$stage"
 mkdir -p "$stage/bin" "$stage/libexec" "$stage/cuda/lib64" "$stage/share/licenses"
 
 # All variants use explicit ISA flags. Static C++ runtimes avoid a dependency on the builder's libstdc++.
+base_flags='-O3 -march=x86-64 -mtune=generic -std=gnu++20 -g -Wall -Wno-unused-function -Wno-sign-compare -Wno-unused-variable -Wno-array-bounds -fno-math-errno -pthread'
 for cpu in scalar avx2 avx512; do
-    flags='-O3 -march=x86-64 -mtune=generic -std=gnu++20 -g -Wall -Wno-unused-function -Wno-sign-compare -Wno-unused-variable -Wno-array-bounds -fno-math-errno -pthread'
+    flags=$base_flags
     [[ $cpu == scalar ]] || flags+=' -mavx2 -mfma -mf16c'
     [[ $cpu != avx512 ]] || flags+=' -mavx512f -mavx512bw -mavx512vl -mavx512vnni'
     # Override ambient CXXFLAGS/OPT as well: a developer's -march=native must never reach a release.
@@ -30,7 +31,7 @@ for cpu in scalar avx2 avx512; do
         CXXFLAGS="$flags" LDFLAGS='-static-libstdc++ -static-libgcc' tachyon
 done
 make -j"$jobs" CXX="$cxx" CUDA="$cuda" CPU=scalar BUILD="$work/obj-scalar" \
-    CXXFLAGS='-O3 -march=x86-64 -mtune=generic -std=gnu++20 -g -pthread' \
+    CXXFLAGS="$base_flags" \
     CLIENT_OUT="$stage/bin/tachyon-client" LDFLAGS='-static-libstdc++ -static-libgcc' "$stage/bin/tachyon-client"
 "$cxx" -O2 -std=c++20 -march=x86-64 -mtune=generic -static-libstdc++ -static-libgcc \
     tools/launcher.cpp -o "$stage/bin/tachyon"
