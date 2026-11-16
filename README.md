@@ -178,7 +178,26 @@ machine doesn't separate them. Zen 4 executes AVX-512 on 256-bit datapaths, so a
 units may behave differently; that has not been measured. The scalar kernels are 4 to 8x slower on Q4 and 2 to 5x
 slower on Q8, so use them only on CPUs that lack AVX2.
 
-To measure on your own hardware, run `./tachyon bench -m model.tach`.
+### Benchmark your own hardware
+
+`tools/bench.sh` pulls the models it needs, runs `tachyon bench` several times (interleaved, so drift in machine
+state hits every configuration equally) and prints the median and range as a markdown table. It needs a built
+tree (see [Build](#build)) and `python3`.
+
+```bash
+tools/bench.sh gpu                                  # GPU backend: qwen3:0.6b and qwen3:8b, 2048-token prompt, 3 runs
+tools/bench.sh gpu qwen3:8b qwen3.5:9b mistral:7b   # any catalog names or Hugging Face repos
+tools/bench.sh cpu                                  # CPU kernel sets: qwen3:0.6b, qwen3:0.6b-q8, qwen3:1.7b, 512-token prompt, 5 runs
+tools/bench.sh cpu -r 3 -t 16 -p 2048 qwen3:1.7b    # runs, CPU threads, prompt length, generated tokens (-n)
+```
+
+Models are downloaded from Hugging Face and converted (Q4 + importance matrix) the first time they are used, and
+are kept in `$TACHYON_HOME` (default `~/.tachyon`). Gated models need `HF_TOKEN`. `cpu` mode builds a binary per
+kernel set in `build/bench/` (AVX-512, AVX2 and scalar, whichever the CPU can run), so it takes a few minutes the
+first time. The raw runs are written to `build/bench/`.
+
+For a single run on one model, use `./tachyon bench -m model.tach [-n 256] [--prompt-len 512] [--device cpu|cuda]`.
+`tachyon show <name>` prints the `.tach` file of a pulled model.
 
 ## Command reference
 
@@ -252,7 +271,7 @@ HTTP (OpenAI / Anthropic) ─▶ server ─▶ engine (continuous batching, pref
 ```
 src/            engine, backends, server, converter, tokenizer, runner, client
 src/kernels/    all CUDA kernels (embedded into the binary)
-tools/          regression and API test scripts, Hugging Face reference comparisons
+tools/          benchmark script, regression and API test scripts, Hugging Face reference comparisons
 data/           calibration text (wikitext-2 train) and evaluation text (wikitext-2 test)
 ```
 
