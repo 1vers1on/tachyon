@@ -17,7 +17,7 @@
     X(cuMemsetD8) X(cuMemsetD32) X(cuMemsetD8Async) X(cuMemsetD32Async) \
     X(cuModuleLoadData) X(cuModuleUnload) X(cuModuleGetFunction) X(cuFuncGetAttribute) X(cuFuncSetAttribute) \
     X(cuOccupancyMaxActiveBlocksPerMultiprocessor) X(cuLaunchKernel) \
-    X(cuStreamCreate) X(cuStreamSynchronize) X(cuStreamWaitEvent) X(cuStreamBeginCapture) X(cuStreamEndCapture) \
+    X(cuStreamCreate) X(cuStreamDestroy) X(cuStreamSynchronize) X(cuStreamWaitEvent) X(cuStreamBeginCapture) X(cuStreamEndCapture) \
     X(cuGraphInstantiate) X(cuGraphLaunch) X(cuGraphDestroy) X(cuGraphExecDestroy) \
     X(cuEventCreate) X(cuEventDestroy) X(cuEventRecord) X(cuEventSynchronize) X(cuEventElapsedTime)
 

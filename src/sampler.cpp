@@ -3,7 +3,7 @@
 
 void Sampler::init(const SamplingParams& p) {
     params = p;
-    uint64_t seed = p.seed ? p.seed : std::random_device{}() ^ ((uint64_t)std::random_device{}() << 32);
+    uint64_t seed = p.seed_set || p.seed ? p.seed : std::random_device{}() ^ ((uint64_t)std::random_device{}() << 32);
     rng_.seed(seed);
     counts_.clear();
 }
@@ -35,10 +35,10 @@ void Sampler::finalize_candidates(float mx) {
     const float T = std::max(params.temperature, 1e-4f);
     int k = params.top_k > 0 ? std::min<int>(params.top_k, (int)cand_.size()) : (int)cand_.size();
     if (k < (int)cand_.size()) {
-        std::nth_element(cand_.begin(), cand_.begin() + k, cand_.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        std::nth_element(cand_.begin(), cand_.begin() + k, cand_.end(), [](auto& a, auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
         cand_.resize(k);
     }
-    std::sort(cand_.begin(), cand_.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::sort(cand_.begin(), cand_.end(), [](auto& a, auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
     double sum = 0;
     for (auto& c : cand_) { c.first = expf((c.first - mx) / T); sum += c.first; }
     for (auto& c : cand_) c.first = (float)(c.first / sum);

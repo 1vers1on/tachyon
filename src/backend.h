@@ -42,7 +42,7 @@ public:
     virtual void copy_kv(int src_slot, int dst_slot, int n) = 0;
     virtual int vocab() const = 0;
     // Candidate logits (value, token) with logit >= rowmax - delta for logits rows [0, n). Returns false if
-    // unsupported (caller falls back to get_logits). Rows whose candidate count overflows `cap` are truncated.
+    // unsupported or any row overflows `cap` (caller falls back to get_logits).
     virtual bool candidates(int n, float delta, int cap, std::vector<std::vector<std::pair<float, int>>>& out) { return false; }
     virtual void imat_flush() {}  // move device-side importance statistics into g_imatrix
     // Recurrent-state rollback (speculative decoding on conv / delta-net models; needs opt.state_rollback):

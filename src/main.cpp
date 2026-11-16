@@ -93,7 +93,7 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--top-k") a.sp.top_k = atoi(next().c_str());
         else if (s == "--top-p") a.sp.top_p = atof(next().c_str());
         else if (s == "--min-p") a.sp.min_p = atof(next().c_str());
-        else if (s == "--seed") a.sp.seed = strtoull(next().c_str(), nullptr, 10);
+        else if (s == "--seed") { a.sp.seed = strtoull(next().c_str(), nullptr, 10); a.sp.seed_set = true; }
         else if (s == "--repeat-penalty") a.sp.repetition_penalty = atof(next().c_str());
         else if (log_arg(s, next)) {}
         else if (s == "-h" || s == "--help") { usage(); exit(0); }

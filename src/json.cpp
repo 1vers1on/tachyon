@@ -149,7 +149,7 @@ struct Parser {
 void dump_num(std::string& o, double d) {
     if (std::isnan(d) || std::isinf(d)) { o += "null"; return; }
     char buf[64];
-    if (d == (double)(int64_t)d && fabs(d) < 9.007199254740992e15) snprintf(buf, sizeof buf, "%lld", (long long)d);
+    if (fabs(d) < 9.007199254740992e15 && d == (double)(int64_t)d) snprintf(buf, sizeof buf, "%lld", (long long)d);
     else snprintf(buf, sizeof buf, "%.9g", d);
     o += buf;
 }

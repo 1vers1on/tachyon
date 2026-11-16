@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine and server in C++, with hand-written CUDA, AVX-512 and AVX2 kernels (plus a scalar fallback).
 
 Tachyon takes a Hugging Face checkpoint, quantizes it to its own `.tach` format, and serves it over
-OpenAI- and Anthropic-compatible HTTP APIs, with tool calling, so coding agents such as Claude Code can
+OpenAI-, Anthropic- and Ollama-compatible text generation APIs, with tool calling, so coding agents such as Claude Code can
 run on a local model. It also has an ollama-style runner (`tachyon run qwen3:8b`) that downloads,
 converts and loads models by name.
 
@@ -24,7 +24,7 @@ repository.
   Q3 format. Perplexity is checked against Hugging Face transformers for each supported family.
 - **MoE models larger than VRAM**: experts that don't fit stay in system RAM and run on the CPU, so
   models such as Qwen3-30B-A3B run on cards with far less memory than their weights.
-- **Agent-ready API**: OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`, both with streaming,
+- **Agent-ready API**: OpenAI `/v1/chat/completions`, Anthropic `/v1/messages` and Ollama `/api/chat` / `/api/generate`, with streaming,
   tool calls in each model's native format, reasoning/thinking blocks and `tool_choice`. A request is
   cancelled when its client disconnects.
 - **No build-time CUDA compiler.** The kernels are compiled at runtime with NVRTC, with every model
@@ -95,6 +95,44 @@ Or with curl:
 curl localhost:28657/v1/chat/completions \
   -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+### Ollama clients
+
+Point an Ollama client at `http://127.0.0.1:28657` (or start Tachyon with `--port 11434`).
+Both `tachyon serve` and `tachyon serve -m FILE --alias NAME` support `/api/chat`, `/api/generate`,
+`/api/show`, `/api/tags`, `/api/ps` and `/api/version`. The model manager also supports pulling and
+deleting local models. Model names refer to Tachyon's catalog or imported `.tach` files.
+
+```bash
+curl localhost:28657/api/chat -d '{
+  "model": "qwen3:8b",
+  "messages": [{"role": "user", "content": "hi"}],
+  "stream": false,
+  "think": false,
+  "options": {"temperature": 0.7, "num_predict": 128}
+}'
+```
+
+Streaming defaults to true and returns newline-delimited JSON, following the
+[Ollama chat](https://docs.ollama.com/api/chat) and
+[generation](https://docs.ollama.com/api/generate) response shapes. Responses include token counts and
+durations in nanoseconds. Chat supports `tools`, assistant `tool_calls` with object arguments,
+tool results using `tool_name`, and separate `thinking` output. Generate supports `system` and `raw`.
+`format: "json"` and schema objects add prompt instructions; output is not grammar constrained.
+
+Supported `options`: `temperature`, `top_k`, `top_p`, `min_p`, `seed`, `repeat_penalty`,
+`presence_penalty`, `frequency_penalty`, `stop`, `num_predict`, and `num_ctx`.
+`num_predict: -1` / `-2` generate up to the context limit; zero evaluates the prompt without generating.
+`num_ctx` may limit a request within the server's configured context; oversized prompts return HTTP 400.
+
+With the model manager, `keep_alive` accepts seconds or a duration such as `"5m"`; a negative value
+keeps a model loaded. Zero unloads it after the response completes. An empty prompt or empty message
+list preloads the model; combine it with `keep_alive: 0` to unload. A server started with `-m` keeps its
+model loaded for its process lifetime.
+
+This covers text inference, rather than every Ollama feature. Embeddings, images, logprobs, custom
+templates, fill-in-the-middle suffixes, legacy `context` tokens, and string-valued thinking levels are
+not supported. Other Ollama runtime options do not change the backend's server configuration.
 
 ### Convert and serve one model manually
 
@@ -215,6 +253,24 @@ first time. The raw runs are written to `build/bench/`.
 For a single run on one model, use `./tachyon bench -m model.tach [-n 256] [--prompt-len 512] [--device cpu|cuda]`.
 `tachyon show <name>` prints the `.tach` file of a pulled model.
 
+### CUDA sampling kernels
+
+The vocabulary maximum used by candidate sampling is reduced across 32 GPU blocks per row, and
+candidate writes reserve space per warp. Overflow falls back to full logits so high-temperature
+sampling keeps the correct distribution. On an RTX 3060, the two sampling kernels together took
+11.7 µs instead of 19.4 µs for one 151,936-token vocabulary row, and 16.3 µs instead of 22.4 µs for
+four rows (medians of five interleaved runs, 296 candidates per row). These are isolated kernel
+measurements; full inference is dominated by the model forward pass and needs separate measurement.
+
+```bash
+make build/bench-sampling
+build/bench-sampling                       # synthetic sparse and overflowing candidate distributions
+build/bench-sampling /tmp/old-kernels.cu    # compare against an earlier kernels.cu revision
+```
+
+The benchmark captures 100 pairs of kernels per CUDA graph and times 20 replays with CUDA events,
+so host launch overhead does not dominate the comparison.
+
 ## Command reference
 
 | Command | Purpose |
@@ -268,7 +324,7 @@ Flags override the environment. Colors are used on a terminal unless `NO_COLOR` 
 HF checkpoint ──convert──▶ .tach (Q4/Q8/Q3 weights, tokenizer, chat template, layer graph)
                                 │ mmap
                                 ▼
-HTTP (OpenAI / Anthropic) ─▶ server ─▶ engine (continuous batching, prefix cache, speculation)
+HTTP (OpenAI / Anthropic / Ollama) ─▶ server ─▶ engine (continuous batching, prefix cache, speculation)
                                               │
                                               ▼
                                   backend: CUDA (NVRTC kernels) or CPU (AVX-512 / AVX2 / scalar)
@@ -294,7 +350,8 @@ data/           calibration text (wikitext-2 train) and evaluation text (wikitex
 ## Testing
 
 ```bash
-make test                                # offline file validation + CPU kernel reference checks
+make test                                # offline file validation, CPU kernels and HTTP/API regressions
+make test-cuda                           # CUDA candidate sampling vs full logits, including overflow
 make test-models PYTHON=.venv/bin/python  # tiny model conversion + CPU logits vs Transformers; no downloads
 TACH_TEST_DEVICE=cuda make test-models PYTHON=.venv/bin/python  # quantized references on CUDA
 tools/regress.sh                          # perplexity regression across models, both CUDA paths
@@ -313,8 +370,6 @@ need `torch` and `transformers`.
   returned as text.
 - Image inputs, logprobs and `n > 1` aren't supported.
 - Chat templates are written per model family, not run from Jinja.
-- Ollama's management endpoints (`/api/tags`, `/api/ps`, `/api/pull`, …) exist, but `/api/chat` and
-  `/api/generate` don't.
 
 ## License
 

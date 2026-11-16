@@ -40,12 +40,27 @@ $(BUILD)/file-probe: tests/file_probe.cpp $(BUILD)/model_file.o $(BUILD)/safeten
 $(BUILD)/kernel-test: tests/kernel_test.cpp $(BUILD)/cpu_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
-test: $(BUILD)/file-probe $(BUILD)/kernel-test
+$(BUILD)/text-test: tests/text_test.cpp $(BUILD)/tokenizer.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/sampler.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
+
+test: tachyon $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/text-test
 	python3 tests/file_test.py $(BUILD)/file-probe
 	$(BUILD)/kernel-test
+	python3 tests/server_test.py ./tachyon $(BUILD)/text-test
 
 $(BUILD)/inference-probe: tests/inference_probe.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/cuda_api.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
+
+$(BUILD)/cuda-sampling-test: tests/cuda_sampling_test.cpp $(BUILD)/cpu_backend.o $(BUILD)/cuda_backend.o $(BUILD)/cuda_api.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
+
+$(BUILD)/bench-sampling: tools/bench_sampling.cpp $(BUILD)/cuda_api.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
+
+test-cuda: $(BUILD)/cuda-sampling-test
+	python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tests"); from server_test import fixture; fixture(Path("$(BUILD)/sampling.tach")); fixture(Path("$(BUILD)/sampling-wide.tach"), vocab=1056)'
+	$(BUILD)/cuda-sampling-test $(BUILD)/sampling.tach
+	$(BUILD)/cuda-sampling-test $(BUILD)/sampling-wide.tach
 
 # Optional reference tests: needs torch, transformers, numpy and safetensors (no downloads).
 PYTHON ?= python3
@@ -55,4 +70,4 @@ test-models: tachyon $(BUILD)/inference-probe
 clean:
 	rm -rf $(BUILD) tachyon tachyon-client
 
-.PHONY: all clean test test-models
+.PHONY: all clean test test-models test-cuda

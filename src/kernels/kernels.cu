@@ -1343,18 +1343,23 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
 }
 
 // ---- sampling support: compact candidate lists (logit >= rowmax - delta) for host-side top-k/top-p ----
-// pass 1: row max (grid rows, block 1024)
-extern "C" __global__ void __launch_bounds__(1024) row_max(const float* __restrict__ logits, int V, float* __restrict__ out, int* __restrict__ counts) {
-    const float* l = logits + (size_t)blockIdx.x * V;
+// pass 1: 32 partial maxima per row (grid 32 x rows, block 256).
+// Large vocabularies need multiple CTAs to use the memory bandwidth of the GPU.
+extern "C" __global__ void __launch_bounds__(256) row_max(const float* __restrict__ logits, int V, float* __restrict__ out, int* __restrict__ counts) {
+    const int row = blockIdx.y;
+    const float* l = logits + (size_t)row * V;
     float m = -INFINITY;
-    for (int i = threadIdx.x; i < V; i += 1024) m = fmaxf(m, l[i]);
+    for (int i = blockIdx.x * 256 + threadIdx.x; i < V; i += 32 * 256) m = fmaxf(m, l[i]);
     m = warp_max(m);
     __shared__ float sm[32];
     if (threadIdx.x % 32 == 0) sm[threadIdx.x / 32] = m;
     __syncthreads();
     if (threadIdx.x < 32) {
-        m = warp_max(sm[threadIdx.x]);
-        if (threadIdx.x == 0) { out[blockIdx.x] = m; counts[blockIdx.x] = 0; }
+        m = warp_max(threadIdx.x < 8 ? sm[threadIdx.x] : -INFINITY);
+        if (threadIdx.x == 0) {
+            out[(size_t)row * 32 + blockIdx.x] = m;
+            if (blockIdx.x == 0) counts[row] = 0;
+        }
     }
 }
 // pass 2: grid (blocks, rows)
@@ -1362,12 +1367,19 @@ extern "C" __global__ void cand_filter(const float* __restrict__ logits, int V, 
                                        int* __restrict__ counts, float2* __restrict__ out) {
     const int row = blockIdx.y;
     const float* l = logits + (size_t)row * V;
-    const float thr = rmax[row] - delta;
+    const float thr = warp_max(rmax[(size_t)row * 32 + (threadIdx.x & 31)]) - delta;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < V; i += gridDim.x * blockDim.x) {
         const float v = l[i];
-        if (v >= thr) {
-            const int p = atomicAdd(&counts[row], 1);
-            if (p < cap) out[(size_t)row * cap + p] = make_float2(v, __int_as_float(i));
+        // Reserve one contiguous range per warp instead of contending once per token.
+        const unsigned active = __activemask();
+        const unsigned mask = __ballot_sync(active, v >= thr);
+        if (mask) {
+            const int leader = __ffs(mask) - 1, lane = threadIdx.x & 31;
+            int base = 0;
+            if (lane == leader) base = atomicAdd(&counts[row], __popc(mask));
+            base = __shfl_sync(active, base, leader);
+            const int p = base + __popc(mask & ((1u << lane) - 1));
+            if ((mask & (1u << lane)) && p < cap) out[(size_t)row * cap + p] = make_float2(v, __int_as_float(i));
         }
     }
 }

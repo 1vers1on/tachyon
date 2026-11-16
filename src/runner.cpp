@@ -9,6 +9,7 @@
 #include "json.h"
 #include "http.h"
 #include "model_file.h"
+#include "ollama.h"
 #include "https.h"
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -26,6 +27,7 @@
 #include <glob.h>
 #include <ftw.h>
 #include <map>
+#include <set>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -185,9 +187,8 @@ std::string ago(double sec) {
     else snprintf(s, sizeof s, "%.0f days", sec / 86400);
     return s;
 }
-std::string iso_now() {
+std::string iso_now(time_t t = time(nullptr)) {
     char b[64];
-    time_t t = time(nullptr);
     struct tm tmv;
     gmtime_r(&t, &tmv);
     strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", &tmv);
@@ -590,7 +591,9 @@ struct Runner {
     int port = 0;
     int inflight = 0;
     bool ready = false;
+    bool unload_requested = false;
     double last_used = 0, started = 0;
+    double keep_alive = 300;
 };
 
 class Manager {
@@ -604,7 +607,8 @@ public:
             for (auto it = runners_.begin(); it != runners_.end();) {
                 auto& r = it->second;
                 int st;
-                if (r->pid > 0 && waitpid(r->pid, &st, WNOHANG) == r->pid) {
+                // acquire() owns waitpid while a runner is loading.
+                if (r->ready && r->pid > 0 && waitpid(r->pid, &st, WNOHANG) == r->pid) {
                     char how[64];
                     if (WIFSIGNALED(st)) snprintf(how, sizeof how, "killed by signal %d (%s)", WTERMSIG(st), strsignal(WTERMSIG(st)));
                     else snprintf(how, sizeof how, "exit code %d", WEXITSTATUS(st));
@@ -614,7 +618,7 @@ public:
                     cv_.notify_all();
                     continue;
                 }
-                if (r->ready && r->inflight == 0 && o_.keep_alive >= 0 && now_sec() - r->last_used > o_.keep_alive) {
+                if (r->ready && r->inflight == 0 && r->keep_alive >= 0 && now_sec() - r->last_used >= r->keep_alive) {
                     logi("unloading %s (idle %.0fs)", r->name.c_str(), now_sec() - r->last_used);
                     kill_runner(*r);
                     it = runners_.erase(it);
@@ -671,6 +675,7 @@ private:
     bool reply(Conn& c, const HttpRequest& r, int code, const Json& body) { return c.send_response(code, "application/json", body.dump(), r.keep_alive); }
     bool error(Conn& c, const HttpRequest& r, int code, const std::string& msg) {
         c.note = msg.size() > 300 ? msg.substr(0, 300) + "..." : msg;
+        if (r.path.rfind("/api/", 0) == 0) { Json j = Json::object(); j.set("error", msg); return reply(c, r, code, j); }
         const bool anth = r.path.find("/messages") != std::string::npos;
         std::string type = code == 404 ? (anth ? "not_found_error" : "model_not_found") : code >= 500 ? "api_error" : code == 401 ? "authentication_error" : "invalid_request_error";
         return reply(c, r, code, err_json(msg, anth, type));
@@ -803,6 +808,7 @@ private:
             mkdirs(home_dir() + "/logs");
             r->log = home_dir() + "/logs/" + slug(m.name) + ".log";
             r->started = now_sec();
+            r->keep_alive = o_.keep_alive;
             r->pid = spawn_runner(m, r->port, r->log);
             runners_[m.name] = r;
             logi("loading %s (pid %d, port %d, log %s)", m.name.c_str(), r->pid, r->port, r->log.c_str());
@@ -810,6 +816,7 @@ private:
             bool ok = false;
             std::string body;
             while (true) {
+                if (r->pid <= 0) break;
                 int st;
                 if (waitpid(r->pid, &st, WNOHANG) == r->pid) { r->pid = -1; break; }
                 body.clear();
@@ -832,10 +839,18 @@ private:
             return r;
         }
     }
-    void release(const std::shared_ptr<Runner>& r) {
+    void release(const std::shared_ptr<Runner>& r, double keep_alive) {
         std::lock_guard<std::mutex> lk(mu_);
         r->inflight--;
+        auto it = runners_.find(r->name);
+        if (it == runners_.end() || it->second != r) return;
         r->last_used = now_sec();
+        if (r->unload_requested) keep_alive = 0;
+        r->keep_alive = keep_alive;
+        if (r->inflight == 0 && keep_alive == 0) {
+            kill_runner(*r);
+            runners_.erase(r->name);
+        }
         cv_.notify_all();
     }
 
@@ -894,9 +909,9 @@ private:
                 j.set("model", m.name);
                 j.set("size", (int64_t)m.size);
                 j.set("modified_at", m.created);
-                Json d = Json::object();
-                d.set("format", "tach");
-                d.set("quantization_level", m.quant);
+                j.set("digest", "");
+                ModelFile mf; mf.open(m.path);
+                Json d = ollama_details(mf);
                 d.set("source", m.source);
                 j.set("details", d);
                 arr.push(j);
@@ -914,12 +929,16 @@ private:
                 j.set("name", x.name);
                 j.set("model", x.name);
                 j.set("size", (int64_t)file_size(x.path));
+                j.set("digest", "");
+                const double remaining = x.keep_alive - (now_sec() - x.last_used);
+                j.set("expires_at", x.keep_alive < 0 || x.inflight || remaining > 6e9 ? "9999-12-31T23:59:59Z" : iso_now(time(nullptr) + (time_t)std::max(0.0, remaining)));
+                ModelFile mf; mf.open(x.path); j.set("details", ollama_details(mf));
                 j.set("pid", (int)x.pid);
                 j.set("port", x.port);
                 j.set("status", x.ready ? (x.inflight ? "busy" : "idle") : "loading");
                 j.set("active_requests", x.inflight);
                 j.set("idle_seconds", x.inflight ? 0.0 : now_sec() - x.last_used);
-                j.set("unload_in_seconds", o_.keep_alive < 0 || x.inflight ? -1.0 : std::max(0.0, o_.keep_alive - (now_sec() - x.last_used)));
+                j.set("unload_in_seconds", x.keep_alive < 0 || x.inflight ? -1.0 : std::max(0.0, x.keep_alive - (now_sec() - x.last_used)));
                 arr.push(j);
             }
             Json o = Json::object();
@@ -930,23 +949,64 @@ private:
         if (r.method == "POST" || r.method == "DELETE") {
             std::string err;
             body = Json::parse(r.body.empty() ? "{}" : r.body, &err);
-            if (!err.empty()) return error(c, r, 400, "invalid JSON body: " + err);
+            if (!err.empty() || !body.is_obj()) return error(c, r, 400, "invalid JSON body: " + err);
         }
         const std::string name = body.get_str("model", body.get_str("name", ""));
-        if (r.path == "/api/stop" || (r.path == "/api/generate" && body.get_num("keep_alive", 1) == 0)) {
+        const bool ollama = r.path == "/api/chat" || r.path == "/api/generate";
+        double keep_alive = o_.keep_alive;
+        if (ollama) {
+            if (name.empty()) return error(c, r, 400, "model is required");
+            if (body.has("keep_alive")) {
+                const Json& k = body["keep_alive"];
+                if (k.is_num()) keep_alive = k.num;
+                else if (k.is_str()) {
+                    char* end = nullptr;
+                    keep_alive = strtod(k.str.c_str(), &end);
+                    const std::string unit = end ? end : "";
+                    double scale = unit == "ns" ? 1e-9 : unit == "us" ? 1e-6 : unit == "ms" ? 1e-3 : unit == "s" ? 1 : unit == "m" ? 60 : unit == "h" ? 3600 : unit.empty() && keep_alive == 0 ? 1 : 0;
+                    if (end == k.str.c_str() || !scale) return error(c, r, 400, "invalid keep_alive duration");
+                    keep_alive *= scale;
+                } else return error(c, r, 400, "keep_alive must be seconds or a duration string");
+                if (!std::isfinite(keep_alive)) return error(c, r, 400, "invalid keep_alive duration");
+            }
+        }
+        if (r.method == "POST" && r.path == "/api/show") {
+            LocalModel m;
+            if (!find_local(name, m)) return error(c, r, 404, "model not found");
+            ModelFile mf; mf.open(m.path);
+            return reply(c, r, 200, ollama_show(mf));
+        }
+        const bool unload = ollama && keep_alive == 0 && (r.path == "/api/generate" ? body.get_str("prompt", "").empty() : body["messages"].is_arr() && body["messages"].arr.empty());
+        if (r.method == "POST" && (r.path == "/api/stop" || unload)) {
             std::lock_guard<std::mutex> lk(mu_);
             std::string key = name;
             LocalModel m;
             if (find_local(name, m)) key = m.name;
             auto it = runners_.find(key);
-            if (it == runners_.end()) return error(c, r, 404, "model " + name + " is not loaded");
-            kill_runner(*it->second);
-            runners_.erase(it);
+            if (it == runners_.end() && !unload) return error(c, r, 404, "model " + name + " is not loaded");
+            if (it != runners_.end()) {
+                if (unload && it->second->inflight) { it->second->keep_alive = 0; it->second->unload_requested = true; }
+                else { kill_runner(*it->second); runners_.erase(it); }
+            }
             cv_.notify_all();
+            if (unload) {
+                Json j = Json::object(); j.set("model", key); j.set("done", true); j.set("done_reason", "unload"); j.set("created_at", iso_now());
+                if (r.path == "/api/generate") j.set("response", "");
+                else { Json m = Json::object(); m.set("role", "assistant"); m.set("content", ""); j.set("message", m); }
+                return reply(c, r, 200, j);
+            }
             return reply(c, r, 200, Json::object());
         }
         if (r.path == "/api/pull") {
             if (name.empty()) return error(c, r, 400, "model is required");
+            const bool stream = body.get_bool("stream", true);
+            if (!stream) {
+                mkdirs(home_dir() + "/logs");
+                std::string log = home_dir() + "/logs/pull-" + slug(parse_ref(name).name) + ".log";
+                int rc = run_prog({self_exe(), "pull", name}, log);
+                if (rc) return error(c, r, 500, tail_file(log, 600));
+                Json j = Json::object(); j.set("status", "success"); return reply(c, r, 200, j);
+            }
             if (!c.start_chunked("application/x-ndjson")) return false;
             mkdirs(home_dir() + "/logs");
             std::string log = home_dir() + "/logs/pull-" + slug(parse_ref(name).name) + ".log";
@@ -972,14 +1032,20 @@ private:
             return reply(c, r, 200, Json::object());
         }
         if (r.method != "POST") return error(c, r, 404, "not found: " + r.method + " " + r.path);
+        static const std::set<std::string> inference_paths = {
+            "/api/chat", "/api/generate", "/v1/chat/completions", "/chat/completions", "/v1/completions", "/completions",
+            "/v1/messages", "/messages", "/v1/messages/count_tokens", "/messages/count_tokens", "/tokenize", "/detokenize"};
+        if (!inference_paths.count(r.path)) return error(c, r, 404, "not found: " + r.method + " " + r.path);
         // inference endpoints: route by model
         LocalModel m;
         std::string err;
+        if (ollama && !find_local(name, m) && !(o_.auto_pull && parse_ref(name).known)) return error(c, r, 404, "model '" + name + "' not found");
         if (!resolve(name, m, err)) return error(c, r, 404, err);
+        if (ollama) { body.set("model", m.name); r.body = body.dump(); }
         auto run = acquire(m, err);
         if (!run) return error(c, r, 500, err);
         bool keep = http_relay(r, "127.0.0.1", run->port, c, &err);
-        release(run);
+        release(run, keep_alive);
         if (!err.empty()) return error(c, r, 502, err);
         return keep;
     }

@@ -13,6 +13,7 @@ struct SamplingParams {
     float presence_penalty = 0.0f;
     float frequency_penalty = 0.0f;
     uint64_t seed = 0;  // 0 = random
+    bool seed_set = false;  // an explicit seed, including zero
     bool greedy() const { return temperature <= 0.f || top_k == 1; }
     bool has_penalties() const { return repetition_penalty != 1.f || presence_penalty != 0.f || frequency_penalty != 0.f; }
 };

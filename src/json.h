@@ -5,6 +5,8 @@
 #include <utility>
 #include <memory>
 #include <cstdint>
+#include <cmath>
+#include <limits>
 
 struct Json {
     enum Type { Null, Bool, Number, String, Array, Object };
@@ -59,13 +61,16 @@ struct Json {
     size_t size() const { return type == Array ? arr.size() : type == Object ? obj.size() : 0; }
 
     double as_num(double def = 0) const { return type == Number ? num : (type == Bool ? (b ? 1 : 0) : def); }
-    int64_t as_int(int64_t def = 0) const { return type == Number ? (int64_t)num : def; }
+    int64_t as_int(int64_t def = 0) const {
+        return type == Number && std::isfinite(num) && num >= (double)std::numeric_limits<int64_t>::min() &&
+               num < -(double)std::numeric_limits<int64_t>::min() ? (int64_t)num : def;
+    }
     bool as_bool(bool def = false) const { return type == Bool ? b : (type == Number ? num != 0 : def); }
     std::string as_str(const std::string& def = "") const { return type == String ? str : def; }
 
     // get with default
     double get_num(const std::string& k, double def) const { auto p = find(k); return p && p->is_num() ? p->num : def; }
-    int64_t get_int(const std::string& k, int64_t def) const { auto p = find(k); return p && p->is_num() ? (int64_t)p->num : def; }
+    int64_t get_int(const std::string& k, int64_t def) const { auto p = find(k); return p ? p->as_int(def) : def; }
     bool get_bool(const std::string& k, bool def) const { auto p = find(k); return p && (p->is_bool() || p->is_num()) ? p->as_bool() : def; }
     std::string get_str(const std::string& k, const std::string& def) const { auto p = find(k); return p && p->is_str() ? p->str : def; }
 

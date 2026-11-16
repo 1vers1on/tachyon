@@ -80,10 +80,18 @@ public:
     const char* name() const override { return "cuda"; }
     ~CudaBackend() override {
         if (ctx_) {
+            dcu.cuCtxSetCurrent(ctx_);
             dcu.cuCtxSynchronize();
             for (auto& g : graphs_) if (g.second) dcu.cuGraphExecDestroy(g.second);
             if (module_) dcu.cuModuleUnload(module_);
             for (auto p : allocs_) dcu.cuMemFree(p);
+            for (auto ev : stage_ev_) if (ev) dcu.cuEventDestroy(ev);
+            for (int i = 0; i < 2; i++) {
+                if (stage_ready_[i]) dcu.cuEventDestroy(stage_ready_[i]);
+                if (stage_free_[i]) dcu.cuEventDestroy(stage_free_[i]);
+            }
+            if (cstream_) dcu.cuStreamDestroy(cstream_);
+            if (stream_) dcu.cuStreamDestroy(stream_);
             if (h_batch_) dcu.cuMemFreeHost(h_batch_);
             if (h_out_) dcu.cuMemFreeHost(h_out_);
             if (h_moe_) dcu.cuMemFreeHost(h_moe_);
@@ -215,8 +223,9 @@ public:
 
     bool candidates(int n, float delta, int cap, std::vector<std::vector<std::pair<float, int>>>& out) override {
         bind();
+        if (n <= 0 || n > n_logits_ || cap <= 0) return false;
         cap = std::min(cap, CAND_CAP);
-        launch(f_rowmax_, D3(n), D3(1024), 0, logits_, c_.vocab, d_rmax_, d_ccount_);
+        launch(f_rowmax_, D3(32, n), D3(256), 0, logits_, c_.vocab, d_rmax_, d_ccount_);
         launch(f_cand_, D3(32, n), D3(256), 0, logits_, c_.vocab, d_rmax_, delta, cap, d_ccount_, d_cand_);
         int* hc = (int*)h_out_;
         struct F2 { float x, y; };
@@ -224,6 +233,7 @@ public:
         CU(dcu.cuMemcpyDtoHAsync(hc, d_ccount_, n * 4, stream_));
         CU(dcu.cuMemcpyDtoHAsync(hv, d_cand_, (size_t)n * cap * 8, stream_));
         CU(dcu.cuStreamSynchronize(stream_));
+        for (int r = 0; r < n; r++) if (hc[r] <= 0 || hc[r] > cap) { out.clear(); return false; }
         out.assign(n, {});
         for (int r = 0; r < n; r++) {
             int k = std::min(hc[r], cap);
@@ -693,9 +703,9 @@ private:
         CU(dcu.cuMemsetD8(counters_, 0, (size_t)std::max(MAX_DEC, cap_) * std::max(1, maxNH_) * 4));
         logits_ = alloc((size_t)MAX_LOGITS * c_.vocab * 4);
         d_argmax_ = alloc(MAX_LOGITS * 4);
-        d_rmax_ = alloc(MAX_LOGITS * 4);
+        d_rmax_ = alloc(MAX_LOGITS * 32 * 4);
         d_ccount_ = alloc(MAX_LOGITS * 4);
-        d_cand_ = alloc((size_t)MAX_DEC * CAND_CAP * 8);
+        d_cand_ = alloc((size_t)MAX_LOGITS * CAND_CAP * 8);
         d_batch_ = alloc(4 * cap_ * sizeof(int));
         if (c_.ple_dim) {
             const size_t W = (size_t)c_.n_layers * c_.ple_dim;
@@ -727,7 +737,7 @@ private:
             CU(dcu.cuEventCreate(&stage_ev_[i], CU_EVENT_DISABLE_TIMING));
             CU(dcu.cuEventRecord(stage_ev_[i], stream_));
         }
-        CU(dcu.cuMemAllocHost((void**)&h_out_, std::max((size_t)c_.vocab * 4, (size_t)MAX_DEC * CAND_CAP * 8) + 4096));
+        CU(dcu.cuMemAllocHost((void**)&h_out_, std::max((size_t)c_.vocab * 4, (size_t)MAX_LOGITS * CAND_CAP * 8) + 4096));
     }
 
     // ---------------------------------------------------------------------------------------------

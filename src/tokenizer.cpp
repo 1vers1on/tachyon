@@ -377,17 +377,36 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
     return s;
 }
 
-std::string StreamDecoder::push(int id) {
-    if (id >= 0 && id < tok_->n_vocab()) pending_ += tok_->token_bytes(id);
-    size_t k = utf8_valid_prefix(pending_);
-    std::string out = pending_.substr(0, k);
-    pending_.erase(0, k);
+// Replace malformed byte sequences, retaining only a potentially valid incomplete suffix.
+// Byte-fallback tokens can otherwise put invalid UTF-8 into JSON and break API clients.
+static std::string stream_utf8(std::string& pending, bool final) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < pending.size()) {
+        const unsigned char c = pending[pos];
+        if (c < 0x80) { out += pending[pos++]; continue; }
+        const int len = c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+        if (!len) { out += "\xef\xbf\xbd"; pos++; continue; }
+        int j = 1;
+        for (; j < len && pos + j < pending.size(); j++) {
+            const unsigned char b = pending[pos + j];
+            if (b < 0x80 || b > 0xbf || (j == 1 && ((c == 0xe0 && b < 0xa0) || (c == 0xed && b > 0x9f) ||
+                (c == 0xf0 && b < 0x90) || (c == 0xf4 && b > 0x8f)))) break;
+        }
+        if (j == len) { out.append(pending, pos, len); pos += len; }
+        else if (!final && pos + j == pending.size()) break;
+        else { out += "\xef\xbf\xbd"; pos += j; }
+    }
+    pending.erase(0, pos);
     return out;
 }
+
+std::string StreamDecoder::push(int id) {
+    if (id >= 0 && id < tok_->n_vocab()) pending_ += tok_->token_bytes(id);
+    return stream_utf8(pending_, false);
+}
 std::string StreamDecoder::flush() {
-    std::string o;
-    o.swap(pending_);
-    return o;
+    return stream_utf8(pending_, true);
 }
 
 static std::string strip_nl(const std::string& s) {

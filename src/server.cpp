@@ -1,12 +1,14 @@
-// Tachyon - HTTP server: OpenAI-compatible and Anthropic-compatible APIs (no dependencies: raw sockets,
+// Tachyon - HTTP server: OpenAI-, Anthropic- and Ollama-compatible APIs (no dependencies: raw sockets,
 // HTTP/1.1 keep-alive, chunked SSE).
 //
 // OpenAI:    POST /v1/chat/completions, POST /v1/completions, GET /v1/models[/{id}]
 // Anthropic: POST /v1/messages, POST /v1/messages/count_tokens
+// Ollama:    POST /api/chat, POST /api/generate, POST /api/show, GET /api/tags, /api/ps, /api/version
 // Other:     GET /health, POST /tokenize, POST /detokenize
 #include "server.h"
 #include "http.h"
 #include "chat.h"
+#include "ollama.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -154,6 +156,10 @@ private:
 
     bool send_error(Conn& c, const HttpRequest& r, int code, const std::string& msg, const std::string& type = "invalid_request_error") {
         c.note = msg;
+        if (r.path.rfind("/api/", 0) == 0) {
+            Json j = Json::object(); j.set("error", msg);
+            return c.send_response(code, "application/json", j.dump(), r.keep_alive);
+        }
         std::string atype = code == 401 ? "authentication_error" : code == 404 ? "not_found_error" : code >= 500 ? "api_error" : type;
         return c.send_response(code, "application/json", is_anthropic(r) ? anth_error(msg, atype).dump() : oai_error(msg, type).dump(), r.keep_alive);
     }
@@ -200,6 +206,31 @@ private:
             return c.send_response(200, "text/plain", s, r.keep_alive);
         }
         if (!authorized(r)) return send_error(c, r, 401, "invalid API key");
+        if (r.method == "GET" && r.path == "/api/version") {
+            Json j = Json::object(); j.set("version", TACH_VERSION);
+            return c.send_response(200, "application/json", j.dump(), r.keep_alive);
+        }
+        if (r.method == "GET" && (r.path == "/api/tags" || r.path == "/api/ps")) {
+            Json j = Json::object(), m = Json::object(), a = Json::array();
+            m.set("name", alias_); m.set("model", alias_);
+            m.set("size", (int64_t)e_.mf.file_size);
+            m.set("digest", ""); m.set("modified_at", iso_time(time(nullptr)));
+            m.set("details", ollama_details(e_.mf));
+            if (r.path == "/api/ps") {
+                m.set("context_length", e_.opt.backend.ctx);
+                m.set("size_vram", std::string(e_.be->name()) == "cuda" ? (int64_t)e_.mf.file_size : 0);
+                m.set("expires_at", "9999-12-31T23:59:59Z");
+            }
+            a.push(m); j.set("models", a);
+            return c.send_response(200, "application/json", j.dump(), r.keep_alive);
+        }
+        if (r.method == "POST" && r.path == "/api/show") {
+            std::string err; Json j = Json::parse(r.body, &err);
+            if (!err.empty() || !j.is_obj()) return send_error(c, r, 400, "invalid JSON body");
+            if (j.get_str("model", j.get_str("name", "")) != alias_) return send_error(c, r, 404, "model not found");
+            return c.send_response(200, "application/json", ollama_show(e_.mf).dump(), r.keep_alive);
+        }
+        if (r.method == "POST" && (r.path == "/api/chat" || r.path == "/api/generate")) return ollama_inference(c, r);
         if (r.method == "GET" && (r.path == "/v1/models" || r.path == "/models")) {
             Json l = Json::object();
             l.set("object", "list");
@@ -384,6 +415,132 @@ private:
         return t;
     }
 
+    // ------------------------------------------------------------------------------------------ Ollama
+    bool ollama_inference(Conn& c, const HttpRequest& hr) {
+        std::string err;
+        Json j = Json::parse(hr.body, &err);
+        if (!err.empty() || !j.is_obj()) return send_error(c, hr, 400, "invalid JSON body");
+        if (!j["model"].is_str() || j["model"].str.empty()) return send_error(c, hr, 400, "model is required");
+        if (j["model"].str != alias_) return send_error(c, hr, 404, "model '" + j["model"].str + "' not found");
+        const bool chat = hr.path == "/api/chat", stream = j.get_bool("stream", true);
+        if (j.has("stream") && !j["stream"].is_bool()) return send_error(c, hr, 400, "stream must be a boolean");
+        if (j.has("options") && !j["options"].is_obj()) return send_error(c, hr, 400, "options must be an object");
+        if (j.has("think") && !j["think"].is_null() && !j["think"].is_bool()) return send_error(c, hr, 400, "think must be a boolean or null");
+        if (j.has("format") && !j["format"].is_obj() && !(j["format"].is_str() && (j["format"].str.empty() || j["format"].str == "json")))
+            return send_error(c, hr, 400, "format must be 'json' or a JSON schema");
+        if (!j.get_str("suffix", "").empty()) return send_error(c, hr, 400, "fill-in-the-middle suffix is not supported");
+        if (!j.get_str("template", "").empty()) return send_error(c, hr, 400, "custom templates are not supported");
+        if (j.get_bool("logprobs", false)) return send_error(c, hr, 400, "logprobs are not supported");
+        if (j["images"].size()) return send_error(c, hr, 400, "image inputs are not supported");
+        const Json& options = j["options"];
+        for (const char* key : {"temperature", "top_p", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty"})
+            if (options.has(key) && (!options[key].is_num() || !std::isfinite(options[key].num))) return send_error(c, hr, 400, std::string("invalid option: ") + key);
+        for (const char* key : {"num_predict", "num_ctx", "top_k", "seed"})
+            if (options.has(key) && (!options[key].is_num() || !std::isfinite(options[key].num) || options[key].num < -2 || options[key].num > INT32_MAX || options[key].num != options[key].as_int()))
+                return send_error(c, hr, 400, std::string("invalid integer option: ") + key);
+        // Translate the options supported by the common sampler.
+        Json translated = options;
+        translated.set("max_tokens", options.get_int("num_predict", -1));
+        translated.set("repetition_penalty", options.get_num("repeat_penalty", default_sampling().repetition_penalty));
+        ChatSpec spec;
+        if (chat) {
+            if (!j["messages"].is_arr()) return send_error(c, hr, 400, "messages must be an array");
+            Json messages = Json::array();
+            for (auto m : j["messages"].arr) {
+                if (!m.is_obj() || !m["role"].is_str() || (m.has("content") && !m["content"].is_str()))
+                    return send_error(c, hr, 400, "messages must contain objects with a role and string content");
+                const std::string role = m["role"].str;
+                if (role != "system" && role != "user" && role != "assistant" && role != "tool") return send_error(c, hr, 400, "invalid message role");
+                if (m["images"].size()) return send_error(c, hr, 400, "image inputs are not supported");
+                m.set("reasoning_content", m.get_str("thinking", ""));
+                m.set("name", m.get_str("tool_name", ""));
+                messages.push(m);
+            }
+            translated.set("messages", messages);
+            translated.set("tools", j["tools"]);
+            if (!(err = oai_spec(translated, spec)).empty()) return send_error(c, hr, 400, err);
+        } else {
+            if (j.has("prompt") && !j["prompt"].is_str()) return send_error(c, hr, 400, "prompt must be a string");
+            if (j.has("system") && !j["system"].is_str()) return send_error(c, hr, 400, "system must be a string");
+            oai_sampling(translated, spec);
+            if (!j.get_str("system", "").empty()) { ChatMessage m; m.role = "system"; m.content = j["system"].str; spec.msgs.push_back(m); }
+            ChatMessage m; m.role = "user"; m.content = j.get_str("prompt", ""); spec.msgs.push_back(m);
+        }
+        if (j["think"].is_bool()) spec.thinking = j["think"].b;
+        spec.sp.seed_set = options.has("seed") && options.get_int("seed", -1) >= 0;
+        if (!spec.sp.seed_set) spec.sp.seed = 0;
+        if (j["format"].is_obj() || j.get_str("format", "") == "json") spec.format_instruction = json_instruction(j["format"]);
+        const auto& sp = spec.sp;
+        if (!std::isfinite(sp.temperature) || sp.temperature < 0 || !std::isfinite(sp.top_p) || sp.top_p < 0 || sp.top_p > 1 ||
+            !std::isfinite(sp.min_p) || sp.min_p < 0 || sp.min_p > 1 || !std::isfinite(sp.repetition_penalty) || sp.repetition_penalty <= 0 ||
+            !std::isfinite(sp.presence_penalty) || !std::isfinite(sp.frequency_penalty)) return send_error(c, hr, 400, "invalid sampling options");
+        const int64_t requested_ctx = options.get_int("num_ctx", e_.opt.backend.ctx);
+        if (requested_ctx <= 0 || requested_ctx > e_.opt.backend.ctx) return send_error(c, hr, 400, "num_ctx must be within the server context length");
+        if (options.has("num_predict") && (!options["num_predict"].is_num() || options["num_predict"].num != options.get_int("num_predict", -1) || options["num_predict"].num < -2))
+            return send_error(c, hr, 400, "num_predict must be an integer >= -2");
+        if (j.has("context")) return send_error(c, hr, 400, "legacy context tokens are not supported; use /api/chat history");
+        const bool empty = chat ? spec.msgs.empty() : j.get_str("prompt", "").empty();
+        Prepared p;
+        if (!empty) {
+            if (!chat && j.get_bool("raw", false)) {
+                p.req = std::make_shared<GenRequest>();
+                p.req->prompt = e_.tok.encode(j["prompt"].str);
+                p.req->sp = spec.sp; p.req->stop = spec.stop;
+                p.req->max_tokens = spec.max_tokens > 0 ? spec.max_tokens : (int)requested_ctx;
+            } else if (!(err = prepare(spec, p)).empty()) return send_error(c, hr, 400, err);
+            if (p.req->prompt.size() >= (size_t)requested_ctx) return send_error(c, hr, 400, "prompt exceeds num_ctx");
+            p.req->max_tokens = std::min(p.req->max_tokens, (int)requested_ctx - (int)p.req->prompt.size());
+            if (spec.max_tokens == 0) p.req->max_tokens = 0;
+        }
+        struct Sink : Events {
+            bool chat, stream;
+            std::string model, out, content, thinking;
+            Json calls = Json::array();
+            Json response(bool done, const std::string& text = "", const std::string& thought = "", const Json& tc = Json()) {
+                Json o = Json::object(); o.set("model", model); o.set("created_at", iso_time(time(nullptr))); o.set("done", done);
+                Json msg = Json::object(); msg.set("role", "assistant"); msg.set("content", text);
+                if (!thought.empty()) msg.set("thinking", thought);
+                if (tc.size()) msg.set("tool_calls", tc);
+                if (chat) o.set("message", msg);
+                else { o.set("response", text); if (!thought.empty()) o.set("thinking", thought); }
+                return o;
+            }
+            void text(const std::string& t) override { if (stream) out += response(false, t).dump() + "\n"; else content += t; }
+            void reasoning(const std::string& t) override { if (stream) out += response(false, "", t).dump() + "\n"; else thinking += t; }
+            void tool_call(ToolCall& tc) override {
+                Json f = Json::object(), call = Json::object(), a = Json::array();
+                f.set("index", (int)calls.size()); f.set("name", tc.name);
+                f.set("arguments", Json::parse(tc.arguments)); call.set("function", f); calls.push(call); a.push(call);
+                if (stream) out += response(false, "", "", a).dump() + "\n";
+            }
+        } sink;
+        sink.chat = chat; sink.stream = stream; sink.model = alias_;
+        if (stream && !c.start_chunked("application/x-ndjson")) return false;
+        if (!empty) {
+            if (!pump(c, p, sink, stream,
+                [&]() -> long { std::string s; s.swap(sink.out); return s.empty() ? 0 : c.chunk(s) ? (long)s.size() : -1; },
+                [&]() { return c.chunk("\n"); })) return false;
+            log_request(*p.req, chat ? "ollama-chat" : "ollama-generate");
+            if (p.req->finish_reason == "error") {
+                if (!stream) return send_error(c, hr, 500, p.req->error);
+                Json o = Json::object(); o.set("error", p.req->error);
+                return c.chunk(o.dump() + "\n") && c.end_chunked();
+            }
+        }
+        Json o = sink.response(true, sink.content, sink.thinking, stream ? Json() : sink.calls);
+        o.set("done_reason", empty ? "load" : p.req->finish_reason);
+        auto ns = [](double seconds) { return (int64_t)(std::max(0.0, seconds) * 1e9); };
+        o.set("total_duration", empty ? (int64_t)0 : ns(p.req->t_done - p.req->t_submit));
+        o.set("load_duration", (int64_t)0);
+        o.set("prompt_eval_count", empty ? 0 : p.req->n_prompt);
+        o.set("prompt_eval_cached_count", empty ? 0 : p.req->n_cached);
+        o.set("prompt_eval_duration", empty ? (int64_t)0 : ns(p.req->t_prefill_done - p.req->t_submit));
+        o.set("eval_count", empty ? 0 : p.req->n_gen);
+        o.set("eval_duration", empty ? (int64_t)0 : ns(p.req->t_done - p.req->t_prefill_done));
+        if (stream) return c.chunk(o.dump() + "\n") && c.end_chunked();
+        return c.send_response(200, "application/json", o.dump(), hr.keep_alive);
+    }
+
     // ------------------------------------------------------------------------------------------ OpenAI
 
     void oai_sampling(const Json& j, ChatSpec& s) const {
@@ -396,6 +553,7 @@ private:
         s.sp.frequency_penalty = (float)j.get_num("frequency_penalty", 0);
         s.sp.repetition_penalty = (float)j.get_num("repetition_penalty", s.sp.repetition_penalty);
         s.sp.seed = (uint64_t)j.get_int("seed", 0);
+        s.sp.seed_set = j.has("seed") && j["seed"].is_num();
         s.max_tokens = (int)j.get_int("max_completion_tokens", j.get_int("max_tokens", -1));
         const Json& stop = j["stop"];
         if (stop.is_str()) s.stop.push_back(stop.str);
@@ -581,7 +739,13 @@ private:
         p.req = std::make_shared<GenRequest>();
         const Json& pj = j["prompt"];
         if (pj.is_str()) p.req->prompt = e_.tok.encode(pj.str);
-        else if (pj.is_arr() && !pj.arr.empty() && pj[0].is_num()) for (auto& t : pj.arr) p.req->prompt.push_back((int)t.as_int());
+        else if (pj.is_arr() && !pj.arr.empty() && pj[0].is_num()) {
+            for (auto& t : pj.arr) {
+                if (!t.is_num() || !std::isfinite(t.num) || t.num < 0 || t.num >= e_.mf.config.vocab || t.num != (int)t.num)
+                    return send_error(c, hr, 400, "prompt contains an invalid token id");
+                p.req->prompt.push_back((int)t.num);
+            }
+        }
         else if (pj.is_arr() && !pj.arr.empty() && pj[0].is_str()) p.req->prompt = e_.tok.encode(pj[0].str);
         else return send_error(c, hr, 400, "prompt is required");
         const int ctx = e_.opt.backend.ctx;

@@ -161,6 +161,11 @@ void Engine::admit() {
         s.req = r;
         n_active_++;
         queue_.pop_front();
+        if (std::any_of(r->prompt.begin(), r->prompt.end(), [&](int t) { return t < 0 || t >= be->vocab(); })) {
+            r->error = "prompt contains an out-of-range token id";
+            finish(s, "error");
+            continue;
+        }
         if ((int)r->prompt.size() + 1 > opt.backend.ctx) {
             r->error = "prompt (" + std::to_string(r->prompt.size()) + " tokens) exceeds context size " + std::to_string(opt.backend.ctx);
             logw("%s", r->error.c_str());
@@ -192,6 +197,7 @@ void Engine::admit() {
         s.generating = false;
         s.last = -1;
         s.sampler.init(r->sp);
+        for (int t : r->prompt) s.sampler.accept(t);
         s.dec = std::make_unique<StreamDecoder>(&tok);
         s.pending_text.clear();
         s.spec_k = opt.spec_draft;
@@ -265,7 +271,7 @@ bool Engine::emit_token(Slot& s, int t) {
     }
     if (r.cancel) { finish(s, "cancelled"); return false; }
     if (r.n_gen >= r.max_tokens) { finish(s, "length"); return false; }
-    if ((int)s.hist.size() + 1 >= opt.backend.ctx) { finish(s, "length"); return false; }
+    if ((int)s.hist.size() >= opt.backend.ctx) { finish(s, "length"); return false; }
     return true;
 }
 
@@ -374,6 +380,7 @@ bool Engine::step() {
                 t = s.sampler.sample(logits_buf_.data(), be->vocab());
             }
             r.t_prefill_done = now_sec();  // after the sync above, so it measures real GPU time
+            if (r.max_tokens == 0) { finish(s, "length"); return true; }
             s.generating = true;
             s.last = t;
             emit_token(s, t);

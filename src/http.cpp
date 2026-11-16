@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <strings.h>
+#include <charconv>
 
 std::string HttpRequest::header(const std::string& k) const {
     for (auto& h : headers) if (strcasecmp(h.first.c_str(), k.c_str()) == 0) return h.second;
@@ -44,12 +45,20 @@ bool Conn::fill() {
 }
 
 bool Conn::read_request(HttpRequest& r, int* status) {
+    r = HttpRequest{};
     if (status) *status = 0;
+    auto bad = [&](int code = 400) { if (status) *status = code; return false; };
+    auto number = [](const std::string& text, size_t& value, int base) {
+        if (text.empty()) return false;
+        auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value, base);
+        return ec == std::errc() && end == text.data() + text.size();
+    };
     size_t hdr_end;
     while ((hdr_end = buf_.find("\r\n\r\n")) == std::string::npos) {
         if (buf_.size() > (1 << 20)) { if (status) *status = 431; return false; }
         if (!fill()) return false;
     }
+    if (hdr_end > (1 << 20)) return bad(431);
     std::string head = buf_.substr(0, hdr_end);
     buf_.erase(0, hdr_end + 4);
     size_t le = head.find("\r\n");
@@ -59,6 +68,7 @@ bool Conn::read_request(HttpRequest& r, int* status) {
     r.method = line.substr(0, a);
     r.path = line.substr(a + 1, b - a - 1);
     std::string ver = line.substr(b + 1);
+    if ((ver != "HTTP/1.1" && ver != "HTTP/1.0") || r.path.empty() || r.path[0] != '/' || r.path.find(' ') != std::string::npos) return bad();
     size_t q = r.path.find('?');
     if (q != std::string::npos) { r.query = r.path.substr(q + 1); r.path = r.path.substr(0, q); }
     while (r.path.size() > 1 && r.path.back() == '/') r.path.pop_back();
@@ -68,7 +78,8 @@ bool Conn::read_request(HttpRequest& r, int* status) {
         if (e == std::string::npos) e = head.size();
         std::string h = head.substr(p, e - p);
         size_t c = h.find(':');
-        if (c != std::string::npos) {
+        if (c == std::string::npos || c == 0 || h.substr(0, c).find_first_of(" \t") != std::string::npos) return bad();
+        {
             std::string v = h.substr(c + 1);
             while (!v.empty() && (v[0] == ' ' || v[0] == '\t')) v.erase(0, 1);
             while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
@@ -78,34 +89,58 @@ bool Conn::read_request(HttpRequest& r, int* status) {
     }
     std::string conn = r.header("Connection");
     r.keep_alive = ver == "HTTP/1.1" ? strcasecmp(conn.c_str(), "close") != 0 : strcasecmp(conn.c_str(), "keep-alive") == 0;
-    // clients (curl) wait for this before sending large bodies
-    if (strcasecmp(r.header("Expect").c_str(), "100-continue") == 0) write_all("HTTP/1.1 100 Continue\r\n\r\n");
     const size_t kMax = 256u << 20;
-    if (strcasestr(r.header("Transfer-Encoding").c_str(), "chunked")) {
+    int ncl = 0, nte = 0;
+    for (const auto& h : r.headers) {
+        ncl += strcasecmp(h.first.c_str(), "Content-Length") == 0;
+        nte += strcasecmp(h.first.c_str(), "Transfer-Encoding") == 0;
+    }
+    if (ncl > 1 || nte > 1 || (ncl && nte)) return bad();
+    const bool chunked = nte != 0;
+    if (chunked && strcasecmp(r.header("Transfer-Encoding").c_str(), "chunked") != 0) return bad();
+    size_t cl = 0;
+    if (ncl && !number(r.header("Content-Length"), cl, 10)) return bad();
+    if (cl > kMax) return bad(413);
+    // clients (curl) wait for this before sending large bodies
+    if (strcasecmp(r.header("Expect").c_str(), "100-continue") == 0 && !write_all("HTTP/1.1 100 Continue\r\n\r\n")) return false;
+    if (chunked) {
         r.body.clear();
         while (true) {
             size_t e;
-            while ((e = buf_.find("\r\n")) == std::string::npos) if (!fill()) return false;
-            size_t n = strtoull(buf_.substr(0, e).c_str(), nullptr, 16);
+            while ((e = buf_.find("\r\n")) == std::string::npos) {
+                if (buf_.size() > 8192) return bad();
+                if (!fill()) return false;
+            }
+            if (e > 8192) return bad();
+            std::string size = buf_.substr(0, e);
+            size_t ext = size.find(';');
+            if (ext != std::string::npos) size.resize(ext);
+            size_t n = 0;
+            if (!number(size, n, 16)) return bad();
             buf_.erase(0, e + 2);
             if (n == 0) {   // trailers until the empty line
+                size_t trailers = 0;
                 while (true) {
-                    while ((e = buf_.find("\r\n")) == std::string::npos) if (!fill()) return false;
+                    while ((e = buf_.find("\r\n")) == std::string::npos) {
+                        if (trailers + buf_.size() > (1 << 20)) return bad(431);
+                        if (!fill()) return false;
+                    }
+                    trailers += e + 2;
+                    if (trailers > (1 << 20)) return bad(431);
                     bool empty = e == 0;
                     buf_.erase(0, e + 2);
                     if (empty) break;
                 }
                 break;
             }
-            if (r.body.size() + n > kMax) { if (status) *status = 413; return false; }
+            if (n > kMax - r.body.size()) return bad(413);
             while (buf_.size() < n + 2) if (!fill()) return false;
+            if (buf_.compare(n, 2, "\r\n") != 0) return bad();
             r.body.append(buf_, 0, n);
             buf_.erase(0, n + 2);
         }
         return true;
     }
-    size_t cl = strtoull(r.header("Content-Length").c_str(), nullptr, 10);
-    if (cl > kMax) { if (status) *status = 413; return false; }
     while (buf_.size() < cl) if (!fill()) return false;
     r.body = buf_.substr(0, cl);
     buf_.erase(0, cl);
@@ -301,6 +336,7 @@ bool http_relay(const HttpRequest& r, const std::string& host, int port, Conn& c
         return true;
     }
     if (err) err->clear();
+    sscanf(head.c_str(), "HTTP/%*s %d", &client.status);
     // keep the client connection open: only the upstream hop is "Connection: close"
     std::string lh = lower(head);
     size_t cp = lh.find("\r\nconnection:");
