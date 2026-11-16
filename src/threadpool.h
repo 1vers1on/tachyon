@@ -8,7 +8,8 @@
 
 class ThreadPool {
 public:
-    explicit ThreadPool(int n) : n_(n < 1 ? 1 : n) {
+    // A zero spin limit lets I/O-bound callers park idle workers immediately.
+    explicit ThreadPool(int n, int spin_limit = 200000) : n_(n < 1 ? 1 : n), spin_limit_(spin_limit) {
         for (int i = 1; i < n_; i++) th_.emplace_back([this, i] { worker(i); });
     }
     ~ThreadPool() {
@@ -47,7 +48,7 @@ private:
             int spins = 0;
             uint32_t g;
             while ((g = gen_.load(std::memory_order_acquire)) == last) {
-                if (++spins < 200000) _mm_pause();
+                if (++spins < spin_limit_) _mm_pause();
                 else gen_.wait(last, std::memory_order_acquire);
             }
             last = g;
@@ -57,6 +58,7 @@ private:
         }
     }
     int n_;
+    int spin_limit_;
     std::vector<std::thread> th_;
     std::atomic<uint32_t> gen_{0};
     std::atomic<int> done_{0};

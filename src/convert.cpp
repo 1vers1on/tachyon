@@ -4,6 +4,7 @@
 #include "safetensors.h"
 #include "model_file.h"
 #include "quant.h"
+#include "threadpool.h"
 #include <thread>
 #include <unordered_map>
 #include <algorithm>
@@ -491,6 +492,7 @@ int convert_main(int argc, char** argv) {
         die("missing tensor (tried: %s)", all.c_str());
     };
     size_t total_bytes = 0;
+    ThreadPool quant_pool(o.threads, 0);
     // Write a matrix assembled from row sources
     auto write_matrix = [&](const std::string& name, QType qt, int64_t rows, int64_t cols,
                             const std::function<void(int64_t, float*)>& src_row) {
@@ -511,7 +513,7 @@ int convert_main(int argc, char** argv) {
             for (int64_t i = 0; i < cols; i++) impv[i] = it->second[i] + 0.01f * (float)avg;
             imp = impv.data();
         }
-        quantize_matrix(qt, rows, cols, src_row, data, scales, o.threads, imp);
+        quantize_matrix(qt, rows, cols, src_row, data, scales, quant_pool, imp);
         TensorInfo ti;
         ti.name = name; ti.type = qt; ti.rows = rows; ti.cols = cols;
         ti.data_bytes = data.size();
@@ -656,16 +658,25 @@ int convert_main(int argc, char** argv) {
             };
             const STTensor* fused_gu = st.get(mp + "experts.gate_up_proj");
             const STTensor* fused_dn = st.get(mp + "experts.down_proj");
+            // Resolve each expert once; row workers only read the cached pointers.
+            std::vector<const STTensor*> gates(E), ups(E), downs(E);
+            for (int e = 0; e < E; e++) {
+                if (!fused_gu) {
+                    gates[e] = ex(e, "gate_proj", "w1");
+                    ups[e] = ex(e, "up_proj", "w3");
+                }
+                if (!fused_dn) downs[e] = ex(e, "down_proj", "w2");
+            }
             write_matrix(o_ + "wgu_e", o.wtype, (int64_t)E * 2 * F, H, [&](int64_t r, float* buf) {
                 int e = (int)(r / (2 * F)), rr = (int)(r % (2 * F));
                 bool up = rr & 1; int row = rr >> 1;
                 if (fused_gu) fused_gu->to_float(buf, ((int64_t)e * 2 * F + (up ? F + row : row)) * H, H);
-                else ex(e, up ? "up_proj" : "gate_proj", up ? "w3" : "w1")->to_float(buf, (int64_t)row * H, H);
+                else (up ? ups[e] : gates[e])->to_float(buf, (int64_t)row * H, H);
             });
             write_matrix(o_ + "wdown_e", o.wtype, (int64_t)E * H, F, [&](int64_t r, float* buf) {
                 int e = (int)(r / H), row = (int)(r % H);
                 if (fused_dn) fused_dn->to_float(buf, ((int64_t)e * H + row) * F, F);
-                else ex(e, "down_proj", "w2")->to_float(buf, (int64_t)row * F, F);
+                else downs[e]->to_float(buf, (int64_t)row * F, F);
             });
         } else if (L.ffn) {
             const STTensor *wg, *wu, *wd;

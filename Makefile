@@ -40,12 +40,16 @@ $(BUILD)/file-probe: tests/file_probe.cpp $(BUILD)/model_file.o $(BUILD)/safeten
 $(BUILD)/kernel-test: tests/kernel_test.cpp $(BUILD)/cpu_backend.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/quant.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
+$(BUILD)/quant-test: tests/quant_test.cpp $(BUILD)/quant.o
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
+
 $(BUILD)/text-test: tests/text_test.cpp $(BUILD)/tokenizer.o $(BUILD)/model_file.o $(BUILD)/json.o $(BUILD)/sampler.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^
 
-test: tachyon $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/text-test
+test: tachyon $(BUILD)/file-probe $(BUILD)/kernel-test $(BUILD)/quant-test $(BUILD)/text-test
 	python3 tests/file_test.py $(BUILD)/file-probe
 	$(BUILD)/kernel-test
+	$(BUILD)/quant-test
 	python3 tests/server_test.py ./tachyon $(BUILD)/text-test
 	python3 tests/settings_test.py ./tachyon
 

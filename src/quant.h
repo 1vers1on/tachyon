@@ -10,6 +10,11 @@ void dequantize_row(QType t, const uint8_t* data, const uint8_t* scales, int64_t
 
 // Multithreaded quantization of a [rows, cols] matrix. src_row(r, buf) fills a row of floats.
 #include <functional>
+class ThreadPool;
+// Reuse a pool when converting multiple tensors.
+void quantize_matrix(QType t, int64_t rows, int64_t cols,
+                     const std::function<void(int64_t, float*)>& src_row,
+                     std::vector<uint8_t>& data, std::vector<uint8_t>& scales, ThreadPool& pool, const float* imp = nullptr);
 void quantize_matrix(QType t, int64_t rows, int64_t cols,
                      const std::function<void(int64_t, float*)>& src_row,
                      std::vector<uint8_t>& data, std::vector<uint8_t>& scales, int nthreads, const float* imp = nullptr);
