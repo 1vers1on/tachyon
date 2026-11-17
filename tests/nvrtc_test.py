@@ -20,7 +20,7 @@ def check(code):
 
 source = (root / 'src/kernels/kernels.cu').read_text().replace(
     '// TACH_PACKED_SOURCE', (root / 'src/packed.h').read_text()).encode()
-names = ['gemv2<3,256,1,1,0>', 'gemv_tc<3,256,0>', 'gemm<3,0>',
+names = ['gemv2<3,256,1,1,0>', 'gemv_tc<3,256,0>', 'gemm<3,0,128>', 'gemm<3,0,64>', 'gemm<2,2,64>',
          'rope_t<128,0>', 'attn_decode<128,4,8,0>', 'flash_prefill<128>', 'flash_wide<256>',
          'delta_rule<128,128>', 'dn_prep<128,128>', 'dn_chunk<128,128>',
          'causal_conv<0>', 'gemv_ind<3,256>', 'gemv_grp<3,256>',

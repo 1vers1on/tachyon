@@ -266,22 +266,24 @@ extern "C" __global__ void __launch_bounds__(256) rmsnorm_f16(const float* __res
 
 // ------------------------------------------------------------------------------------------------
 // GEMM (prefill): C[M,N] = A[M,K] (fp16) x W[N,K]^T (Q4/Q8 dequantized to fp16 in shared memory)
-// Tensor cores (mma.sync m16n8k16, fp32 accumulate). Tile 64(M) x 128(N) x 64(K), 8 warps (2x4), double buffer.
+// Tensor cores (mma.sync m16n8k16, fp32 accumulate). Tile 64(M) x BN x 64(K). Each warp computes 32 x 32 outputs.
 // ------------------------------------------------------------------------------------------------
 #define GBM 64
-#define GBN 128
 #define GBK 64
 #define GLD 72  // padded smem row (halves)
 
-template <int QT, int EPI>
-__global__ void __launch_bounds__(256) gemm(const half* __restrict__ A, int M, int K, const uint8_t* __restrict__ W, const void* __restrict__ S,
+template <int QT, int EPI, int BN = 128>
+__global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M, int K, const uint8_t* __restrict__ W, const void* __restrict__ S,
                                             int N, float* __restrict__ Cf, half* __restrict__ Ch, const float* __restrict__ bias) {
+    static_assert(BN == 64 || BN == 128);
+    constexpr int threads = BN * 2;
+    constexpr int warps_n = BN / 32;
     extern __shared__ __align__(16) uint8_t smem[];
     half* As = (half*)smem;                       // [2][GBM][GLD]
-    half* Ws = (half*)(smem + 2 * GBM * GLD * 2); // [2][GBN][GLD]
+    half* Ws = (half*)(smem + 2 * GBM * GLD * 2); // [2][BN][GLD]
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-    const int wm = warp / 4, wn = warp % 4;
-    const int m0 = blockIdx.y * GBM, n0 = blockIdx.x * GBN;
+    const int wm = warp / warps_n, wn = warp % warps_n;
+    const int m0 = blockIdx.y * GBM, n0 = blockIdx.x * BN;
     const int KT = K / GBK;
 
     // loader roles
@@ -291,8 +293,7 @@ __global__ void __launch_bounds__(256) gemm(const half* __restrict__ A, int M, i
     int packed_kt=0;
     auto load_A = [&](int kt, int buf) {
 #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            int c = tid + i * 256;
+        for (int c = tid; c < GBM * (GBK / 8); c += threads) {
             int r = c / 8, col = (c % 8) * 8;
             int gr = m0 + r;
             bool ok = gr < M;
@@ -346,7 +347,7 @@ __global__ void __launch_bounds__(256) gemm(const half* __restrict__ A, int M, i
 #pragma unroll
             for (int i = 0; i < 8; i++) v[8 + i] = __hmul2(__floats2half2_rn((float)b1[2 * i], (float)b1[2 * i + 1]), wsc);
         }
-        uint4* dst = (uint4*)(Ws + (buf * GBN + wrow) * GLD + wpart * 32);
+        uint4* dst = (uint4*)(Ws + (buf * BN + wrow) * GLD + wpart * 32);
 #pragma unroll
         for (int i = 0; i < 4; i++) dst[i] = *(uint4*)&v[4 * i];
     };
@@ -393,7 +394,7 @@ __global__ void __launch_bounds__(256) gemm(const half* __restrict__ A, int M, i
 #pragma unroll
             for (int ni = 0; ni < 4; ni += 2) {
                 uint32_t b0, b1, b2, b3;
-                const half* p = Ws + (buf * GBN + wn * 32 + ni * 8 + (lane & 7) + ((lane >> 4) << 3)) * GLD + kk * 16 + ((lane >> 3) & 1) * 8;
+                const half* p = Ws + (buf * BN + wn * 32 + ni * 8 + (lane & 7) + ((lane >> 4) << 3)) * GLD + kk * 16 + ((lane >> 3) & 1) * 8;
                 ldmatrix_x4(b0, b1, b2, b3, p);
 #pragma unroll
                 for (int mi = 0; mi < 2; mi++) {

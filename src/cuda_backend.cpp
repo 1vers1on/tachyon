@@ -792,7 +792,10 @@ private:
     std::string gemv2_name(QType t, int K, int M, int pro, int epi) { return "gemv2<" + I(qt_code(t)) + "," + I(K) + "," + I(M) + "," + I(pro) + "," + I(epi) + ">"; }
     std::string gu2_name(QType t, int K, int M) { return "gemv2_gu<" + I(qt_code(t)) + "," + I(K) + "," + I(M) + ">"; }
     std::string tc_name(QType t, int K, int epi) { return "gemv_tc<" + I(qt_code(t)) + "," + I(K) + "," + I(epi) + ">"; }
-    std::string gemm_name(QType t, int epi) { return "gemm<" + I(qt_code(t)) + "," + I(epi) + ">"; }
+    std::string gemm_name(QType t, int epi, int tile_n = 128) {
+        return "gemm<" + I(qt_code(t)) + "," + I(epi) + "," + I(tile_n) + ">";
+    }
+    bool blackwell_rtx() const { return cc_major_ == 12 && cc_minor_ == 0; }
     std::string ind_name(QType t, int K) { return "gemv_ind<" + I(qt_code(t)) + "," + I(K) + ">"; }
     std::string grp_name(QType t, int K) { return "gemv_grp<" + I(qt_code(t)) + "," + I(K) + ">"; }
     std::string rope_name(int hd, int f16) { return "rope_t<" + I(hd) + "," + I(f16) + ">"; }
@@ -835,14 +838,18 @@ private:
         if (opt.kv_int8) opts.push_back("-DKV8=1");
         if (getenv("TACH_GEMM_F16ACC")) opts.push_back("-DGEMM_F16ACC=1");
         std::set<std::string> names;
+        auto add_gemm = [&](QType t, int epi) {
+            names.insert(gemm_name(t, epi));
+            if (blackwell_rtx()) names.insert(gemm_name(t, epi, 64));
+        };
         auto add_in = [&](const DMat& W, int epi) {  // RMS-prologue GEMV + GEMM + tc
             if(!precise_format(W.t)) for (int M = 1; M <= 8; M++) names.insert(gemv2_name(W.t, W.cols, M, 1, epi));
-            names.insert(gemm_name(W.t, epi));
+            add_gemm(W.t, epi);
             if (tc_ok(W.t) && W.cols % 256 == 0) names.insert(tc_name(W.t, W.cols, epi));
         };
         auto add_out = [&](const DMat& W) {  // int8-activation GEMV (store or add) + GEMM + tc
             if(!precise_format(W.t)) for (int M = 1; M <= 8; M++) { names.insert(gemv2_name(W.t, W.cols, M, 0, 1)); names.insert(gemv2_name(W.t, W.cols, M, 0, 0)); }
-            names.insert(gemm_name(W.t, 1)); names.insert(gemm_name(W.t, 0));
+            add_gemm(W.t, 1); add_gemm(W.t, 0);
             if (tc_ok(W.t) && W.cols % 256 == 0) { names.insert(tc_name(W.t, W.cols, 1)); names.insert(tc_name(W.t, W.cols, 0)); }
         };
         for (auto& L : layers_) {
@@ -872,17 +879,17 @@ private:
                 }
             }
             if (conv_par_ok(lc)) { names.insert("conv_par<0>"); names.insert("conv_state<0>"); }
-            if (lc.n_experts && L.cpu_moe >= 0) { names.insert(gemm_name(QType::Q4, 2)); names.insert(gemm_name(QType::Q4, 0)); names.insert(gemm_name(QType::Q8, 2)); names.insert(gemm_name(QType::Q8, 0)); }
+            if (lc.n_experts && L.cpu_moe >= 0) { add_gemm(QType::Q4, 2); add_gemm(QType::Q4, 0); add_gemm(QType::Q8, 2); add_gemm(QType::Q8, 0); }
             if (lc.n_experts) {
                 names.insert(ind_name(L.wgu_e.t, L.wgu_e.cols));
                 names.insert(ind_name(L.wdown_e.t, L.wdown_e.cols));
                 names.insert(grp_name(L.wgu_e.t, L.wgu_e.cols));
                 names.insert(grp_name(L.wdown_e.t, L.wdown_e.cols));
-                names.insert(gemm_name(L.wgu_e.t, 2));
-                names.insert(gemm_name(L.wdown_e.t, 0));
+                add_gemm(L.wgu_e.t, 2);
+                add_gemm(L.wdown_e.t, 0);
             } else if (lc.ffn) {
                 if(!precise_format(L.wgu.t)) for (int M = 1; M <= 8; M++) names.insert(gu2_name(L.wgu.t, L.wgu.cols, M));
-                names.insert(gemm_name(L.wgu.t, 2));
+                add_gemm(L.wgu.t, 2);
                 if (tc_ok(L.wgu.t) && L.wgu.cols % 256 == 0) names.insert(tc_name(L.wgu.t, L.wgu.cols, 2));
                 add_out(L.wdown);
             }
@@ -966,7 +973,7 @@ private:
         for (auto& n : names) {
             CUfunction f = fn(n);
             funcs_[n] = f;
-            if (n.rfind("gemm<", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gemm_smem()));
+            if (n.rfind("gemm<", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gemm_smem(n.ends_with(",64>") ? 64 : 128)));
             if (n.rfind("gemv_tc", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, TC_SMEM));
             if (n.rfind("gemv2", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_pro_smem));
             if (n.rfind("dn_prep", 0) == 0) CU(dcu.cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, DN_PREP_SMEM));
@@ -1000,7 +1007,7 @@ private:
         f_mwait_ = fn("moe_wait");
     }
     static constexpr int TC_SMEM = 3 * (64 * 144 + 64 * 16 + 8 * 272 + 512);
-    int gemm_smem() const { return 2 * 64 * 72 * 2 + 2 * 128 * 72 * 2; }
+    static int gemm_smem(int tile_n) { return 2 * (64 + tile_n) * 72 * 2; }
 
     CUfunction F(const std::string& n) {
         auto it = funcs_.find(n);
@@ -1172,7 +1179,12 @@ private:
             if(epi==2)launch(F("packed_gate"),D3((N/2+255)/256),D3(256),0,proj_,Ch,N/2);
             return;
         }
-        launch(F(gemm_name(W.t, epi)), D3((N + 127) / 128, (M + 63) / 64), D3(256), gemm_smem(), A, M, W.cols, d, s, N, Cf, Ch, bias);
+        // On RTX Blackwell, small grids leave many SMs idle. Halve the N tile
+        // to expose more independent CTAs, retaining the same warp MMA tile.
+        const int tiles_m = (M + 63) / 64;
+        const int tile_n = blackwell_rtx() && (N + 127) / 128 * tiles_m < 2 * n_sm_ ? 64 : 128;
+        launch(F(gemm_name(W.t, epi, tile_n)), D3((N + tile_n - 1) / tile_n, tiles_m),
+               D3(tile_n * 2), gemm_smem(tile_n), A, M, W.cols, d, s, N, Cf, Ch, bias);
     }
 
     // mixer output y [M][H] (fp32) -> residual: x = (x + post_norm(y)) * scalar
