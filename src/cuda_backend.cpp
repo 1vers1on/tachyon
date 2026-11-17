@@ -185,13 +185,16 @@ public:
         stage_ = (stage_ + 1) % NSTAGE;
         CU(dcu.cuEventSynchronize(stage_ev_[stage_]));
         int* hb = h_batch_ + (size_t)stage_ * 4 * cap_;
+        // Graphs are keyed by M, so offsets based on the live row count
+        // remain stable across replays. A one-token step copies four ints.
+        batch_stride_ = M;
         for (int i = 0; i < M; i++) {
             hb[i] = batch[i].token;
-            hb[cap_ + i] = batch[i].pos;
-            hb[2 * cap_ + i] = batch[i].slot;
+            hb[M + i] = batch[i].pos;
+            hb[2 * M + i] = batch[i].slot;
         }
-        for (int i = 0; i < n_logits_; i++) hb[3 * cap_ + i] = lrows_[i];
-        CU(dcu.cuMemcpyHtoDAsync(d_batch_, hb, 4 * cap_ * sizeof(int), stream_));
+        for (int i = 0; i < n_logits_; i++) hb[3 * M + i] = lrows_[i];
+        CU(dcu.cuMemcpyHtoDAsync(d_batch_, hb, (3ull * M + n_logits_) * sizeof(int), stream_));
         CU(dcu.cuEventRecord(stage_ev_[stage_], stream_));
         if (prof_ && ++prof_count_ % prof_every_ == 0) prof_report();
         if (M <= decode_limit_) {
@@ -1028,9 +1031,9 @@ private:
     // building blocks
     // ---------------------------------------------------------------------------------------------
     CUdeviceptr tok_ptr() const { return d_batch_; }
-    CUdeviceptr pos_ptr() const { return d_batch_ + (size_t)cap_ * 4; }
-    CUdeviceptr slot_ptr() const { return d_batch_ + (size_t)2 * cap_ * 4; }
-    CUdeviceptr lrow_ptr() const { return d_batch_ + (size_t)3 * cap_ * 4; }
+    CUdeviceptr pos_ptr() const { return d_batch_ + (size_t)batch_stride_ * 4; }
+    CUdeviceptr slot_ptr() const { return d_batch_ + (size_t)2 * batch_stride_ * 4; }
+    CUdeviceptr lrow_ptr() const { return d_batch_ + (size_t)3 * batch_stride_ * 4; }
 
     int occupancy(CUfunction f, int smem, int threads = 256) {
         auto key = std::make_pair(f, smem * 2 + (threads == 128));
@@ -1723,7 +1726,7 @@ private:
     std::unique_ptr<CpuMoe> cmoe_;
     static constexpr int NSTAGE = 4;
     CUevent stage_ev_[NSTAGE] = {};
-    int stage_ = 0;
+    int stage_ = 0, batch_stride_ = 0;
     float* h_out_ = nullptr;
     std::map<std::string, CUfunction> funcs_;
     bool packed_weights_=false;
