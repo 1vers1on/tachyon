@@ -233,7 +233,12 @@ public:
 
     void argmax_all(int* out) override {
         bind();
-        launch(f_argmax_, D3(n_logits_), D3(1024), 0, logits_, c_.vocab, logit_rows(), d_argmax_);
+        const int V = logit_rows();  // the output projection writes compact rows for a limited draft vocabulary
+        const int parts = V < 8192 ? 1 : std::min(32, (V + 2047) / 2048);
+        // Reuse the 32-per-row candidate scratch while sampling greedily.
+        launch(f_argmax_, D3(parts, n_logits_), D3(256), 0, logits_, V, parts == 1 ? d_argmax_ : d_rmax_);
+        if (parts > 1)
+            launch(f_argfinish_, D3(n_logits_), D3(32), 0, logits_, V, d_rmax_, parts, d_argmax_);
         CU(dcu.cuMemcpyDtoHAsync(h_out_, d_argmax_, n_logits_ * 4, stream_));
         CU(dcu.cuStreamSynchronize(stream_));
         memcpy(out, h_out_, n_logits_ * 4);
@@ -997,6 +1002,7 @@ private:
         f_rms_q8_rows_ = fn("rmsnorm_q8_rows");
         f_rms_f16_ = fn("rmsnorm_f16");
         f_argmax_ = fn("argmax_rows");
+        f_argfinish_ = fn("argmax_finish");
         f_kvcopy_ = fn("kv_copy");
         f_colsq_ = fn("colsq_accum");
         f_rowmax_ = fn("row_max");
@@ -1731,7 +1737,7 @@ private:
     std::map<std::string, CUfunction> funcs_;
     bool packed_weights_=false;
     CUdeviceptr rot_h_=0,rot_f_=0;
-    CUfunction f_embed_, f_rms_q8_, f_rms_q8_rows_, f_rms_f16_, f_argmax_, f_kvcopy_, f_colsq_, f_rowmax_, f_cand_;
+    CUfunction f_embed_, f_rms_q8_, f_rms_q8_rows_, f_rms_f16_, f_argmax_, f_argfinish_, f_kvcopy_, f_colsq_, f_rowmax_, f_cand_;
     CUfunction f_embrows_, f_plecomb_, f_plemul_, f_dnpost_, f_mpost_, f_mwait_;
     CUdeviceptr dn_cv_ = 0, dn_kt_ = 0, dn_gq_ = 0, dn_kh_ = 0, dn_at_ = 0, dn_vt_ = 0, dn_gam_ = 0;
     DMat ple_embd_, ple_proj_;

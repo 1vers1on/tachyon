@@ -18,13 +18,17 @@ int main(int argc, char** argv) {
         std::vector<BatchToken> batch;
         for (int i = 0; i < rows; i++) batch.push_back({65, 0, i, true});
         b->forward(batch);
+        std::vector<int> greedy(rows);
+        b->argmax_all(greedy.data());
         std::vector<std::vector<std::pair<float, int>>> out;
         assert(!b->candidates(rows, 1e9f, 1, out));
         assert(b->candidates(rows, 0.f, 1024, out));
         std::vector<float> logits(b->vocab());
         for (int row = 0; row < rows; row++) {
             b->get_logits(row, logits.data());
-            const float mx = *std::max_element(logits.begin(), logits.end());
+            const auto winner = std::max_element(logits.begin(), logits.end());
+            assert(greedy[row] == winner - logits.begin());
+            const float mx = *winner;
             std::vector<std::pair<float, int>> expected;
             for (int t = 0; t < b->vocab(); t++) if (logits[t] >= mx) expected.push_back({logits[t], t});
             std::sort(out[row].begin(), out[row].end());

@@ -103,7 +103,7 @@ $(BUILD)/bench-sampling: tools/bench_sampling.cpp $(BUILD)/cuda_api.o
 	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $^ $(LDCUDA)
 
 test-cuda: $(BUILD)/cuda-sampling-test
-	python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tests"); from server_test import fixture; fixture(Path("$(BUILD)/sampling.tach")); fixture(Path("$(BUILD)/sampling-wide.tach"), vocab=1056)'
+	python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "tests"); from server_test import fixture; fixture(Path("$(BUILD)/sampling.tach")); fixture(Path("$(BUILD)/sampling-wide.tach"), vocab=16416)'
 	$(BUILD)/cuda-sampling-test $(BUILD)/sampling.tach
 	$(BUILD)/cuda-sampling-test $(BUILD)/sampling-wide.tach
 

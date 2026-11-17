@@ -1040,34 +1040,45 @@ __global__ void __launch_bounds__(128) flash_wide(const half* __restrict__ Q, co
 }
 
 // ------------------------------------------------------------------------------------------------
-// argmax over vocab rows. grid rows, block 1024
-// ------------------------------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(1024) argmax_rows(const float* __restrict__ logits, int V, int Vlim, int* __restrict__ out) {
-    const float* l = logits + (size_t)blockIdx.x * V;
+// Greedy selection. Every reduction breaks ties by the lowest token id.
+__device__ __forceinline__ int warp_argmax(float& best, int id) {
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+        float v = __shfl_xor_sync(0xffffffff, best, o);
+        int other = __shfl_xor_sync(0xffffffff, id, o);
+        if (v > best || (v == best && other < id)) { best = v; id = other; }
+    }
+    return id;
+}
+
+extern "C" __global__ void __launch_bounds__(256) argmax_rows(const float* logits, int V, int* ids) {
+    const float* row = logits + (size_t)blockIdx.y * V;
     float best = -INFINITY;
-    int bi = 0;
-    for (int i = threadIdx.x; i < Vlim; i += 1024) { float v = l[i]; if (v > best) { best = v; bi = i; } }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        float ov = __shfl_xor_sync(0xffffffff, best, o);
-        int oi = __shfl_xor_sync(0xffffffff, bi, o);
-        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    int id = 0;
+    for (int i = blockIdx.x * 256 + threadIdx.x; i < V; i += gridDim.x * 256) {
+        if (row[i] > best) { best = row[i]; id = i; }
     }
-    __shared__ float sv[32];
-    __shared__ int si[32];
+    id = warp_argmax(best, id);
+    __shared__ float values[8];
+    __shared__ int indices[8];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (lane == 0) { sv[warp] = best; si[warp] = bi; }
+    if (!lane) { values[warp] = best; indices[warp] = id; }
     __syncthreads();
-    if (warp == 0) {
-        best = sv[lane]; bi = si[lane];
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            float ov = __shfl_xor_sync(0xffffffff, best, o);
-            int oi = __shfl_xor_sync(0xffffffff, bi, o);
-            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
-        }
-        if (lane == 0) out[blockIdx.x] = bi;
+    if (!warp) {
+        best = lane < 8 ? values[lane] : -INFINITY;
+        id = warp_argmax(best, lane < 8 ? indices[lane] : 0);
+        if (!lane) ids[(size_t)blockIdx.y * gridDim.x + blockIdx.x] = id;
     }
+}
+
+// One warp completes a large row using at most 32 partial winners.
+extern "C" __global__ void argmax_finish(const float* logits, int V, const int* partial, int parts, int* out) {
+    const int r = blockIdx.x, lane = threadIdx.x;
+    int id = lane < parts ? partial[r * parts + lane] : 0;
+    float v = lane < parts ? logits[(size_t)r * V + id] : -INFINITY;
+    if (isnan(v)) v = -INFINITY;
+    id = warp_argmax(v, id);
+    if (!lane) out[r] = id;
 }
 
 // copy KV positions [0,n) between slots of one layer. grid nkv, block 256
