@@ -125,7 +125,9 @@ with tempfile.TemporaryDirectory(prefix="tachyon-models-") as tmp:
                 assert converted["act"] == "gelu" and converted["embed_scale"] == 16
                 assert all(not layer.get("sandwich", False) and layer.get("qk_norm", 0) == 0 for layer in layers)
             outputs = []
-            for chunk in (1, 4, 16):
+            # The first three sizes use decode / verify. The 20-token CUDA
+            # batch exercises tensor-core prefill against the same reference.
+            for chunk in ((1, 4, 16, 20) if device == "cuda" else (1, 4, 16)):
                 logits = folder / "logits.f32"
                 run(probe, str(out), str(logits), str(chunk), "20", device)
                 actual = np.fromfile(logits, dtype=np.float32).reshape(reference.shape)
@@ -133,7 +135,8 @@ with tempfile.TemporaryDirectory(prefix="tachyon-models-") as tmp:
                 limit = 0.004 if quant == "f16" else 0.04
                 assert np.isfinite(actual).all() and rel < limit, (name, quant, chunk, rel)
                 assert np.max(np.abs(actual - reference)) < (0.008 if quant == "f16" else 0.1)
-                outputs.append(actual.copy())
+                if chunk <= 16:
+                    outputs.append(actual.copy())
                 print(f"{name:18} {quant} chunk={chunk}: relative logits error {rel:.6f}")
             # CUDA batches use tensor cores and round intermediate activations to half.
             for actual in outputs[1:]:
