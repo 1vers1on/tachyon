@@ -71,13 +71,19 @@ cases = [
     ("mixtral-window", MixtralConfig, MixtralForCausalLM, {"sliding_window": 5}, True),
     ("mistral-window", MistralConfig, MistralForCausalLM, {"sliding_window": 5}, False),
 ]
+if device == "cuda":
+    cases.append(("mistral-ring", MistralConfig, MistralForCausalLM, {"sliding_window": 79}, False))
 with tempfile.TemporaryDirectory(prefix="tachyon-models-") as tmp:
     root = Path(tmp)
     for name, config_class, model_class, extra, legacy in cases:
         folder = root / name
         folder.mkdir()
-        cfg = config_class(hidden_size=256, intermediate_size=256, num_hidden_layers=2,
-                           num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+        ring = name == "mistral-ring"
+        # More than one active KV split, a ring wrap, and an uneven number of
+        # value groups per CTA exercise the cooperative score and output paths.
+        head_dim = 96 if ring else 64
+        cfg = config_class(hidden_size=4 * head_dim, intermediate_size=256, num_hidden_layers=2,
+                           num_attention_heads=4, num_key_value_heads=2, head_dim=head_dim,
                            vocab_size=256, max_position_embeddings=128,
                            num_local_experts=4, num_experts_per_tok=2, **extra)
         cfg._attn_implementation = "eager"
@@ -109,7 +115,8 @@ with tempfile.TemporaryDirectory(prefix="tachyon-models-") as tmp:
         (folder / "tokenizer.json").write_text(json.dumps(dict(
             model=dict(type="BPE", vocab=byte_vocab(), merges=[]), added_tokens=[])))
         (folder / "tokenizer_config.json").write_text("{}")
-        ids = torch.tensor([[65 + i % 23 for i in range(20)]])
+        tokens = 120 if ring else 20
+        ids = torch.tensor([[65 + i % 23 for i in range(tokens)]])
         with torch.no_grad():
             reference = model(ids).logits[0].numpy()
         # CUDA runs quantized weights; the CPU additionally checks float16 conversion accuracy.
@@ -129,7 +136,7 @@ with tempfile.TemporaryDirectory(prefix="tachyon-models-") as tmp:
             # batch exercises tensor-core prefill against the same reference.
             for chunk in ((1, 4, 16, 20) if device == "cuda" else (1, 4, 16)):
                 logits = folder / "logits.f32"
-                run(probe, str(out), str(logits), str(chunk), "20", device)
+                run(probe, str(out), str(logits), str(chunk), str(tokens), device)
                 actual = np.fromfile(logits, dtype=np.float32).reshape(reference.shape)
                 rel = np.linalg.norm(actual - reference) / np.linalg.norm(reference)
                 limit = 0.004 if quant == "f16" else 0.04
@@ -138,6 +145,12 @@ with tempfile.TemporaryDirectory(prefix="tachyon-models-") as tmp:
                 if chunk <= 16:
                     outputs.append(actual.copy())
                 print(f"{name:18} {quant} chunk={chunk}: relative logits error {rel:.6f}")
+            if ring:
+                run(probe, str(out), str(logits), "4", str(tokens), device, "kv8")
+                actual = np.fromfile(logits, dtype=np.float32).reshape(reference.shape)
+                rel = np.linalg.norm(actual - reference) / np.linalg.norm(reference)
+                assert np.isfinite(actual).all() and rel < limit, (name, "kv8", rel)
+                print(f"{name:18} {quant} int8 KV cache: relative logits error {rel:.6f}")
             # CUDA batches use tensor cores and round intermediate activations to half.
             for actual in outputs[1:]:
                 np.testing.assert_allclose(outputs[0], actual, atol=0.008 if device == "cuda" else 2e-6,

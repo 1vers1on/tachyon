@@ -5,13 +5,15 @@
 int g_log_level = 0;
 
 int main(int argc, char** argv) {
-    if (argc != 5 && argc != 6) return 2;
+    if (argc < 5 || argc > 7) return 2;
     ModelFile mf; mf.open(argv[1]);
-    const bool cuda = argc == 6 && std::string(argv[5]) == "cuda";
+    const bool cuda = argc >= 6 && std::string(argv[5]) == "cuda";
     const int chunk = atoi(argv[3]), n = atoi(argv[4]);
     if (chunk <= 0 || n <= 0 || n > 128) return 2;
     std::unique_ptr<Backend> b(cuda ? create_cuda_backend() : create_cpu_backend());
     BackendOptions opt;
+    if (argc == 7 && (!cuda || std::string(argv[6]) != "kv8")) return 2;
+    opt.kv_int8 = argc == 7;
     opt.ctx = 128; opt.max_batch = std::max(4, chunk); opt.threads = 2; opt.n_slots = 2;
     b->init(mf, opt);
     FILE* f = fopen(argv[2], "wb");
