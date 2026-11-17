@@ -806,6 +806,13 @@ private:
         for (int g = 4; g >= 1; g--) if (gqa % g == 0) return g;
         return 1;
     }
+    int decode_attn_group(const LayerCfg& lc, int batch) const {
+        const int grouped = attn_group(lc);
+        // A single sequence with few KV heads can leave even one wave of RTX
+        // Blackwell SMs underfilled. Independent query heads expose more CTAs.
+        if (blackwell_rtx() && batch == 1 && (lc.n_heads / grouped) * SPLITS < n_sm_) return 1;
+        return grouped;
+    }
     std::string flash_name(int hd) { return (hd > 128 ? "flash_wide<" : "flash_prefill<") + I(hd) + ">"; }
     // tensor-core prefill attention: FA2-style kernel up to 128 dims, sliced-head kernel for 256 / 512
     static bool flash_ok(int hd) { return hd <= 128 || hd == 256 || hd == 512; }
@@ -840,7 +847,7 @@ private:
         std::set<std::string> names;
         auto add_gemm = [&](QType t, int epi) {
             names.insert(gemm_name(t, epi));
-            if (blackwell_rtx()) names.insert(gemm_name(t, epi, 64));
+            names.insert(gemm_name(t, epi, 64));
         };
         auto add_in = [&](const DMat& W, int epi) {  // RMS-prologue GEMV + GEMM + tc
             if(!precise_format(W.t)) for (int M = 1; M <= 8; M++) names.insert(gemv2_name(W.t, W.cols, M, 1, epi));
@@ -860,9 +867,11 @@ private:
                 names.insert(rope_name(lc.head_dim, 0));
                 names.insert(rope_name(lc.head_dim, 1));
                 const int g = attn_group(lc);
-                names.insert(attn_name(lc.head_dim, g, SPLITS, 0));
-                if ((c_.arch == "gemma4" || c_.norm_groups > 1 || L.c.n_experts) && precise_format(L.wo.t) && !L.wo.hadamard_block)
-                    names.insert(attn_name(lc.head_dim, g, SPLITS, 2));
+                for (int decode_group : {g, decode_attn_group(lc, 1)}) {
+                    names.insert(attn_name(lc.head_dim, decode_group, SPLITS, 0));
+                    if ((c_.arch == "gemma4" || c_.norm_groups > 1 || lc.n_experts) && precise_format(L.wo.t) && !L.wo.hadamard_block)
+                        names.insert(attn_name(lc.head_dim, decode_group, SPLITS, 2));
+                }
                 if (flash_ok(lc.head_dim) && !no_flash_wide(lc.head_dim)) names.insert(flash_name(lc.head_dim));
                 // Also used for short precision-sensitive prefills.
                 names.insert(attn_name(lc.head_dim, g, 1, 1));
@@ -1179,10 +1188,11 @@ private:
             if(epi==2)launch(F("packed_gate"),D3((N/2+255)/256),D3(256),0,proj_,Ch,N/2);
             return;
         }
-        // On RTX Blackwell, small grids leave many SMs idle. Halve the N tile
-        // to expose more independent CTAs, retaining the same warp MMA tile.
+        // Halve the N tile for small grids to expose more independent CTAs.
+        // Supply two waves on the wide RTX Blackwell GPUs.
         const int tiles_m = (M + 63) / 64;
-        const int tile_n = blackwell_rtx() && (N + 127) / 128 * tiles_m < 2 * n_sm_ ? 64 : 128;
+        const int target = blackwell_rtx() ? 2 * n_sm_ : n_sm_;
+        const int tile_n = (N + 127) / 128 * tiles_m < target ? 64 : 128;
         launch(F(gemm_name(W.t, epi, tile_n)), D3((N + tile_n - 1) / tile_n, tiles_m),
                D3(tile_n * 2), gemm_smem(tile_n), A, M, W.cols, d, s, N, Cf, Ch, bias);
     }
@@ -1296,7 +1306,8 @@ private:
                 // Keep the packed projection input in fp32, as its FFN already does.
                 const bool exact = (c_.arch == "gemma4" || c_.norm_groups > 1 || L.c.n_experts) && precise_format(L.wo.t) && !L.wo.hadamard_block;
                 AttnArgs aa = attn_args(L, qf_, exact ? 0 : xq_, exact ? 0 : xds_, exact ? rot_f_ : 0);
-                launch(F(attn_name(lc.head_dim, attn_group(lc), SPLITS, exact ? 2 : 0)), D3(lc.n_heads / attn_group(lc), SPLITS, M), D3(128), 0, aa);
+                const int group = decode_attn_group(lc, M);
+                launch(F(attn_name(lc.head_dim, group, SPLITS, exact ? 2 : 0)), D3(lc.n_heads / group, SPLITS, M), D3(128), 0, aa);
                 if (exact) pmv(L.wo, rot_f_, M, dadd ? x_ : tmp_, H, 0, dadd ? 1 : 0);
                 else gemv(L.wo, 0, dadd ? 1 : 0, M, 0, 0, 0, xq_, xds_, dadd ? x_ : tmp_);
             } else if (lc.type == "conv") {
