@@ -1312,7 +1312,9 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
     int chunk = (span + SPLITS - 1) / SPLITS;
     chunk = max(64, (chunk + 63) & ~63);
     const int start = lo + split * chunk;
+    if (start >= len) return;
     const int end = min(len, start + chunk);
+    const int active = SPLITS == 1 ? 1 : 1 + (span - 1) / chunk;
     const size_t pidx = ((size_t)m * a.nh + head0) * SPLITS + split;
     __shared__ float qs[GQA][HD];
     __shared__ float ps[GQA][ATILE];
@@ -1322,7 +1324,24 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
     constexpr int PG = 128 / NDO;        // position groups
     __shared__ __align__(16) float red[PG][GQA][HD];
     __shared__ int is_last;
-    if (start < len) {
+    auto store = [&](int g, int d, float v) {
+        const int head = head0 + g;
+        if (a.gate) v *= 1.f / (1.f + __expf(-a.gate[(size_t)m * a.nrows + head * a.qstride + HD + d]));
+        const int col = head * HD + d;
+        if (OUT_TYPE == 2) {
+            ((float*)a.oh)[(size_t)m * QD + col] = v;
+        } else if (OUT_TYPE == 1) {
+            a.oh[(size_t)m * QD + col] = __float2half(v);
+        } else {
+            const float amax = warp_absmax(v);
+            const float dd = amax / 127.f;
+            const int qi = amax > 0 ? __float2int_rn(v / dd) : 0;
+            const int sm = warp_sum_i(qi);
+            a.oq[(size_t)m * QD + col] = (int8_t)qi;
+            if (lane == 0) a.ods[(size_t)m * (QD / 32) + col / 32] = make_float2(dd, dd * sm);
+        }
+    };
+    {
         const float scale = rsqrtf((float)HD) * 1.4426950408889634f;
         for (int i = tid; i < GQA * HD; i += 128) qs[i / HD][i % HD] = a.q[(size_t)m * QD + head0 * HD + i] * scale;
         if (tid < GQA) { m_s[tid] = -INFINITY; l_s[tid] = 0.f; }
@@ -1450,58 +1469,34 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
             float sum = 0.f;
 #pragma unroll
             for (int k = 0; k < PG; k++) sum += red[k][g][d];
-            a.part_o[(pidx + g * SPLITS) * HD + d] = sum;
+            if (active == 1) store(g, d, sum / l_s[g]);
+            else a.part_o[(pidx + g * SPLITS) * HD + d] = sum;
         }
+        if (active == 1) return;
         if (tid < GQA) a.part_ml[pidx + tid * SPLITS] = make_float2(m_s[tid], l_s[tid]);
-    } else {
-        if (tid < GQA) a.part_ml[pidx + tid * SPLITS] = make_float2(-INFINITY, 0.f);
     }
-    if (SPLITS > 1) {
-        __threadfence();
-        __syncthreads();
-        if (tid == 0) {
-            int* cnt = a.counters + (size_t)m * (a.nh / GQA) + blockIdx.x;
-            const int prev = atomicAdd(cnt, 1);
-            is_last = prev == SPLITS - 1;
-            if (is_last) *cnt = 0;
-        }
-        __syncthreads();
-        if (!is_last) return;
-        __threadfence();
-    } else {
-        __syncthreads();
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        unsigned* cnt = (unsigned*)a.counters + (size_t)m * (a.nh / GQA) + blockIdx.x;
+        is_last = atomicInc(cnt, active - 1) == active - 1;
     }
+    __syncthreads();
+    if (!is_last) return;
+    __threadfence();
     for (int i = tid; i < GQA * HD; i += 128) {
         const int g = i / HD, d = i % HD;
         const size_t base = ((size_t)m * a.nh + head0 + g) * SPLITS;
         float mx = -INFINITY;
-#pragma unroll
-        for (int s2 = 0; s2 < SPLITS; s2++) mx = fmaxf(mx, __ldcg(&a.part_ml[base + s2]).x);
+        for (int s = 0; s < active; s++) mx = fmaxf(mx, __ldcg(&a.part_ml[base + s]).x);
         float L = 0.f, o = 0.f;
-#pragma unroll
-        for (int s2 = 0; s2 < SPLITS; s2++) {
-            const float2 ml = __ldcg(&a.part_ml[base + s2]);
-            if (ml.y == 0.f) continue;
+        for (int s = 0; s < active; s++) {
+            const float2 ml = __ldcg(&a.part_ml[base + s]);
             const float w = exp2f(ml.x - mx);
             L += w * ml.y;
-            o += w * __ldcg(&a.part_o[(base + s2) * HD + d]);
+            o += w * __ldcg(&a.part_o[(base + s) * HD + d]);
         }
-        float v = o / L;
-        const int head = head0 + g;
-        if (a.gate) v *= 1.f / (1.f + __expf(-a.gate[(size_t)m * a.nrows + head * a.qstride + HD + d]));
-        const int col = head * HD + d;
-        if (OUT_TYPE == 2) {
-            ((float*)a.oh)[(size_t)m * QD + col] = v;
-        } else if (OUT_TYPE == 1) {
-            a.oh[(size_t)m * QD + col] = __float2half(v);
-        } else {
-            const float amax = warp_absmax(v);
-            const float dd = amax / 127.f;
-            const int qi = amax > 0 ? __float2int_rn(v / dd) : 0;
-            const int sm = warp_sum_i(qi);
-            a.oq[(size_t)m * QD + col] = (int8_t)qi;
-            if (lane == 0) a.ods[(size_t)m * (QD / 32) + col / 32] = make_float2(dd, dd * sm);
-        }
+        store(g, d, o / L);
     }
 }
 
