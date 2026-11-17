@@ -2836,26 +2836,37 @@ __device__ __forceinline__ void pdot(const uint8_t* __restrict__ w0, size_t rb, 
                 }
             }
         }
-    } else if constexpr (QT == 11) {               // Q6_K: 210-byte blocks of 256, one per pass, 8 elements per lane
-        const int nb = K / 256;
-        for (int b = 0; b < nb; b++) {
+    } else if constexpr (QT == 11) {  // Q6_K, 16 lanes per 256-weight block
+        const int half_block = (lane / 8) & 1;
+        const int col = 4 * (lane & 7);
+        for (int b = lane / 16; b < K / 256; b += 2) {
+            float4 x[MB][4];
 #pragma unroll
-            for (int h = 0; h < 2; h++) {
-                float xv[MB][4];
+            for (int m = 0; m < MB; m++) {
+                const float* row = X + (size_t)min(m, M - 1) * K + b * 256 + half_block * 128 + col;
 #pragma unroll
-                for (int m = 0; m < MB; m++) { const float* x = X + (size_t)(MB == 1 ? 0 : min(m, M - 1)) * K + (size_t)b * 256 + h * 128 + lane; xv[m][0] = x[0]; xv[m][1] = x[32]; xv[m][2] = x[64]; xv[m][3] = x[96]; }
+                for (int g = 0; g < 4; g++) x[m][g] = ld_x4(row + 32 * g);
+            }
 #pragma unroll
-                for (int r = 0; r < R; r++) {
-                    const uint8_t* p = PROW(r) + (size_t)b * 210;
-                    const float d = packed_half(p + 208);
-                    const int a0 = p[h * 64 + lane], a1 = p[h * 64 + 32 + lane], qh = p[128 + h * 32 + lane];
-                    const int q0 = ((a0 & 15) | ((qh & 3) << 4)) - 32, q1 = ((a1 & 15) | (((qh >> 2) & 3) << 4)) - 32;
-                    const int q2 = ((a0 >> 4) | (((qh >> 4) & 3) << 4)) - 32, q3 = ((a1 >> 4) | (((qh >> 6) & 3) << 4)) - 32;
-                    const int sb = 192 + h * 8 + (lane >> 4);
-                    const float c0 = d * (float)(signed char)p[sb] * q0, c1 = d * (float)(signed char)p[sb + 2] * q1;
-                    const float c2 = d * (float)(signed char)p[sb + 4] * q2, c3 = d * (float)(signed char)p[sb + 6] * q3;
+            for (int r = 0; r < R; r++) {
+                const uint8_t* p = PROW(r) + (size_t)b * 210;
+                const float d = packed_half(p + 208);
+                const unsigned lo0 = ld_u16x2(p + half_block * 64 + col);
+                const unsigned lo1 = ld_u16x2(p + half_block * 64 + col + 32);
+                const unsigned hi = ld_u16x2(p + 128 + half_block * 32 + col);
 #pragma unroll
-                    for (int m = 0; m < MB; m++) acc[r][m] += c0 * xv[m][0] + c1 * xv[m][1] + c2 * xv[m][2] + c3 * xv[m][3];
+                for (int g = 0; g < 4; g++) {
+                    const unsigned lo = g & 1 ? lo1 : lo0;
+                    const unsigned q = ((lo >> (4 * (g / 2))) & 0x0f0f0f0fu) |
+                                       (((hi >> (2 * g)) & 0x03030303u) << 4);
+                    const float scale = d * (signed char)p[192 + 8 * half_block + 2 * g + col / 16];
+                    const float q0 = u2f(q & 63u, 8388640.f), q1 = u2f((q >> 8) & 63u, 8388640.f);
+                    const float q2 = u2f((q >> 16) & 63u, 8388640.f), q3 = u2f(q >> 24, 8388640.f);
+#pragma unroll
+                    for (int m = 0; m < MB; m++) {
+                        const float4 a = x[m][g];
+                        acc[r][m] += scale * (q0 * a.x + q1 * a.y + q2 * a.z + q3 * a.w);
+                    }
                 }
             }
         }
