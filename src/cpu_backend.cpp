@@ -1281,8 +1281,8 @@ struct CpuMoe::Impl {
                 }
             }
         }, 256);
-        memcpy(s, t.scales, sb);
-        q.d = d; q.s = s;
+        if (sb) memcpy(s, t.scales, sb);
+        q.d = d; q.s = sb ? s : nullptr;
         return q;
     }
 };
@@ -1333,18 +1333,21 @@ void CpuMoe::forward(int li, int M, int K, const uint16_t* xn, const int* ids, c
     // 2. gathered, quantized activations (row i = pair order[i])
     I.xf.resize((size_t)P * H);
     I.xa.resize(P, H);
+    I.xa.x = I.xf.data();
     I.pool->parallel_for(P, [&](int64_t a, int64_t b) {
         for (int64_t i = a; i < b; i++) {
             const int m = I.order[i] / K;
             float* x = I.xf.data() + (size_t)i * H;
             for (int j = 0; j < H; j++) x[j] = h2f(xn[(size_t)m * H + j]);
-            quantize_act_row(x, H, I.xa.q + (size_t)i * H, I.xa.d + (size_t)i * (H / CPU_ABLK), I.xa.s + (size_t)i * (H / CPU_ABLK));
+            if (L.gu.t == QType::Q4 || L.gu.t == QType::Q8)
+                quantize_act_row(x, H, I.xa.q + (size_t)i * H, I.xa.d + (size_t)i * (H / CPU_ABLK), I.xa.s + (size_t)i * (H / CPU_ABLK));
         }
     }, 4);
     mark(0);
     if (g_imatrix) g_imatrix->add(L.pre + "wgu_e", I.xf.data(), P, H);
     auto view = [&](const QAct& a, int K2, int off, int n) {
         QAct v; v.M = n; v.K = K2;
+        v.x = a.x + (size_t)off * K2;
         v.q = a.q + (size_t)off * K2; v.d = a.d + (size_t)off * (K2 / CPU_ABLK); v.s = a.s + (size_t)off * (K2 / CPU_ABLK);
         return v;
     };
@@ -1367,12 +1370,14 @@ void CpuMoe::forward(int li, int M, int K, const uint16_t* xn, const int* ids, c
     mark(1);
     I.h.resize((size_t)P * F);
     I.ha.resize(P, F);
+    I.ha.x = I.h.data();
     I.pool->parallel_for(P, [&](int64_t a, int64_t b) {
         for (int64_t i = a; i < b; i++) {
             const float* g = I.gu.data() + (size_t)i * 2 * F;
             float* hh = I.h.data() + (size_t)i * F;
             for (int j = 0; j < F; j++) hh[j] = (L.gelu ? gelu_tanh(g[2 * j]) : silu(g[2 * j])) * g[2 * j + 1];
-            quantize_act_row(hh, F, I.ha.q + (size_t)i * F, I.ha.d + (size_t)i * (F / CPU_ABLK), I.ha.s + (size_t)i * (F / CPU_ABLK));
+            if (L.dn.t == QType::Q4 || L.dn.t == QType::Q8)
+                quantize_act_row(hh, F, I.ha.q + (size_t)i * F, I.ha.d + (size_t)i * (F / CPU_ABLK), I.ha.s + (size_t)i * (F / CPU_ABLK));
         }
     }, 4);
     if (g_imatrix) g_imatrix->add(L.pre + "wdown_e", I.h.data(), P, F);

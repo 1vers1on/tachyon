@@ -1444,7 +1444,8 @@ private:
         for (int w = 0; w < 2; w++) {
             auto h = cmoe_->mat(L.cpu_moe, w);
             CU(dcu.cuMemcpyHtoDAsync(xstage_[b] + off, h.d, h.db, cstream_)); off += align_up(h.db, 256);
-            CU(dcu.cuMemcpyHtoDAsync(xstage_[b] + off, h.s, h.sb, cstream_)); off += align_up(h.sb, 256);
+            if (h.sb) CU(dcu.cuMemcpyHtoDAsync(xstage_[b] + off, h.s, h.sb, cstream_));
+            off += align_up(h.sb, 256);
         }
         CU(dcu.cuEventRecord(stage_ready_[b], cstream_));
         stage_layer_[b] = l;
