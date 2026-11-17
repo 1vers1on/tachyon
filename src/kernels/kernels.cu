@@ -55,9 +55,13 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 __device__ __forceinline__ int warp_sum_i(int v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
-    return v;
+    return __reduce_add_sync(0xffffffff, v);
+}
+// Nonnegative IEEE floats have the same ordering as their unsigned bits.
+// Zero is the neutral value for an all-zero (or all-NaN) quantization block.
+__device__ __forceinline__ float warp_absmax(float v) {
+    unsigned magnitude = __float_as_uint(fmaxf(0.f, fabsf(v)));
+    return __uint_as_float(__reduce_max_sync(0xffffffff, magnitude));
 }
 // streaming 16B load that does not allocate in L1 (weights are touched once per token)
 __device__ __forceinline__ uint4 ld_stream(const void* p) {
@@ -221,7 +225,7 @@ __device__ __forceinline__ void rmsnorm_impl(const float* __restrict__ x, const 
         float sum=0;for(int i=0;i<8;i++)sum+=red[i];float inv=rsqrtf(sum/width+EPS);
         for(int b=threadIdx.x/32;b<width/32;b+=8){int i=g*width+b*32+threadIdx.x%32;float v=xr[i]*inv*w[i];
             if(OUT_F16)oh[(size_t)out_row*HID+i]=__float2half_rn(v);
-            else {float peak=warp_max(fabsf(v)),d=peak/127.f;int z=d>0?__float2int_rn(v/d):0;int sumq=warp_sum_i(z);q[(size_t)out_row*HID+i]=z;if(threadIdx.x%32==0)ds[(size_t)out_row*(HID/32)+i/32]=make_float2(d,d*sumq);}}
+            else {float peak=warp_absmax(v),d=peak/127.f;int z=d>0?__float2int_rn(v/d):0;int sumq=warp_sum_i(z);q[(size_t)out_row*HID+i]=z;if(threadIdx.x%32==0)ds[(size_t)out_row*(HID/32)+i/32]=make_float2(d,d*sumq);}}
         __syncthreads();
     }
     return;
@@ -245,7 +249,7 @@ __device__ __forceinline__ void rmsnorm_impl(const float* __restrict__ x, const 
         if (OUT_F16) {
             oh[(size_t)out_row * HID + i] = __float2half(v);
         } else {
-            float amax = warp_max(fabsf(v));
+            float amax = warp_absmax(v);
             float d = amax / 127.f;
             int qi = amax > 0 ? __float2int_rn(v / d) : 0;
             int s = warp_sum_i(qi);
@@ -1140,7 +1144,7 @@ __device__ __forceinline__ void prologue_rms(const float* __restrict__ x, const 
         for (int blk = warp; blk < K / 32; blk += 8) {
             const int i = blk * 32 + lane;
             const float v = xr[i] * scale * nw[i];
-            const float amax = warp_max(fabsf(v));
+            const float amax = warp_absmax(v);
             const float d = amax / 127.f;
             const int qi = amax > 0 ? __float2int_rn(v / d) : 0;
             const int sm = warp_sum_i(qi);
@@ -1267,7 +1271,7 @@ __global__ void __launch_bounds__(256) gemv2_gu(const uint8_t* __restrict__ W, c
         __syncthreads();
         for (int m = warp; m < M; m += 8) {
             const float v = res[m][lane];
-            const float amax = warp_max(fabsf(v));
+            const float amax = warp_absmax(v);
             const float dd = amax / 127.f;
             const int qi = amax > 0 ? __float2int_rn(v / dd) : 0;
             const int sm = warp_sum_i(qi);
@@ -1491,7 +1495,7 @@ __global__ void __launch_bounds__(128) attn_decode(const AttnArgs a) {
         } else if (OUT_TYPE == 1) {
             a.oh[(size_t)m * QD + col] = __float2half(v);
         } else {
-            const float amax = warp_max(fabsf(v));
+            const float amax = warp_absmax(v);
             const float dd = amax / 127.f;
             const int qi = amax > 0 ? __float2int_rn(v / dd) : 0;
             const int sm = warp_sum_i(qi);
@@ -1725,7 +1729,7 @@ __global__ void __launch_bounds__(128) gemv_tc(const uint8_t* __restrict__ W, co
             __syncthreads();
             for (int m = warp; m < M; m += 4) {
                 const float v = res[m][lane];
-                const float amax = warp_max(fabsf(v));
+                const float amax = warp_absmax(v);
                 const float dd = amax / 127.f;
                 const int qi = amax > 0 ? __float2int_rn(v / dd) : 0;
                 const int sm = warp_sum_i(qi);
@@ -1759,7 +1763,7 @@ extern "C" __global__ void __launch_bounds__(256) quant_rows(const float* __rest
     const int m = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     for (int blk = warp; blk < K / 32; blk += 8) {
         const float v = x[(size_t)m * K + blk * 32 + lane];
-        const float amax = warp_max(fabsf(v));
+        const float amax = warp_absmax(v);
         const float d = amax / 127.f;
         const int qi = amax > 0 ? __float2int_rn(v / d) : 0;
         const int sm = warp_sum_i(qi);
@@ -1827,7 +1831,7 @@ __global__ void causal_conv(float* __restrict__ in, int stride, int C, int K, co
         else if (MODE == 1) r[ch] = acc / (1.f + __expf(-acc));
         else {
             const float v = r[C + ch] * acc;
-            const float amax = warp_max(fabsf(v));
+            const float amax = warp_absmax(v);
             const float d = amax / 127.f;
             const int qi = amax > 0 ? __float2int_rn(v / d) : 0;
             const int sm = warp_sum_i(qi);
@@ -1923,7 +1927,7 @@ __global__ void __launch_bounds__(2 * DV) delta_rule(const float* __restrict__ p
             const float z = r[CD + h * DV + j];
             const float v = o * sc * nw[j] * (z / (1.f + __expf(-z)));
             if (oq) {   // int8 blocks for the out-projection GEMV (threads j = 0..DV-1 are whole warps)
-                const float amax = warp_max(fabsf(v));
+                const float amax = warp_absmax(v);
                 const float d = amax / 127.f;
                 const int qi = amax > 0 ? __float2int_rn(v / d) : 0;
                 const int sm = warp_sum_i(qi);
@@ -2497,7 +2501,7 @@ extern "C" __global__ void __launch_bounds__(256) act_quant(const float* __restr
     for (int blk = warp; blk < F / 32; blk += 8) {
         const int i = blk * 32 + lane;
         const float v = act_fn(g[2 * i]) * g[2 * i + 1];
-        const float amax = warp_max(fabsf(v));
+        const float amax = warp_absmax(v);
         const float d = amax / 127.f;
         const int qi = amax > 0 ? __float2int_rn(v / d) : 0;
         const int sm = warp_sum_i(qi);
