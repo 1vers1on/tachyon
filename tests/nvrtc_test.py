@@ -24,9 +24,9 @@ names = ['gemv2<3,256,1,1,0>', 'gemv_tc<3,256,0>', 'gemm<3,0,128>', 'gemm<3,0,64
          'rope_t<128,0>', 'attn_decode<128,4,8,0>', 'flash_prefill<128>', 'flash_wide<256>',
          'delta_rule<128,128>', 'dn_prep<128,128>', 'dn_chunk<128,128>',
          'causal_conv<0>', 'gemv_ind<3,256>', 'gemv_grp<3,256>',
-         'attn_decode<128,1,16,0>', 'attn_decode<96,2,16,0>',
+         'attn_decode<128,1,16,0>', 'attn_decode<96,2,16,0>', 'attn_decode<512,1,16,2>',
          'gemm<1,0,64>', 'gemm<5,0,64>', 'gemm<7,1,128>', 'gemm<8,2,64>',
-         'gemm<9,2,64>', 'gemm<10,1,128>', 'gemm<11,0,128>', 'packed_mv<5>', 'pmv2<6,1,4>', 'pmv_ind<9,1>']
+         'gemm<9,2,64>', 'gemm<10,1,128>', 'gemm<11,0,128>', 'packed_mv<5>', 'pmv2<6,1,4>', 'pmv2<11,1,1>', 'pmv2<11,8,2>', 'pmv_ind<9,1>']
 for arch in (86, 120):
     for kv8 in (0, 1):
         program = c.c_void_p()
