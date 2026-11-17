@@ -264,6 +264,95 @@ extern "C" __global__ void __launch_bounds__(256) rmsnorm_f16(const float* __res
     rmsnorm_impl<1>(x, w, blockIdx.x, blockIdx.x, nullptr, nullptr, o);
 }
 
+// Convert four signed bytes to scaled half pairs. In the [1024, 1280)
+// interval each mantissa bit is one integer unit. Flipping the sign bit
+// shifts int8 to [0, 255], which makes the subtraction exact in half.
+__device__ __forceinline__ void dequant_i8x4(uint32_t bytes, half2 scale, half2* v) {
+    bytes ^= 0x80808080u;
+    const uint32_t lo = __byte_perm(bytes, 0x64646464u, 0x4140);
+    const uint32_t hi = __byte_perm(bytes, 0x64646464u, 0x4342);
+    const half2 bias = __float2half2_rn(1152.f);
+    v[0] = __hmul2(__hsub2(*(const half2*)&lo, bias), scale);
+    v[1] = __hmul2(__hsub2(*(const half2*)&hi, bias), scale);
+}
+
+// One thread expands one aligned group of 32 for the prefill MMA tile.
+// Decode block metadata once and load contiguous words where the format permits.
+template <int QT>
+__device__ __forceinline__ void dequant_packed32(const uint8_t* row, int k, half2* v) {
+    if constexpr (QT == 5) {  // PQ2_0, four successive ternary values per byte
+        const uint8_t* block = row + (k / 128) * 34;
+        const half2 scale = __half2half2(*(const half*)block);
+        const uint8_t* q = block + 2 + (k % 128) / 4;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const unsigned b = q[i];
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const unsigned pair = b >> (4 * j);
+                const unsigned h = 0x64006400u | (pair & 3u) | ((pair & 12u) << 14);
+                v[2 * i + j] = __hmul2(__hsub2(*(const half2*)&h, __float2half2_rn(1025.f)), scale);
+            }
+        }
+    } else if constexpr (QT == 7 || QT == 8) {  // Q4_0 / Q8_0
+        const uint8_t* block = row + (k / 32) * packed_bytes(QT);
+        const half2 scale = __half2half2(*(const half*)block);
+        const uint16_t* q = (const uint16_t*)(block + 2);
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if constexpr (QT == 7) {
+                const unsigned b = q[i];
+                const unsigned lo = __byte_perm(b & 0x0f0fu, 0x64646464u, 0x4140);
+                const unsigned hi = __byte_perm((b >> 4) & 0x0f0fu, 0x64646464u, 0x4140);
+                const half2 bias = __float2half2_rn(1032.f);
+                v[i] = __hmul2(__hsub2(*(const half2*)&lo, bias), scale);
+                v[i + 8] = __hmul2(__hsub2(*(const half2*)&hi, bias), scale);
+            } else {
+                const unsigned bytes = q[2 * i] | ((unsigned)q[2 * i + 1] << 16);
+                dequant_i8x4(bytes, scale, v + 2 * i);
+            }
+        }
+    } else if constexpr (QT == 9 || QT == 10) {  // Q4_K / Q5_K
+        const uint8_t* block = row + (k / 256) * packed_bytes(QT);
+        const uint8_t* sc = block + 4;
+        const int g = k % 256 / 32;
+        const int scale = g < 4 ? sc[g] & 63 : (sc[g + 4] & 15) | ((sc[g - 4] >> 6) << 4);
+        const int mn = g < 4 ? sc[g + 4] & 63 : (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4);
+        const float d = packed_half(block) * scale, m = packed_half(block + 2) * mn;
+        const uint8_t* q = block + (QT == 9 ? 16 : 48) + (g / 2) * 32;
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+            int lo = (q[2 * i] >> (4 * (g & 1))) & 15;
+            int hi = (q[2 * i + 1] >> (4 * (g & 1))) & 15;
+            if constexpr (QT == 10) {
+                lo |= ((block[16 + 2 * i] >> g) & 1) << 4;
+                hi |= ((block[17 + 2 * i] >> g) & 1) << 4;
+            }
+            v[i] = __floats2half2_rn(d * lo - m, d * hi - m);
+        }
+    } else if constexpr (QT == 11) {  // Q6_K
+        const uint8_t* block = row + (k / 256) * 210;
+        const int h = k % 256 / 128, g = k % 128 / 32;
+        const uint8_t* ql = block + h * 64 + (g & 1) * 32;
+        const uint8_t* qh = block + 128 + h * 32;
+#pragma unroll
+        for (int part = 0; part < 2; part++) {
+            const float d = packed_half(block + 208) * (signed char)block[192 + 8 * h + 2 * g + part];
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int i = part * 16 + j * 2;
+                const int a = ((ql[i] >> (4 * (g / 2))) & 15) | (((qh[i] >> (2 * g)) & 3) << 4);
+                const int b = ((ql[i + 1] >> (4 * (g / 2))) & 15) | (((qh[i + 1] >> (2 * g)) & 3) << 4);
+                v[part * 8 + j] = __floats2half2_rn(d * (a - 32), d * (b - 32));
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 16; i++)
+            v[i] = __floats2half2_rn(packed_read(QT, row, k + 2 * i), packed_read(QT, row, k + 2 * i + 1));
+    }
+}
+
 // ------------------------------------------------------------------------------------------------
 // GEMM (prefill): C[M,N] = A[M,K] (fp16) x W[N,K]^T (Q4/Q8 dequantized to fp16 in shared memory)
 // Tensor cores (mma.sync m16n8k16, fp32 accumulate). Tile 64(M) x BN x 64(K). Each warp computes 32 x 32 outputs.
@@ -291,7 +380,7 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
     uint4 wreg0, wreg1;
     half2 wsc;
     int packed_kt=0;
-    auto load_A = [&](int kt, int buf) {
+    auto stage_async = [&](int kt, int buf) {
 #pragma unroll
         for (int c = tid; c < GBM * (GBK / 8); c += threads) {
             int r = c / 8, col = (c % 8) * 8;
@@ -299,6 +388,15 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
             bool ok = gr < M;
             const half* src = A + (size_t)(ok ? gr : 0) * K + kt * GBK + col;
             cp_async16(As + (buf * GBM + r) * GLD + col, src, ok);
+        }
+        if constexpr (QT == QT_F16) {
+#pragma unroll
+            for (int c = tid; c < BN * (GBK / 8); c += threads) {
+                const int r = c / 8, col = (c % 8) * 8;
+                const bool ok = n0 + r < N;
+                const half* src = (const half*)W + (size_t)(ok ? n0 + r : 0) * K + kt * GBK + col;
+                cp_async16(Ws + (buf * BN + r) * GLD + col, src, ok);
+            }
         }
     };
     auto fetch_W = [&](int kt) {
@@ -321,9 +419,8 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
     auto store_W = [&](int buf) {
         half2 v[16];
         if constexpr (QT >= 5 || QT == 0 || QT == 1) {
-            int gn=min(n0+wrow,N-1);const uint8_t* row=W+(size_t)gn*packed_row_bytes(QT,K);
-#pragma unroll
-            for(int i=0;i<16;i++)v[i]=__floats2half2_rn(packed_read(QT,row,packed_kt*64+wpart*32+2*i),packed_read(QT,row,packed_kt*64+wpart*32+2*i+1));
+            const uint8_t* row = W + (size_t)min(n0 + wrow, N - 1) * packed_row_bytes(QT, K);
+            dequant_packed32<QT>(row, packed_kt * GBK + wpart * 32, v);
         } else if constexpr (QT == QT_Q4) {
             dequant_q4_block(wreg0, __half2half2(__low2half(wsc)), __half2half2(__high2half(wsc)), v);
         } else if constexpr (QT == QT_Q3) {
@@ -340,12 +437,10 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
                 v[2 * i + 1] = __hfma2(__hsub2(*(const half2*)&p1, k1024), sc2, mn2);
             }
         } else {
-            const int8_t* b0 = (const int8_t*)&wreg0;
-            const int8_t* b1 = (const int8_t*)&wreg1;
+            const uint32_t words[8] = {wreg0.x, wreg0.y, wreg0.z, wreg0.w,
+                                       wreg1.x, wreg1.y, wreg1.z, wreg1.w};
 #pragma unroll
-            for (int i = 0; i < 8; i++) v[i] = __hmul2(__floats2half2_rn((float)b0[2 * i], (float)b0[2 * i + 1]), wsc);
-#pragma unroll
-            for (int i = 0; i < 8; i++) v[8 + i] = __hmul2(__floats2half2_rn((float)b1[2 * i], (float)b1[2 * i + 1]), wsc);
+            for (int i = 0; i < 8; i++) dequant_i8x4(words[i], wsc, v + 2 * i);
         }
         uint4* dst = (uint4*)(Ws + (buf * BN + wrow) * GLD + wpart * 32);
 #pragma unroll
@@ -360,10 +455,10 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
 #pragma unroll
             for (int k = 0; k < 4; k++) c[i][j][k] = 0.f;
 
-    load_A(0, 0);
+    stage_async(0, 0);
     cp_async_commit();
     fetch_W(0);
-    store_W(0);
+    if constexpr (QT != QT_F16) store_W(0);
     cp_async_wait_all();
     __syncthreads();
 
@@ -371,7 +466,7 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
         const int buf = kt & 1;
         const bool more = kt + 1 < KT;
         if (more) {
-            load_A(kt + 1, buf ^ 1);
+            stage_async(kt + 1, buf ^ 1);
             cp_async_commit();
             fetch_W(kt + 1);
         }
@@ -418,7 +513,7 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
             }
 #endif
         if (more) {
-            store_W(buf ^ 1);
+            if constexpr (QT != QT_F16) store_W(buf ^ 1);
             cp_async_wait_all();
         }
         __syncthreads();
