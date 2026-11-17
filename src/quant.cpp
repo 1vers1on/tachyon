@@ -219,6 +219,14 @@ void quantize_row(QType t, const float* src, int64_t cols, uint8_t* dst, uint8_t
 }
 
 void dequantize_row(QType t, const uint8_t* data, const uint8_t* scales, int64_t cols, float* dst) {
+    if (t == QType::Q8_0) {
+        for (int64_t i = 0; i < cols; i += 32, data += 34) {
+            const float scale = packed_half(data);
+            const int n = std::min<int64_t>(32, cols - i);
+            for (int j = 0; j < n; j++) dst[i + j] = scale * (int8_t)data[2 + j];
+        }
+        return;
+    }
     if (qtype_packed(t)) { for (int64_t i = 0; i < cols; i++) dst[i] = packed_value((int)t, data, i); return; }
     switch (t) {
         case QType::F32: memcpy(dst, data, cols * 4); break;

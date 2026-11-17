@@ -408,10 +408,6 @@ inline void add_scaled_f16(float* out, const uint16_t* v, float scale, int n) {
 template <int T>
 inline void dot_rows(const QMat& W, int r, const QAct& a, int m0, float* out) {
     const int K = W.cols;
-    if(qtype_packed(W.t)||W.t==QType::BF16){
-        std::vector<float> row(K);dequantize_row(W.t,W.d+(size_t)r*qtype_data_bytes(W.t,1,K),nullptr,K,row.data());
-        for(int t=0;t<T;t++)out[t]=dot_f32(row.data(),a.x+(size_t)(m0+t)*K,K);return;
-    }
     switch (W.t) {
         case QType::Q4:
             dot_q4<T>(W.d + (size_t)r * K / 2, (const uint16_t*)W.s + (size_t)r * (K / 64) * 2, K, a, m0, out);
@@ -433,6 +429,16 @@ inline void dot_rows(const QMat& W, int r, const QAct& a, int m0, float* out) {
 // y[m][r] = W[r] . x[m]   for rows [r0,r1), all M tokens
 void gemm_rows(const QMat& W, const QAct& a, float* y, int ldy, int r0, int r1) {
     const int M = a.M;
+    if (qtype_packed(W.t) || W.t == QType::BF16) {
+        const size_t stride = qtype_data_bytes(W.t, 1, W.cols);
+        std::vector<float> row(W.cols);
+        for (int r = r0; r < r1; r++) {
+            dequantize_row(W.t, W.d + (size_t)r * stride, nullptr, W.cols, row.data());
+            for (int m = 0; m < M; m++)
+                y[(size_t)m * ldy + r] = dot_f32(row.data(), a.x + (size_t)m * W.cols, W.cols);
+        }
+        return;
+    }
     float tmp[8];
     for (int r = r0; r < r1; r++) {
         int m = 0;
