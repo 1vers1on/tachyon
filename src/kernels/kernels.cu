@@ -386,7 +386,8 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
     int packed_kt=0;
     auto stage_async = [&](int kt, int buf) {
 #pragma unroll
-        for (int c = tid; c < GBM * (GBK / 8); c += threads) {
+        for (int i = 0; i < GBM * (GBK / 8) / threads; i++) {
+            const int c = tid + i * threads;
             int r = c / 8, col = (c % 8) * 8;
             int gr = m0 + r;
             bool ok = gr < M;
@@ -395,7 +396,8 @@ __global__ void __launch_bounds__(BN * 2) gemm(const half* __restrict__ A, int M
         }
         if constexpr (QT == QT_F16) {
 #pragma unroll
-            for (int c = tid; c < BN * (GBK / 8); c += threads) {
+            for (int i = 0; i < BN * (GBK / 8) / threads; i++) {
+                const int c = tid + i * threads;
                 const int r = c / 8, col = (c % 8) * 8;
                 const bool ok = n0 + r < N;
                 const half* src = (const half*)W + (size_t)(ok ? n0 + r : 0) * K + kt * GBK + col;
