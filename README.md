@@ -230,7 +230,39 @@ On the CPU backend alone (8 threads), Qwen3-1.7B Q4 decodes at about 52 tok/s.
 With vectorized CPU attention, Qwen3-0.6B Q4 measures about 324 tok/s prefill and 75 tok/s decode
 after a 2048-token prompt (8 threads, 64 generated tokens, speculation off; two runs).
 
+### Packed checkpoints on RTX 3060
+
+The same RTX 3060 12 GB ran both builds with one stream, a 512-token prompt, a 128-token prefill
+chunk, and 96 generated tokens. Each cell shows tokens per second at commit `465d9fc` and after
+the CUDA changes. Each measurement uses one warm-up followed by one timed run.
+
+| Checkpoint | Prefill before → after | Decode before → after |
+|---|---:|---:|
+| K2-Horizon 7B Q6_K | 381.2 → 566.2 | 28.8 → 40.8 |
+| MiMo 2.6 9B Q6_K | 382.9 → 563.6 | 28.8 → 40.7 |
+| K2-Horizon 7B Q8_0 | 319.7 → 703.9 | 35.4 → 35.1 |
+| Gemma 4 12B QAT | 319.9 → 655.7 | 35.2 → 38.0 |
+| Mellum 2.1 Q4_K_M | 307.7 → 879.3 | 88.8 → 94.2 |
+| Mellum 2.1 Q8_0 | crashed → 477.5 | crashed → 34.0 |
+| Bonsai 2 27B PTQ1_0 | 196.8 → 337.1 | 24.1 → 23.9 |
+
+Mellum Q8_0 placed experts from eight layers in system RAM. For the two Q6_K checkpoints, both
+builds picked the same greedy token at all 32 tested positions with chunk sizes 1, 4, and 32.
+
+To reproduce a row with a local checkpoint, run the same command on each revision.
+
+```bash
+./tachyon bench --device cuda -m models/k2-horizon-7b-q6_k.tach --slots 1 -c 1024 \
+  --prefill-chunk 128 --prompt-len 512 -n 96 --temp 0 --spec 0
+```
+
 ### RTX 5090
+
+On the RTX 5090 and RTX PRO 6000 Blackwell, prefill selects a narrower tensor-core tile when a
+projection would launch fewer than two thread blocks per streaming multiprocessor. Single-stream
+decode can also split query heads into separate blocks when grouped attention would leave SMs idle.
+Both choices use the detected SM count. The updated kernels were compile-tested for SM 120.
+The RTX 5090 measurements below predate these changes.
 
 Measured with `tools/bench.sh gpu` on an RTX 5090: a 2048-token prompt, 128 generated tokens, greedy decoding with
 speculation off, median of 3 runs (min-max). Decode is single-stream.
