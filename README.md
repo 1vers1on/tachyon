@@ -230,26 +230,48 @@ On the CPU backend alone (8 threads), Qwen3-1.7B Q4 decodes at about 52 tok/s.
 With vectorized CPU attention, Qwen3-0.6B Q4 measures about 324 tok/s prefill and 75 tok/s decode
 after a 2048-token prompt (8 threads, 64 generated tokens, speculation off; two runs).
 
-### Packed checkpoints on RTX 3060
+### CUDA changes on RTX 3060
 
-The same RTX 3060 12 GB ran both builds with one stream, a 512-token prompt, a 128-token prefill
-chunk, and 96 generated tokens. Each cell shows tokens per second at commit `465d9fc` and after
-the CUDA changes. Each measurement uses one warm-up followed by one timed run.
+These measurements compare commits `465d9fc` and `1d46552` on the same RTX 3060 12 GB. Each
+benchmark processed a 512-token prompt and generated 96 tokens in a single stream, with greedy
+decoding and speculation disabled. Both columns report tokens per second.
+
+The first group used one slot, a 1024-token context and a 128-token prefill chunk. Each build
+ran one warm-up followed by one timed run per checkpoint.
 
 | Checkpoint | Prefill before → after | Decode before → after |
 |---|---:|---:|
-| K2-Horizon 7B Q6_K | 381.2 → 566.2 | 28.8 → 40.8 |
-| MiMo 2.6 9B Q6_K | 382.9 → 563.6 | 28.8 → 40.7 |
-| K2-Horizon 7B Q8_0 | 319.7 → 703.9 | 35.4 → 35.1 |
-| Gemma 4 12B QAT | 319.9 → 655.7 | 35.2 → 38.0 |
-| Mellum 2.1 Q4_K_M | 307.7 → 879.3 | 88.8 → 94.2 |
-| Mellum 2.1 Q8_0 | crashed → 477.5 | crashed → 34.0 |
-| Bonsai 2 27B PTQ1_0 | 196.8 → 337.1 | 24.1 → 23.9 |
+| K2-Horizon 7B Q6_K | 381.2 → 540.1 | 28.8 → 39.2 |
+| K2-Horizon 7B Q8_0 | 319.7 → 695.0 | 35.4 → 34.3 |
+| MiMo 2.6 9B Q6_K | 382.9 → 530.5 | 28.8 → 37.7 |
+| MiMo 2.6 9B Q8_0 | 320.9 → 693.5 | 34.9 → 34.6 |
+| Gemma 4 12B QAT | 319.9 → 637.3 | 35.2 → 36.2 |
+| Mellum 2.1 Q4_K_M | 307.7 → 929.1 | 88.8 → 93.9 |
+| Mellum 2.1 Q8_0 | crashed → 524.6 | crashed → 34.3 |
+| Bonsai 2 9B PTQ1_0 | 552.6 → 1,112.6 | 68.8 → 66.2 |
+| Bonsai 2 27B PTQ1_0 | 196.8 → 356.2 | 24.1 → 23.7 |
 
-Mellum Q8_0 placed experts from eight layers in system RAM. For the two Q6_K checkpoints, both
-builds picked the same greedy token at all 32 tested positions with chunk sizes 1, 4, and 32.
+Mellum Q8_0 placed experts from eight layers in system RAM. For the two Q6_K checkpoints,
+the updated kernels and the starting revision picked the same greedy token at all 32 tested
+positions with chunk sizes 1, 4, and 32.
 
-To reproduce a row with a local checkpoint, run the same command on each revision.
+The second group used the CLI defaults of four slots, an 8192-token context and a 512-token
+prefill chunk. The Bonsai row shows one timed run per build. The seven smaller checkpoints
+show medians from three interleaved runs per build, each with its own warm-up.
+
+| Checkpoint | Prefill before → after | Decode before → after |
+|---|---:|---:|
+| Bonsai 2 9B PQ2_0 | 602.0 → 1,221.4 | 69.1 → 67.4 |
+| Gemma 3 270M Q8 | 51,979.1 → 59,025.9 | 541.5 → 547.4 |
+| LFM2.5 230M Q4 | 56,266.1 → 53,829.5 | 1,313.2 → 1,300.1 |
+| LFM2.5 230M Q8 | 44,675.9 → 49,618.0 | 866.3 → 889.5 |
+| Qwen3 0.6B Q4 | 19,961.9 → 20,163.3 | 476.0 → 495.5 |
+| Qwen3 0.6B Q8 | 16,180.2 → 18,257.1 | 303.9 → 313.7 |
+| Qwen3 1.7B Q4 | 8,138.1 → 7,976.6 | 243.3 → 243.4 |
+| Qwen3.5 0.8B Q8 | 12,182.4 → 13,379.4 | 281.3 → 274.0 |
+
+To reproduce the first configuration with a local checkpoint, run this command on each revision.
+For the second configuration, omit `--slots`, `-c`, and `--prefill-chunk` along with their values.
 
 ```bash
 ./tachyon bench --device cuda -m models/k2-horizon-7b-q6_k.tach --slots 1 -c 1024 \
