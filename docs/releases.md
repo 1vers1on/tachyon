@@ -46,7 +46,7 @@ With GCC 11+, Make, Python 3, binutils and a CUDA toolkit installed:
 ```bash
 CUDA=/usr/local/cuda JOBS=8 tools/package.sh
 # Optional explicit version; it must match src/common.h:
-tools/package.sh 1.1.1
+tools/package.sh 1.1.2
 ```
 
 The files appear in `dist/`. This uses the same archive format and CPU flags as CI. It records the
@@ -68,7 +68,7 @@ Use a clean checkout when building published assets; `COMMIT` records the checko
 Keep `TACH_VERSION` and the GitHub tag aligned. To upload locally built assets to an existing release:
 
 ```bash
-gh release upload v1.1.1 dist/tachyon-linux-x86_64.tar.gz dist/tachyon-linux-x86_64.tar.gz.sha256
+gh release upload v1.1.2 dist/tachyon-linux-x86_64.tar.gz dist/tachyon-linux-x86_64.tar.gz.sha256
 ```
 
 Avoid replacing existing public assets: publish a new patch version so pinned installs stay reproducible.

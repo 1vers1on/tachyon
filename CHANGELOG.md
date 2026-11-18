@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2 — 2026-11-18
+
+- Accelerate packed-weight CUDA prefill and Q6_K decode. On an RTX 3060 12 GB, Mellum 2.1 Q4_K_M prefill rose from 308 to 929 tokens/s and K2-Horizon 7B Q6_K decode rose from 28.8 to 39.2 tokens/s. Gains vary by checkpoint. [Results for all 17 checkpoints](README.md#cuda-changes-on-rtx-3060)
+- Select prefill tile sizes and decode attention groups using the GPU's streaming multiprocessor count, with dedicated choices for RTX 5090 and RTX PRO 6000 Blackwell. The kernels were compiled for SM 86 and SM 120 and benchmarked on the RTX 3060.
+- Reduce KV-cache reads, batch metadata transfers, and temporary GPU memory use. Parallelize greedy token selection for large vocabularies.
+- Fix packed experts offloaded to system RAM. Mellum 2.1 Q8_0 now runs on the 12 GB RTX 3060 with eight layers' experts in host memory, decoding at 34.3 tokens/s.
+
 ## 1.1.1 — 2026-11-16
 
 - Bundle CUDA 12.8.1 NVRTC, matching builtins and headers so RTX 5090 (`sm_120`) kernels can compile

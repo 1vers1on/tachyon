@@ -1,6 +1,6 @@
 # Tachyon
 
-Version **1.1.1**. See the [release notes](CHANGELOG.md); `./tachyon --version` prints the installed version.
+Version **1.1.2**. See the [release notes](CHANGELOG.md); `./tachyon --version` prints the installed version.
 
 A from-scratch LLM inference engine and server in C++, with hand-written CUDA, AVX-512 and AVX2 kernels (plus a scalar fallback).
 
@@ -46,7 +46,7 @@ If that directory is outside your `PATH`, the installer prints the line to add t
 
 ```bash
 # Pin a version, or choose an installation prefix (containing bin/ and lib/).
-curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --version 1.1.1
+curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --version 1.1.2
 curl -fsSL https://raw.githubusercontent.com/1vers1on/tachyon/main/install.sh | bash -s -- --prefix "$HOME/apps/tachyon"
 ```
 
